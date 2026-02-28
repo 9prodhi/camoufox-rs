@@ -1,0 +1,992 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
+use crate::protocol::events::{EventHandler, EventRouter};
+use crate::protocol::pending::PendingMap;
+use crate::protocol::state::{ConnectionState, IdGenerator, SessionState};
+use crate::protocol::types::{
+    EventMessage, IncomingMessage, Request, ResponseMessage, SessionId,
+    BROWSER_CLOSE_MESSAGE_ID,
+};
+use crate::transport::Transport;
+
+// ---------------------------------------------------------------------------
+// Internal shared state
+// ---------------------------------------------------------------------------
+
+/// Shared mutable state protected by a `Mutex`.
+struct ConnectionInner {
+    state: ConnectionState,
+    id_gen: IdGenerator,
+    /// Session map. Key is `""` for the root session, UUID for page sessions.
+    sessions: HashMap<String, SessionInner>,
+    /// Event subscription router.
+    events: EventRouter,
+}
+
+/// Per-session state and pending request map.
+struct SessionInner {
+    state: SessionState,
+    pending: PendingMap,
+}
+
+impl SessionInner {
+    fn new() -> Self {
+        Self {
+            state: SessionState::Active,
+            pending: PendingMap::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split transport
+// ---------------------------------------------------------------------------
+
+/// Enables concurrent read and write access to a `Transport`.
+///
+/// The `Transport` trait uses `&mut self` for both `send()` and `receive()`.
+/// For pipe-based transports, reads and writes go to separate file
+/// descriptors (fd 3 write, fd 4 read) and can safely happen concurrently.
+///
+/// `SplitTransport` uses `UnsafeCell` to allow the reader thread to call
+/// `receive()` while caller threads call `send()` (serialized by a Mutex).
+///
+/// # Safety
+///
+/// Sound when `send()` and `receive()` operate on independent internal state,
+/// which is true for pipe transports (separate fds) and for the channel-based
+/// mock transport in tests (separate channels).
+struct SplitTransport {
+    inner: std::cell::UnsafeCell<Box<dyn Transport>>,
+}
+
+unsafe impl Send for SplitTransport {}
+unsafe impl Sync for SplitTransport {}
+
+impl SplitTransport {
+    fn new(transport: Box<dyn Transport>) -> Self {
+        Self {
+            inner: std::cell::UnsafeCell::new(transport),
+        }
+    }
+
+    /// Read the next message. Only called by the reader thread.
+    fn receive(
+        &self,
+    ) -> Result<crate::protocol::types::RawMessage, crate::transport::errors::TransportError> {
+        unsafe { &mut *self.inner.get() }.receive()
+    }
+
+    /// Send a message. Caller must serialize access (via Mutex).
+    fn send(
+        &self,
+        message: &serde_json::Value,
+    ) -> Result<(), crate::transport::errors::TransportError> {
+        unsafe { &mut *self.inner.get() }.send(message)
+    }
+
+    /// Close the transport.
+    fn close(&self) -> Result<(), crate::transport::errors::TransportError> {
+        unsafe { &mut *self.inner.get() }.close()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection
+// ---------------------------------------------------------------------------
+
+/// A connection to the Juggler protocol endpoint.
+///
+/// Manages the root session and page sessions. Spawns a single reader thread
+/// that processes incoming messages (responses and events). Outgoing messages
+/// are sent directly from the caller's thread, serialized by a `Mutex`.
+///
+/// # Architecture
+///
+/// - **Reader thread**: loops on `transport.receive()`, classifies each
+///   incoming message, resolves pending requests, and dispatches events.
+/// - **Write path**: caller threads hold the `write_lock` Mutex, serialize
+///   the request to JSON, and call `transport.send()` directly.
+///
+/// There is no dedicated writer thread. This avoids deadlock issues with
+/// channel-based designs and is simpler overall.
+pub struct Connection {
+    /// Thread-safe shared state.
+    inner: Arc<Mutex<ConnectionInner>>,
+    /// Handle to the reader thread.
+    reader_handle: Option<thread::JoinHandle<()>>,
+    /// Shared transport (concurrent read/write via SplitTransport).
+    transport: Arc<SplitTransport>,
+    /// Mutex to serialize write operations from multiple caller threads.
+    write_lock: Arc<Mutex<()>>,
+}
+
+impl Connection {
+    /// Create a new connection from a transport.
+    ///
+    /// Spawns the reader thread. The root session (key `""`) is
+    /// automatically created.
+    pub fn new(transport: Box<dyn Transport>) -> Self {
+        let inner = Arc::new(Mutex::new(ConnectionInner {
+            state: ConnectionState::Connected,
+            id_gen: IdGenerator::new(),
+            sessions: HashMap::new(),
+            events: EventRouter::new(),
+        }));
+
+        // Create root session
+        {
+            let mut guard = inner.lock().unwrap();
+            guard.sessions.insert(String::new(), SessionInner::new());
+        }
+
+        let transport = Arc::new(SplitTransport::new(transport));
+        let write_lock = Arc::new(Mutex::new(()));
+
+        // Spawn reader thread
+        let inner_r = Arc::clone(&inner);
+        let transport_r = Arc::clone(&transport);
+        let reader_handle = thread::Builder::new()
+            .name("juggler-reader".into())
+            .spawn(move || {
+                reader_thread(transport_r, inner_r);
+            })
+            .expect("failed to spawn reader thread");
+
+        Connection {
+            inner,
+            reader_handle: Some(reader_handle),
+            transport,
+            write_lock,
+        }
+    }
+
+    /// Get a handle to the root session for `Browser.*` commands.
+    pub fn root_session(&self) -> Session {
+        Session {
+            session_id: None,
+            session_key: String::new(),
+            inner: Arc::clone(&self.inner),
+            transport: Arc::clone(&self.transport),
+            write_lock: Arc::clone(&self.write_lock),
+        }
+    }
+
+    /// Create a page session.
+    ///
+    /// Call when `Browser.attachedToTarget` event arrives with the
+    /// server-assigned `sessionId`.
+    pub fn create_session(&self, session_id: String) -> Session {
+        let session_key = session_id.clone();
+        {
+            let mut guard = self.inner.lock().unwrap();
+            guard
+                .sessions
+                .entry(session_key.clone())
+                .or_insert_with(SessionInner::new);
+        }
+        Session {
+            session_id: Some(session_id),
+            session_key,
+            inner: Arc::clone(&self.inner),
+            transport: Arc::clone(&self.transport),
+            write_lock: Arc::clone(&self.write_lock),
+        }
+    }
+
+    /// Dispose a page session.
+    ///
+    /// Called when `Browser.detachedFromTarget` arrives. Rejects all pending
+    /// requests and removes event handlers.
+    pub fn dispose_session(&self, session_id: &str) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(mut session) = guard.sessions.remove(session_id) {
+            session.pending.reject_all(ProtocolErrorKind::Closed);
+        }
+        guard.events.remove_session(session_id);
+    }
+
+    /// Subscribe to events on a specific session.
+    pub fn on_event(&self, session_key: &str, method: &str, handler: EventHandler) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.events.on(session_key, method, handler);
+    }
+
+    /// Subscribe to all events on a specific session.
+    pub fn on_event_any(&self, session_key: &str, handler: EventHandler) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.events.on_any(session_key, handler);
+    }
+
+    /// Subscribe to all events globally (for logging/debugging).
+    pub fn on_event_global(&self, handler: EventHandler) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.events.on_global(handler);
+    }
+
+    /// Close the connection gracefully.
+    ///
+    /// Sends `Browser.close` with id=-9999 directly via the transport
+    /// (bypassing session send). After this, call `wait_closed()`.
+    pub fn close(&self) -> Result<(), ProtocolError> {
+        {
+            let mut guard = self.inner.lock().unwrap();
+            if guard.state.is_closed() || guard.state == ConnectionState::Closing {
+                return Ok(());
+            }
+            guard.state = ConnectionState::Closing;
+        }
+
+        let request = Request {
+            id: BROWSER_CLOSE_MESSAGE_ID,
+            method: "Browser.close".to_owned(),
+            params: serde_json::Value::Object(Default::default()),
+            session_id: None,
+        };
+        let value = serde_json::to_value(&request).map_err(|e| ProtocolError {
+            kind: ProtocolErrorKind::Transport,
+            method: Some("Browser.close".to_owned()),
+            message: format!("failed to serialize Browser.close: {e}"),
+            data: None,
+            source: Some(Box::new(e)),
+        })?;
+
+        let _lock = self.write_lock.lock().unwrap();
+        self.transport.send(&value).map_err(|e| {
+            ProtocolError::transport(e)
+        })?;
+
+        Ok(())
+    }
+
+    /// Wait for the connection to fully close.
+    ///
+    /// Force-closes the transport, rejects all pending requests, and joins
+    /// the reader thread.
+    pub fn wait_closed(&mut self) {
+        let _ = self.transport.close();
+        close_all_sessions(&self.inner);
+        if let Some(handle) = self.reader_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Force-close the transport so the reader thread exits.
+        let _ = self.transport.close();
+        // Join the reader thread to ensure clean shutdown. This is safe
+        // because close() above guarantees the reader will exit promptly
+        // (real transports unblock read on fd close; MockTransport uses
+        // recv_timeout to check the closed flag).
+        if let Some(handle) = self.reader_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session handle
+// ---------------------------------------------------------------------------
+
+/// A handle to a specific session (root or page).
+///
+/// Cheap to clone (all state is behind `Arc`).
+///
+/// # Root session
+/// - `session_id`: `None` (absent from wire), `session_key`: `""`
+///
+/// # Page session
+/// - `session_id`: `Some(uuid)`, `session_key`: `uuid`
+#[derive(Clone)]
+pub struct Session {
+    session_id: SessionId,
+    session_key: String,
+    inner: Arc<Mutex<ConnectionInner>>,
+    transport: Arc<SplitTransport>,
+    write_lock: Arc<Mutex<()>>,
+}
+
+impl Session {
+    /// Send a protocol method and wait for the response.
+    ///
+    /// Allocates a message ID, registers a pending request, sends the
+    /// message directly through the transport, then blocks until the
+    /// reader thread resolves or rejects the pending request.
+    ///
+    /// # Pre-send checks
+    ///
+    /// If the session is disposed/crashed or the connection is closed,
+    /// returns an error immediately without sending.
+    pub fn send(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let (rx, value) = {
+            let mut guard = self.inner.lock().unwrap();
+
+            // Pre-send check: connection state
+            if guard.state.is_closed() {
+                return Err(ProtocolError::closed(Some(method.to_owned())));
+            }
+
+            // Pre-send check: session state
+            let session = guard.sessions.get(&self.session_key).ok_or_else(|| {
+                ProtocolError::closed(Some(method.to_owned()))
+            })?;
+
+            match session.state {
+                SessionState::Disposed => {
+                    return Err(ProtocolError::closed(Some(method.to_owned())));
+                }
+                SessionState::Crashed => {
+                    return Err(ProtocolError::crashed(Some(method.to_owned())));
+                }
+                SessionState::Active => {}
+            }
+
+            // Allocate ID and register pending
+            let id = guard.id_gen.next();
+            let session = guard.sessions.get_mut(&self.session_key).unwrap();
+            let rx = session.pending.insert(id, method.to_owned());
+
+            // Build and serialize the request
+            let request = Request {
+                id,
+                method: method.to_owned(),
+                params,
+                session_id: self.session_id.clone(),
+            };
+            let value = match serde_json::to_value(&request) {
+                Ok(v) => v,
+                Err(e) => {
+                    session.pending.resolve(id, Ok(serde_json::Value::Null));
+                    return Err(ProtocolError {
+                        kind: ProtocolErrorKind::Transport,
+                        method: Some(request.method),
+                        message: format!("failed to serialize request: {e}"),
+                        data: None,
+                        source: Some(Box::new(e)),
+                    });
+                }
+            };
+
+            (rx, value)
+        };
+        // Inner lock released. Now send through the transport with write serialization.
+        {
+            let _lock = self.write_lock.lock().unwrap();
+            if let Err(e) = self.transport.send(&value) {
+                return Err(ProtocolError::transport(e));
+            }
+        }
+
+        // Block waiting for the response.
+        match rx.recv() {
+            Ok(result) => result,
+            Err(_) => Err(ProtocolError::closed(Some(method.to_owned()))),
+        }
+    }
+
+    /// Send a protocol method, swallowing errors (fire-and-forget).
+    ///
+    /// Matches the `sendMayFail` pattern from Playwright.
+    pub fn send_may_fail(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        match self.send(method, params) {
+            Ok(result) => Some(result),
+            Err(e) => {
+                log::debug!("sendMayFail({method}): {e}");
+                None
+            }
+        }
+    }
+
+    /// Mark this session as crashed.
+    ///
+    /// Rejects all pending requests with `Crashed`. Future sends fail
+    /// immediately.
+    pub fn mark_crashed(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(session) = guard.sessions.get_mut(&self.session_key) {
+            session.state = SessionState::Crashed;
+            session.pending.reject_all(ProtocolErrorKind::Crashed);
+        }
+    }
+
+    /// Returns the session key (`""` for root, UUID for page).
+    pub fn key(&self) -> &str {
+        &self.session_key
+    }
+
+    /// Returns the session ID for wire format (`None` for root).
+    pub fn id(&self) -> &SessionId {
+        &self.session_id
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reader thread
+// ---------------------------------------------------------------------------
+
+fn reader_thread(transport: Arc<SplitTransport>, inner: Arc<Mutex<ConnectionInner>>) {
+    loop {
+        let raw = transport.receive();
+
+        let raw_message = match raw {
+            Ok(msg) => msg,
+            Err(e) => {
+                log::debug!("reader thread: transport error: {e}");
+                close_all_sessions(&inner);
+                return;
+            }
+        };
+
+        let incoming = match raw_message.classify() {
+            Some(msg) => msg,
+            None => {
+                log::debug!("reader thread: unclassifiable message, skipping");
+                continue;
+            }
+        };
+
+        match incoming {
+            IncomingMessage::Response(response) => handle_response(&inner, response),
+            IncomingMessage::Event(event) => handle_event(&inner, event),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Message handlers
+// ---------------------------------------------------------------------------
+
+fn handle_response(inner: &Arc<Mutex<ConnectionInner>>, response: ResponseMessage) {
+    if response.id == BROWSER_CLOSE_MESSAGE_ID {
+        log::debug!(
+            "reader thread: discarding Browser.close response (id={BROWSER_CLOSE_MESSAGE_ID})"
+        );
+        return;
+    }
+
+    let mut guard = inner.lock().unwrap();
+    let session_key = response.session_id.as_deref().unwrap_or("");
+
+    if let Some(session) = guard.sessions.get_mut(session_key) {
+        session.pending.resolve(response.id, response.result);
+    } else {
+        log::debug!(
+            "reader thread: response for unknown session {:?}, dropping",
+            response.session_id
+        );
+    }
+}
+
+fn handle_event(inner: &Arc<Mutex<ConnectionInner>>, event: EventMessage) {
+    let guard = inner.lock().unwrap();
+    guard.events.dispatch(&event);
+}
+
+fn close_all_sessions(inner: &Arc<Mutex<ConnectionInner>>) {
+    let mut guard = inner.lock().unwrap();
+    guard.state = ConnectionState::Closed;
+    for (_key, session) in guard.sessions.iter_mut() {
+        session.state = SessionState::Disposed;
+        session.pending.reject_all(ProtocolErrorKind::Closed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::{MessageId, RawMessage};
+    use crate::transport::errors::TransportError;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+
+    // -----------------------------------------------------------------------
+    // Mock transport
+    // -----------------------------------------------------------------------
+
+    /// Mock transport using independent channels for read and write.
+    /// `receive()` blocks on `incoming_rx.recv()`.
+    /// `send()` pushes to `outgoing_tx`.
+    /// Both are independent, satisfying SplitTransport's safety invariant.
+    struct MockTransport {
+        incoming_rx: mpsc::Receiver<RawMessage>,
+        outgoing_tx: mpsc::Sender<serde_json::Value>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl MockTransport {
+        fn new() -> (
+            Self,
+            mpsc::Sender<RawMessage>,
+            mpsc::Receiver<serde_json::Value>,
+            Arc<AtomicBool>,
+        ) {
+            let (in_tx, in_rx) = mpsc::channel();
+            let (out_tx, out_rx) = mpsc::channel();
+            let closed = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    incoming_rx: in_rx,
+                    outgoing_tx: out_tx,
+                    closed: Arc::clone(&closed),
+                },
+                in_tx,
+                out_rx,
+                closed,
+            )
+        }
+    }
+
+    impl Transport for MockTransport {
+        fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(TransportError::Closed);
+            }
+            self.outgoing_tx
+                .send(message.clone())
+                .map_err(|_| TransportError::Closed)
+        }
+
+        fn receive(&mut self) -> Result<RawMessage, TransportError> {
+            // Use recv_timeout so that transport.close() (which sets the
+            // closed flag) can unblock this loop promptly. Without this,
+            // Connection::drop would hang waiting for the reader thread
+            // when tests run in parallel and don't explicitly call teardown.
+            loop {
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(TransportError::Closed);
+                }
+                match self
+                    .incoming_rx
+                    .recv_timeout(std::time::Duration::from_millis(10))
+                {
+                    Ok(msg) => return Ok(msg),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(TransportError::Closed)
+                    }
+                }
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------------
+
+    struct TestHarness {
+        conn: Connection,
+        in_tx: mpsc::Sender<RawMessage>,
+        out_rx: mpsc::Receiver<serde_json::Value>,
+        #[allow(dead_code)]
+        closed: Arc<AtomicBool>,
+    }
+
+    fn setup() -> TestHarness {
+        let (transport, in_tx, out_rx, closed) = MockTransport::new();
+        let conn = Connection::new(Box::new(transport));
+        TestHarness {
+            conn,
+            in_tx,
+            out_rx,
+            closed,
+        }
+    }
+
+    fn success_response(id: MessageId, session_id: Option<&str>) -> RawMessage {
+        RawMessage {
+            id: Some(id),
+            method: None,
+            params: None,
+            result: Some(json!({"ok": true})),
+            error: None,
+            session_id: session_id.map(String::from),
+        }
+    }
+
+    fn error_response(id: MessageId, session_id: Option<&str>, msg: &str) -> RawMessage {
+        RawMessage {
+            id: Some(id),
+            method: None,
+            params: None,
+            result: None,
+            error: Some(crate::protocol::types::ErrorData {
+                message: msg.to_owned(),
+                data: None,
+            }),
+            session_id: session_id.map(String::from),
+        }
+    }
+
+    fn event_message(method: &str, session_id: Option<&str>) -> RawMessage {
+        RawMessage {
+            id: None,
+            method: Some(method.to_owned()),
+            params: Some(json!({"data": "test"})),
+            result: None,
+            error: None,
+            session_id: session_id.map(String::from),
+        }
+    }
+
+    fn recv_out(rx: &mpsc::Receiver<serde_json::Value>) -> serde_json::Value {
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("timed out waiting for outgoing message")
+    }
+
+    /// Clean teardown: drop in_tx to unblock reader, then wait.
+    fn teardown(mut h: TestHarness) {
+        drop(h.in_tx);
+        h.conn.wait_closed();
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn root_session_send_and_receive() {
+        let h = setup();
+        let session = h.conn.root_session();
+
+        let in_tx = h.in_tx.clone();
+        let responder = thread::spawn(move || {
+            let sent = recv_out(&h.out_rx);
+            let id = sent["id"].as_i64().unwrap();
+            assert_eq!(sent["method"], "Browser.enable");
+            assert!(sent.get("sessionId").is_none());
+            in_tx.send(success_response(id, None)).unwrap();
+        });
+
+        let result = session.send("Browser.enable", json!({}));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), json!({"ok": true}));
+
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn page_session_send_and_receive() {
+        let h = setup();
+        let page = h.conn.create_session("page-uuid-1".to_owned());
+
+        let in_tx = h.in_tx.clone();
+        let responder = thread::spawn(move || {
+            let sent = recv_out(&h.out_rx);
+            let id = sent["id"].as_i64().unwrap();
+            assert_eq!(sent["method"], "Page.navigate");
+            assert_eq!(sent["sessionId"], "page-uuid-1");
+            in_tx
+                .send(success_response(id, Some("page-uuid-1")))
+                .unwrap();
+        });
+
+        let result = page.send("Page.navigate", json!({"url": "https://example.com"}));
+        assert!(result.is_ok());
+
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn send_returns_protocol_error_on_server_error() {
+        let h = setup();
+        let session = h.conn.root_session();
+
+        let in_tx = h.in_tx.clone();
+        let responder = thread::spawn(move || {
+            let sent = recv_out(&h.out_rx);
+            let id = sent["id"].as_i64().unwrap();
+            in_tx
+                .send(error_response(id, None, "Method not found"))
+                .unwrap();
+        });
+
+        let result = session.send("Browser.nonexistent", json!({}));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, ProtocolErrorKind::Response);
+        assert!(err.message.contains("Method not found"));
+
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn event_dispatch_to_handlers() {
+        let h = setup();
+
+        let received = Arc::new(AtomicUsize::new(0));
+        let r = received.clone();
+        h.conn
+            .on_event("", "Browser.attachedToTarget", Box::new(move |_| {
+                r.fetch_add(1, Ordering::SeqCst);
+            }));
+
+        h.in_tx
+            .send(event_message("Browser.attachedToTarget", None))
+            .unwrap();
+
+        thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(received.load(Ordering::SeqCst), 1);
+
+        teardown(h);
+    }
+
+    #[test]
+    fn dispose_session_rejects_pending() {
+        let h = setup();
+        let page = h.conn.create_session("page-1".to_owned());
+
+        let page2 = page.clone();
+        let handle = thread::spawn(move || page2.send("Page.navigate", json!({})));
+
+        let _sent = recv_out(&h.out_rx);
+
+        h.conn.dispose_session("page-1");
+
+        let result = handle.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind, ProtocolErrorKind::Closed);
+
+        teardown(h);
+    }
+
+    #[test]
+    fn mark_crashed_rejects_pending_and_future_sends() {
+        let h = setup();
+        let page = h.conn.create_session("page-1".to_owned());
+
+        let page2 = page.clone();
+        let handle = thread::spawn(move || page2.send("Page.evaluate", json!({})));
+
+        let _sent = recv_out(&h.out_rx);
+
+        page.mark_crashed();
+
+        let result = handle.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind, ProtocolErrorKind::Crashed);
+
+        let result = page.send("Page.navigate", json!({}));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind, ProtocolErrorKind::Crashed);
+
+        teardown(h);
+    }
+
+    #[test]
+    fn close_sends_browser_close() {
+        let h = setup();
+
+        h.conn.close().unwrap();
+
+        let sent = recv_out(&h.out_rx);
+        assert_eq!(sent["id"], BROWSER_CLOSE_MESSAGE_ID);
+        assert_eq!(sent["method"], "Browser.close");
+
+        teardown(h);
+    }
+
+    #[test]
+    fn browser_close_response_is_silently_discarded() {
+        let h = setup();
+
+        h.in_tx
+            .send(success_response(BROWSER_CLOSE_MESSAGE_ID, None))
+            .unwrap();
+
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        {
+            let guard = h.conn.inner.lock().unwrap();
+            assert_eq!(guard.state, ConnectionState::Connected);
+        }
+
+        teardown(h);
+    }
+
+    #[test]
+    fn transport_error_closes_all_sessions() {
+        let mut h = setup();
+        let root = h.conn.root_session();
+        let page = h.conn.create_session("page-1".to_owned());
+
+        let root2 = root.clone();
+        let h1 = thread::spawn(move || root2.send("Browser.getInfo", json!({})));
+        let page2 = page.clone();
+        let h2 = thread::spawn(move || page2.send("Page.navigate", json!({})));
+
+        let _s1 = recv_out(&h.out_rx);
+        let _s2 = recv_out(&h.out_rx);
+
+        // Drop the incoming channel -- simulates transport EOF.
+        drop(h.in_tx);
+
+        let r1 = h1.join().unwrap();
+        let r2 = h2.join().unwrap();
+        assert!(r1.is_err());
+        assert!(r2.is_err());
+        assert_eq!(r1.unwrap_err().kind, ProtocolErrorKind::Closed);
+        assert_eq!(r2.unwrap_err().kind, ProtocolErrorKind::Closed);
+
+        h.conn.wait_closed();
+    }
+
+    #[test]
+    fn send_on_closed_connection_returns_error() {
+        let mut h = setup();
+        let root = h.conn.root_session();
+
+        drop(h.in_tx);
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let result = root.send("Browser.enable", json!({}));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind, ProtocolErrorKind::Closed);
+
+        h.conn.wait_closed();
+    }
+
+    #[test]
+    fn send_may_fail_returns_none_on_error() {
+        let mut h = setup();
+        let root = h.conn.root_session();
+
+        drop(h.in_tx);
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let result = root.send_may_fail("Browser.enable", json!({}));
+        assert!(result.is_none());
+
+        h.conn.wait_closed();
+    }
+
+    #[test]
+    fn id_generator_is_monotonic() {
+        let gen = IdGenerator::new();
+        assert_eq!(gen.next(), 1);
+        assert_eq!(gen.next(), 2);
+        assert_eq!(gen.next(), 3);
+    }
+
+    #[test]
+    fn multiple_sends_get_different_ids() {
+        let h = setup();
+        let session = h.conn.root_session();
+
+        let in_tx = h.in_tx.clone();
+        let responder = thread::spawn(move || {
+            let s1 = recv_out(&h.out_rx);
+            let s2 = recv_out(&h.out_rx);
+            let id1 = s1["id"].as_i64().unwrap();
+            let id2 = s2["id"].as_i64().unwrap();
+            assert_ne!(id1, id2);
+            assert!(id1 > 0);
+            assert!(id2 > 0);
+            in_tx.send(success_response(id1, None)).unwrap();
+            in_tx.send(success_response(id2, None)).unwrap();
+        });
+
+        let s2 = session.clone();
+        let h1 = thread::spawn(move || session.send("Browser.enable", json!({})));
+        let h2 = thread::spawn(move || s2.send("Browser.getInfo", json!({})));
+
+        assert!(h1.join().unwrap().is_ok());
+        assert!(h2.join().unwrap().is_ok());
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn unknown_session_response_is_silently_dropped() {
+        let h = setup();
+
+        h.in_tx
+            .send(success_response(1, Some("nonexistent-session")))
+            .unwrap();
+
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        {
+            let guard = h.conn.inner.lock().unwrap();
+            assert_eq!(guard.state, ConnectionState::Connected);
+        }
+
+        teardown(h);
+    }
+
+    #[test]
+    fn close_is_idempotent() {
+        let h = setup();
+
+        assert!(h.conn.close().is_ok());
+        assert!(h.conn.close().is_ok());
+
+        teardown(h);
+    }
+
+    #[test]
+    fn session_key_and_id() {
+        let h = setup();
+
+        let root = h.conn.root_session();
+        assert_eq!(root.key(), "");
+        assert_eq!(root.id(), &None);
+
+        let page = h.conn.create_session("uuid-123".to_owned());
+        assert_eq!(page.key(), "uuid-123");
+        assert_eq!(page.id(), &Some("uuid-123".to_owned()));
+
+        teardown(h);
+    }
+
+    #[test]
+    fn global_event_handler_receives_all_events() {
+        let h = setup();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        h.conn.on_event_global(Box::new(move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let _page = h.conn.create_session("p1".to_owned());
+
+        h.in_tx
+            .send(event_message("Browser.attachedToTarget", None))
+            .unwrap();
+        h.in_tx
+            .send(event_message("Page.navigationStarted", Some("p1")))
+            .unwrap();
+
+        thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+
+        teardown(h);
+    }
+}

@@ -1,8 +1,8 @@
 //! Readiness detection for the Camoufox browser process.
 //!
-//! After spawning, Camoufox writes `"Juggler listening to the pipe\n"` to
-//! stderr once the Juggler engine is initialized and the pipe transport is
-//! ready to accept commands (see PROTOCOL.md section 2 & 12).
+//! After spawning, Camoufox writes `"Juggler pipe initialized\n"` to stderr
+//! once the Juggler engine is initialized and the pipe transport is ready to
+//! accept commands (see PROTOCOL.md section 2 & 12).
 //!
 //! This module watches stderr for that sentinel string, with a configurable
 //! timeout. If the process exits or the timeout expires before the sentinel
@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 /// The sentinel string that Camoufox writes to stderr when the Juggler pipe
 /// transport is initialized and ready to accept commands.
 ///
-/// Source: `nsRemoteDebuggingPipe.cpp` — `dump("Juggler listening to the pipe\n")`
-const READINESS_SENTINEL: &str = "Juggler listening to the pipe";
+/// Camoufox outputs `"Juggler pipe initialized"` (via its patched Juggler),
+/// which differs from vanilla Playwright Firefox's `"Juggler listening to the pipe"`.
+const READINESS_SENTINEL: &str = "Juggler pipe initialized";
 
 /// Outcome of the stderr reader thread.
 enum ReadResult {

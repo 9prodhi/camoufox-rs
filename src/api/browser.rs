@@ -307,11 +307,12 @@ impl Browser {
     /// Note that the response to `Browser.close` (sent with `id=-9999`)
     /// is silently discarded by the protocol layer.
     pub fn close(self) -> Result<(), ProtocolError> {
-        // Browser.close uses special message ID -9999. The response is
-        // silently discarded. We use send_may_fail since errors during
-        // shutdown should not prevent cleanup.
-        let _ = self.session.send_may_fail("Browser.close", json!({}));
-        Ok(())
+        // Browser.close must be sent with id=-9999 (PROTOCOL.md §13).
+        // Use the connection-level close() which sends directly via
+        // transport with BROWSER_CLOSE_MESSAGE_ID, bypassing the
+        // session's normal ID allocation. The response is silently
+        // discarded by the reader thread.
+        self.connection.close()
     }
 }
 

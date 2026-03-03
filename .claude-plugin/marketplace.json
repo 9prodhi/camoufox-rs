@@ -1,0 +1,12 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "Camoufox",
+  "description": "Browse the web with Camoufox anti-detect browser - replaces WebSearch/WebFetch with real browser automation.",
+  "plugins": [
+    {
+      "name": "camoufox",
+      "source": "./plugins/camoufox",
+      "version": "1.0.0"
+    }
+  ]
+}

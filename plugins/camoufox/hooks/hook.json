@@ -1,0 +1,39 @@
+{
+  "description": "Camoufox hooks - redirect WebSearch/WebFetch to camoufox CLI browser automation",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat <<'EOF'\n{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"## Camoufox Browser CLI Available\\n\\nThe `/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox` CLI provides real browser automation via Camoufox anti-detect browser. Use it instead of `WebSearch` and `WebFetch` for better results — it handles JS-heavy pages, authenticated sessions, and works globally (not US-only).\\n\\n### Quick workflow (via Bash tool)\\n```bash\\n# 1. Ensure daemon is running\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox ping --json || /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox serve --foreground &\\n\\n# 2. Launch browser\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox launch --json\\n# Returns: instance_id\\n\\n# 3. Create a page\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox new-page <instance_id> --json\\n# Returns: page_id\\n\\n# 4. Navigate\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox navigate <instance_id> <page_id> <url> --json\\n\\n# 5. Extract text content\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox evaluate <instance_id> <page_id> 'document.body.innerText' --json\\n\\n# 6. Take screenshot\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox screenshot <instance_id> <page_id> --json\\n```\\n\\n### Other commands\\n- `/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox list --json` — list running instances\\n- `/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox stop <instance_id> --json` — stop an instance\\n- `/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox shutdown --json` — stop daemon + all instances\\n\\nAlways use `--json` flag for machine-readable output.\"}}\nEOF",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "WebSearch|WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat <<'EOF'\n{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"**STOP — Use the `/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox` CLI via Bash tool instead of WebSearch/WebFetch.**\\n\\nThe /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox CLI provides real browser automation that handles JS-heavy pages and works globally.\\n\\n### Workflow:\\n```bash\\n# 1. Ensure daemon running\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox ping --json || /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox serve --foreground &\\n\\n# 2. Launch browser (or reuse existing: /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox list --json)\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox launch --json\\n\\n# 3. Create page\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox new-page <instance_id> --json\\n\\n# 4. Navigate\\n#    For WebSearch: navigate to https://www.google.com/search?q=<url_encoded_query>\\n#    For WebFetch: navigate directly to the target URL\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox navigate <instance_id> <page_id> '<url>' --json\\n\\n# 5. Extract page text\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox evaluate <instance_id> <page_id> 'document.body.innerText' --json\\n\\n# 6. (Optional) Screenshot\\n/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox screenshot <instance_id> <page_id> --json\\n```\\n\\nAlways use `--json` for machine-readable output. Reuse existing browser instances when possible (`/workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox list --json`).\"}}\nEOF",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat <<'EOF'\n{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"IMPORTANT: Include /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox CLI instructions in your agent prompt. Add this to your prompt: Use the /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox CLI (via Bash) for ALL web browsing instead of WebSearch/WebFetch tools. Workflow: (1) /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox ping --json || /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox serve --foreground & (2) /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox launch --json (3) /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox new-page <instance_id> --json (4) /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox navigate <instance_id> <page_id> '<url>' --json (5) /workspace/camoufox-rs/target/aarch64-unknown-linux-gnu/debug/camoufox evaluate <instance_id> <page_id> 'document.body.innerText' --json. For search: navigate to https://www.google.com/search?q=<query>. Always use --json flag.\"}}\nEOF",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

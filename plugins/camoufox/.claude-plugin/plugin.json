@@ -1,0 +1,7 @@
+{
+  "name": "camoufox",
+  "description": "Browse the web with Camoufox anti-detect browser instead of WebSearch/WebFetch",
+  "version": "1.0.0",
+  "hooks": "./hooks/hook.json",
+  "skills": ["./skills/camoufox-browse"]
+}

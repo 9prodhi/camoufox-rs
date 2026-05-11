@@ -181,6 +181,27 @@ fn navigate_and_evaluate() {
 #[test]
 #[ignore]
 fn navigate_main_frame_with_cross_origin_iframe() {
+    // REGRESSION TEST for the cross-origin-iframe attach bug.
+    //
+    // When a page contains a fast cross-origin iframe (such as Amazon's
+    // aax-eu.amazon-adsystem.com ad-pixel), the iframe's main-world
+    // execution context arrives shortly after the top frame's, and the old
+    // code's unfiltered Runtime.executionContextCreated handler would
+    // overwrite the cached context with the iframe's. Subsequent
+    // `evaluate` then ran in the iframe.
+    //
+    // What this test exercises:
+    //   - Layer 3 fix (auxData.frameId filter on
+    //     Runtime.executionContextCreated): YES, end-to-end.
+    //   - Layer 1 fix (targetInfo.type == "page" on attachedToTarget):
+    //     NOT end-to-end. At new_main_frame() time only the top page target
+    //     exists; the iframe target appears later via navigation.
+    //   - Layer 2 fix (parentFrameId.is_empty() on Page.frameAttached):
+    //     NOT end-to-end. At new_main_frame() time only the top frame
+    //     exists; iframe frames attach later.
+    //
+    // Layers 1 and 2 are exercised by inspection of the filter predicates
+    // in src/api/context.rs.
     use std::time::Duration;
 
     let server = fixtures::FixtureServer::start();

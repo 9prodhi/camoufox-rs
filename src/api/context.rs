@@ -253,6 +253,23 @@ pub struct BrowserContext {
     connection: Arc<Connection>,
 }
 
+/// A `Runtime.executionContextCreated` event captured by the Layer-3
+/// listener before `session_id` and/or `frame_id` are known.
+///
+/// Used by `BrowserContext::new_main_frame` to close the
+/// `frameAttached`/`executionContextCreated` event-ordering race: while the
+/// listener cannot yet filter (because the IDs to filter on are not yet
+/// resolved), it appends candidate events here. After Layer 2 resolves,
+/// the main function drains this buffer under the same lock the listener
+/// uses, applies the final filter, and updates the cached exec-ctx with
+/// the last matching entry.
+struct BufferedContext {
+    session_id: String,
+    frame_id: String,
+    exec_ctx_id: String,
+    is_main_world: bool,
+}
+
 impl BrowserContext {
     /// Create a new `BrowserContext`.
     ///
@@ -552,6 +569,12 @@ impl BrowserContext {
     /// Together these make it structurally impossible for the returned
     /// `MainFrame` to refer to a sub-frame.
     ///
+    /// All three listeners are registered BEFORE `Browser.newPage` is sent
+    /// so no protocol events can be missed. The Layer-3 listener buffers
+    /// `Runtime.executionContextCreated` events until both `session_id`
+    /// (Layer 1) and `frame_id` (Layer 2) are known, then filters and
+    /// either drops them or promotes the last matching one into the cache.
+    ///
     /// # Errors
     ///
     /// - `"timeout waiting for type=='page' attach …"` — `ATTACH_TIMEOUT`
@@ -560,6 +583,7 @@ impl BrowserContext {
     /// - `"timeout waiting for main frame attach …"` — `ATTACH_TIMEOUT`
     ///   elapsed and no `Page.frameAttached` with `parentFrameId` absent
     ///   was seen on the page session.
+    #[allow(clippy::type_complexity)]
     pub fn new_main_frame(&self) -> Result<MainFrame, ProtocolError> {
         const MAX_SKIPPED_ATTACHES: usize = 16;
         let conn = &self.connection;
@@ -570,7 +594,6 @@ impl BrowserContext {
         // event. Skipped attaches go into a bounded Vec for the timeout
         // diagnostic.
         let (attach_tx, attach_rx) = mpsc::channel::<(String, String)>();
-        #[allow(clippy::type_complexity)]
         let skipped: Arc<Mutex<Vec<(String, Option<String>)>>> =
             Arc::new(Mutex::new(Vec::with_capacity(MAX_SKIPPED_ATTACHES)));
         let skipped_clone = Arc::clone(&skipped);
@@ -644,6 +667,128 @@ impl BrowserContext {
             }
         }));
 
+        // === Layer 3 fix: event-buffering listener for
+        // Runtime.executionContextCreated, registered BEFORE Browser.newPage.
+        //
+        // Camoufox/Juggler does NOT formally guarantee event ordering across
+        // `Page.frameAttached` and `Runtime.executionContextCreated`. If the
+        // top-frame exec context arrives before frameAttached, a listener
+        // installed only after Layer 2 resolves would miss it and a caller
+        // doing `evaluate()` without navigating first would hang.
+        //
+        // Strategy: register one global listener up front. While
+        // session_id/frame_id are unknown, buffer candidate events. Once
+        // session_id and frame_id are known, filter directly and update
+        // `exec_ctx` like the old single-filter listener did.
+        //
+        // CRITICAL — deadlock avoidance. Both this listener and the main
+        // function MUST acquire shared mutexes in the same order:
+        //   buffer -> session_id_holder -> frame_id_holder -> exec_ctx
+        let session_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let frame_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let exec_buffer: Arc<Mutex<Vec<BufferedContext>>> = Arc::new(Mutex::new(Vec::new()));
+        let exec_ctx: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        // Also register a sibling listener for Runtime.executionContextDestroyed
+        // that clears the cache when the cached context is destroyed. Without
+        // this, evaluate() in this Camoufox version succeeds-with-empty on a
+        // destroyed-but-still-valid stale context (e.g. about:blank just before
+        // a navigation completes), defeating the lazy retry path.
+        let exec_ctx_for_destroyed = Arc::clone(&exec_ctx);
+        let session_holder_for_destroyed = Arc::clone(&session_id_holder);
+        conn.on_event_global(Box::new(move |event| {
+            if event.method != "Runtime.executionContextDestroyed" {
+                return;
+            }
+            let event_sid = event.session_id.as_deref().unwrap_or("");
+            // Only react once we know our session.
+            let our_sid = match session_holder_for_destroyed.lock().unwrap().clone() {
+                Some(s) => s,
+                None => return,
+            };
+            if event_sid != our_sid {
+                return;
+            }
+            let dead = event
+                .params
+                .get("executionContextId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if dead.is_empty() {
+                return;
+            }
+            let mut guard = exec_ctx_for_destroyed.lock().unwrap();
+            if guard.as_deref() == Some(dead) {
+                *guard = None;
+            }
+        }));
+
+        let session_holder_for_listener = Arc::clone(&session_id_holder);
+        let frame_holder_for_listener = Arc::clone(&frame_id_holder);
+        let buffer_for_listener = Arc::clone(&exec_buffer);
+        let exec_ctx_for_listener = Arc::clone(&exec_ctx);
+        conn.on_event_global(Box::new(move |event| {
+            if event.method != "Runtime.executionContextCreated" {
+                return;
+            }
+            let event_sid = event.session_id.as_deref().unwrap_or("").to_owned();
+            let aux = event.params.get("auxData");
+            let event_fid = aux
+                .and_then(|a| a.get("frameId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let is_main_world = aux
+                .and_then(|a| a.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|n| n.is_empty())
+                .unwrap_or(true);
+            let ctx_id = match event
+                .params
+                .get("executionContextId")
+                .and_then(|v| v.as_str())
+            {
+                Some(s) if !s.is_empty() => s.to_owned(),
+                _ => return,
+            };
+
+            // Lock order: buffer -> session_id_holder -> frame_id_holder
+            //   -> exec_ctx.
+            let mut buf = buffer_for_listener.lock().unwrap();
+            let known_sid = session_holder_for_listener.lock().unwrap().clone();
+            let known_fid = frame_holder_for_listener.lock().unwrap().clone();
+
+            match (known_sid, known_fid) {
+                (None, _) => {
+                    // Don't know our session yet — buffer and filter later.
+                    buf.push(BufferedContext {
+                        session_id: event_sid,
+                        frame_id: event_fid,
+                        exec_ctx_id: ctx_id,
+                        is_main_world,
+                    });
+                }
+                (Some(sid), _) if sid != event_sid => {
+                    // Other session — noise; drop.
+                }
+                (Some(_), None) => {
+                    // Our session, frame_id not known yet — buffer.
+                    buf.push(BufferedContext {
+                        session_id: event_sid,
+                        frame_id: event_fid,
+                        exec_ctx_id: ctx_id,
+                        is_main_world,
+                    });
+                }
+                (Some(_), Some(fid)) => {
+                    // Both known — apply final filter directly.
+                    if event_fid == fid && is_main_world {
+                        *exec_ctx_for_listener.lock().unwrap() = Some(ctx_id);
+                    }
+                }
+            }
+        }));
+
         // === Send Browser.newPage. ===
         let result = self.session().send(
             "Browser.newPage",
@@ -703,6 +848,16 @@ impl BrowserContext {
             }
         };
 
+        // === Layer 1 -> Layer 3: publish session_id to the listener.
+        //
+        // Lock order: buffer -> session_id_holder. We don't drain here;
+        // session-only filtering is the listener's responsibility from now
+        // on. We hold the buffer lock to avoid TOCTOU with the listener.
+        {
+            let _buf = exec_buffer.lock().unwrap();
+            *session_id_holder.lock().unwrap() = Some(session_id.clone());
+        }
+
         // === Build the page session. ===
         let page_session = conn.create_session(session_id.clone());
 
@@ -738,39 +893,30 @@ impl BrowserContext {
             }
         };
 
-        // === Layer 3 fix: subscribe with frame_id + main-world filter. ===
-        let exec_ctx: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let exec_ctx_clone = Arc::clone(&exec_ctx);
-        let sid_for_listener = session_id.clone();
-        let frame_id_for_listener = frame_id.clone();
-        conn.on_event_global(Box::new(move |event| {
-            if event.session_id.as_deref().unwrap_or("") != sid_for_listener {
-                return;
+        // === Layer 2 -> Layer 3: publish frame_id and drain the buffer
+        // atomically.
+        //
+        // Lock order: buffer -> session_id_holder -> frame_id_holder ->
+        // exec_ctx. Acquiring the buffer lock first ensures no listener
+        // invocation can interleave between buffer-check and frame_id set.
+        // The LAST matching entry wins (matches the old listener's
+        // "last writer" semantics).
+        {
+            let mut buf = exec_buffer.lock().unwrap();
+            *frame_id_holder.lock().unwrap() = Some(frame_id.clone());
+            let mut latest: Option<String> = None;
+            for entry in buf.drain(..) {
+                if entry.session_id == session_id
+                    && entry.frame_id == frame_id
+                    && entry.is_main_world
+                {
+                    latest = Some(entry.exec_ctx_id);
+                }
             }
-            if event.method != "Runtime.executionContextCreated" {
-                return;
+            if let Some(c) = latest {
+                *exec_ctx.lock().unwrap() = Some(c);
             }
-            let aux = event.params.get("auxData");
-            let event_frame_id = aux
-                .and_then(|a| a.get("frameId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let is_main_world = aux
-                .and_then(|a| a.get("name"))
-                .and_then(|n| n.as_str())
-                .map(|n| n.is_empty())
-                .unwrap_or(true);
-            if event_frame_id != frame_id_for_listener || !is_main_world {
-                return;
-            }
-            if let Some(ctx_id) = event
-                .params
-                .get("executionContextId")
-                .and_then(|v| v.as_str())
-            {
-                *exec_ctx_clone.lock().unwrap() = Some(ctx_id.to_owned());
-            }
-        }));
+        }
 
         Ok(MainFrame::new(
             page_session,

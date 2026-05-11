@@ -230,6 +230,12 @@ impl MainFrame {
     ///
     /// Always navigates the top frame (no `frame_id` override). Returns the
     /// navigation ID for cross-document navigations, `None` for same-document.
+    ///
+    /// Invalidates the cached execution context on cross-document navigation
+    /// so a subsequent [`evaluate`](Self::evaluate) call waits for the new
+    /// document's main-world context rather than racing against the stale
+    /// pre-navigation context. (The Layer-3 destroyed-event listener also
+    /// clears the cache, but the event can arrive after the next evaluate.)
     pub fn navigate(
         &self,
         url: &str,
@@ -249,6 +255,13 @@ impl MainFrame {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_owned());
+
+        // Cross-document navigation invalidates the pre-nav exec context.
+        // Clear the cache so subsequent evaluate() calls wait for the new
+        // document's main-world context.
+        if nav_id.is_some() {
+            *self.execution_context_id.lock().unwrap() = None;
+        }
         Ok(nav_id)
     }
 
@@ -719,18 +732,24 @@ impl MainFrame {
     // Runtime domain methods
     // -----------------------------------------------------------------------
 
-    /// Evaluate a JavaScript expression.
-    ///
-    /// Returns the result as a JSON value. The expression is evaluated in
-    /// the main execution context of the main frame.
-    ///
-    /// # Error handling
-    ///
     /// Evaluate a JavaScript expression in the top-frame main world.
     ///
     /// Polls the cached execution context (up to `timeout`); if `evaluate`
-    /// fails with a "context destroyed" error (SPA navigation), retries up
-    /// to 5 times after waiting for a fresh context.
+    /// fails with a "context destroyed" error (typical during SPA
+    /// navigation), retries up to 5 times after waiting for a fresh
+    /// context.
+    ///
+    /// # Note on `Runtime.executionContextDestroyed`
+    ///
+    /// The Layer-3 listener installed by
+    /// [`BrowserContext::new_main_frame`](crate::api::context::BrowserContext::new_main_frame)
+    /// proactively clears the cached execution context when its
+    /// `Runtime.executionContextDestroyed` matches, so the next call here
+    /// sees `None` and waits for a fresh context.
+    ///
+    /// As a safety net, this method ALSO retries up to 5 times on a
+    /// "context destroyed" error response — useful when an evaluate
+    /// happens to race the destroyed event over the wire.
     pub fn evaluate(
         &self,
         expression: &str,

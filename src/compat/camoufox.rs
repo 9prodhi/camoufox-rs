@@ -13,7 +13,7 @@
 /// Camoufox builds are detected by looking for the `"Camoufox"` substring
 /// in either the user-agent or version string. This is a heuristic; the
 /// exact detection logic may need to be updated for future Camoufox releases.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CamoufoxInfo {
     /// The full user-agent string from `Browser.getInfo`.
     pub user_agent: String,
@@ -90,7 +90,7 @@ impl CamoufoxInfo {
 
             // Contrast support was added in Firefox 128.
             "Browser.setContrast" => {
-                self.major_version.map_or(false, |v| v >= 128) || self.is_camoufox
+                self.major_version.is_some_and(|v| v >= 128) || self.is_camoufox
             }
 
             // All standard Juggler protocol methods are supported.
@@ -99,16 +99,6 @@ impl CamoufoxInfo {
     }
 }
 
-impl Default for CamoufoxInfo {
-    fn default() -> Self {
-        Self {
-            user_agent: String::new(),
-            version: String::new(),
-            is_camoufox: false,
-            major_version: None,
-        }
-    }
-}
 
 /// Check whether a method is part of the standard Juggler protocol.
 ///

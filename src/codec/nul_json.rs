@@ -137,7 +137,7 @@ impl NulJsonCodec {
     /// Encode a JSON value and split the result into chunks suitable for
     /// individual `write()` syscalls.
     ///
-    /// Each chunk is at most [`write_chunk_size`] bytes (default 64 KiB).
+    /// Each chunk is at most `write_chunk_size` bytes (default 64 KiB).
     /// The trailing `\0` delimiter is included in the payload and naturally
     /// ends up in the final chunk.
     pub fn encode_chunks(&self, value: &serde_json::Value) -> Vec<Vec<u8>> {

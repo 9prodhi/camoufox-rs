@@ -223,6 +223,7 @@ impl Instance {
 // ---------------------------------------------------------------------------
 
 /// Manages all browser instances for the daemon.
+#[derive(Default)]
 pub struct InstanceManager {
     instances: HashMap<String, Instance>,
     /// Per-instance context stored separately so we can borrow mutably.

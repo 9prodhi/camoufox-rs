@@ -262,9 +262,11 @@ mod tests {
     /// successfully, and the parent-side pipe fds should be usable.
     #[test]
     fn spawn_with_sh_creates_pipes() {
-        let mut config = LaunchConfig::default();
-        config.executable = PathBuf::from("/bin/sh");
-        config.profile_dir = Some(PathBuf::from("/tmp"));
+        let config = LaunchConfig {
+            executable: PathBuf::from("/bin/sh"),
+            profile_dir: Some(PathBuf::from("/tmp")),
+            ..Default::default()
+        };
 
         let result = spawn(&config);
         match result {
@@ -275,12 +277,12 @@ mod tests {
 
                 // Verify command_pipe is writable (may get BrokenPipe since
                 // child exited, but the fd should be valid).
-                let write_result = (&mut launched.command_pipe).write(b"test");
+                let write_result = launched.command_pipe.write(b"test");
                 let _ = write_result;
 
                 // Verify response_pipe is readable (should get EOF).
                 let mut buf = [0u8; 64];
-                let read_result = (&mut launched.response_pipe).read(&mut buf);
+                let read_result = launched.response_pipe.read(&mut buf);
                 match read_result {
                     Ok(0) => {} // EOF — expected since child exited
                     Ok(_) => {} // child wrote something
@@ -297,9 +299,11 @@ mod tests {
     /// Test that spawn passes environment variables to the child.
     #[test]
     fn spawn_passes_env_vars() {
-        let mut config = LaunchConfig::default();
-        config.executable = PathBuf::from("/bin/sh");
-        config.profile_dir = Some(PathBuf::from("/tmp"));
+        let mut config = LaunchConfig {
+            executable: PathBuf::from("/bin/sh"),
+            profile_dir: Some(PathBuf::from("/tmp")),
+            ..Default::default()
+        };
         config.env
             .insert("CAMOUFOX_TEST_VAR".into(), "test_value".into());
 
@@ -344,9 +348,11 @@ mod tests {
             .args(["+x", script_path])
             .status();
 
-        let mut config = LaunchConfig::default();
-        config.executable = PathBuf::from(script_path);
-        config.profile_dir = Some(PathBuf::from("/tmp"));
+        let config = LaunchConfig {
+            executable: PathBuf::from(script_path),
+            profile_dir: Some(PathBuf::from("/tmp")),
+            ..Default::default()
+        };
 
         match spawn(&config) {
             Ok(mut launched) => {

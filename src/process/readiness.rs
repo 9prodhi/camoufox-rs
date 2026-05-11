@@ -37,7 +37,7 @@ enum ReadResult {
 /// Wait for the Camoufox process to signal readiness on stderr.
 ///
 /// Spawns a background thread that reads from the child's stderr line by line,
-/// looking for the [`READINESS_SENTINEL`] substring. Uses a channel with
+/// looking for the `READINESS_SENTINEL` substring. Uses a channel with
 /// timeout to enforce the deadline.
 ///
 /// # Arguments
@@ -89,7 +89,7 @@ pub fn wait_for_ready(
 
         Ok(ReadResult::Eof(output)) => {
             // Process stderr closed. Check if the process has exited.
-            let code = child.try_wait().ok().flatten().map(|s| s.code()).flatten();
+            let code = child.try_wait().ok().flatten().and_then(|s| s.code());
             Err(ProcessError::ExitedBeforeReady {
                 code,
                 stderr: output,
@@ -125,7 +125,7 @@ pub fn wait_for_ready(
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             // The reader thread panicked or was dropped without sending.
             // Check if the process exited.
-            let code = child.try_wait().ok().flatten().map(|s| s.code()).flatten();
+            let code = child.try_wait().ok().flatten().and_then(|s| s.code());
             Err(ProcessError::ExitedBeforeReady {
                 code,
                 stderr: String::new(),

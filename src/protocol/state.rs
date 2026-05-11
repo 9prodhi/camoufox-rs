@@ -148,12 +148,12 @@ impl SessionState {
     /// - `Active → Disposed`
     /// - `Crashed → Disposed` (crash followed by close)
     pub fn transition(self, to: SessionState) -> Result<SessionState, String> {
-        let valid = match (self, to) {
-            (SessionState::Active, SessionState::Crashed) => true,
-            (SessionState::Active, SessionState::Disposed) => true,
-            (SessionState::Crashed, SessionState::Disposed) => true,
-            _ => false,
-        };
+        let valid = matches!(
+            (self, to),
+            (SessionState::Active, SessionState::Crashed)
+                | (SessionState::Active, SessionState::Disposed)
+                | (SessionState::Crashed, SessionState::Disposed)
+        );
 
         if valid {
             Ok(to)

@@ -24,6 +24,7 @@ pub struct FixtureServer {
     /// `http://127.0.0.1:<main_port>/`
     pub main_url: String,
     /// `http://127.0.0.1:<iframe_port>/`
+    #[allow(dead_code)]
     pub iframe_url: String,
     _main_server: Arc<Server>,
     _iframe_server: Arc<Server>,

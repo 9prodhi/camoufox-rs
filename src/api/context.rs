@@ -570,6 +570,7 @@ impl BrowserContext {
         // event. Skipped attaches go into a bounded Vec for the timeout
         // diagnostic.
         let (attach_tx, attach_rx) = mpsc::channel::<(String, String)>();
+        #[allow(clippy::type_complexity)]
         let skipped: Arc<Mutex<Vec<(String, Option<String>)>>> =
             Arc::new(Mutex::new(Vec::with_capacity(MAX_SKIPPED_ATTACHES)));
         let skipped_clone = Arc::clone(&skipped);

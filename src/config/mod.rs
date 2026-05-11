@@ -246,8 +246,10 @@ mod tests {
 
     #[test]
     fn build_args_headless_non_persistent() {
-        let mut cfg = LaunchConfig::default();
-        cfg.profile_dir = Some(PathBuf::from("/tmp/test-profile"));
+        let cfg = LaunchConfig {
+            profile_dir: Some(PathBuf::from("/tmp/test-profile")),
+            ..Default::default()
+        };
 
         let args = cfg.build_args();
         assert_eq!(
@@ -265,11 +267,13 @@ mod tests {
 
     #[test]
     fn build_args_headed_persistent_with_extra_args() {
-        let mut cfg = LaunchConfig::default();
-        cfg.headless = false;
-        cfg.persistent = true;
-        cfg.profile_dir = Some(PathBuf::from("/data/profile"));
-        cfg.args = vec!["--width=800".into(), "--height=600".into()];
+        let cfg = LaunchConfig {
+            headless: false,
+            persistent: true,
+            profile_dir: Some(PathBuf::from("/data/profile")),
+            args: vec!["--width=800".into(), "--height=600".into()],
+            ..Default::default()
+        };
 
         let args = cfg.build_args();
         assert_eq!(

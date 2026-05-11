@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::api::{Browser, BrowserOptions, ContextOptions, MainFrame, Rect, ScreenshotOptions};
+use crate::api::{Browser, BrowserOptions, ContextOptions, MainFrame};
+use crate::api::main_frame::{Rect, ScreenshotOptions};
 use crate::config::LaunchConfig;
 use crate::protocol::client::Connection;
 use crate::transport::pipe::PipeTransport;
@@ -68,47 +69,45 @@ impl Instance {
 
     /// Navigate a page to a URL.
     ///
-    /// Waits for the new execution context to be established after navigation
-    /// so that subsequent `evaluate`/`screenshot` calls don't hit a `None` context.
-    pub fn navigate(&self, page_id: &str, url: &str) -> Result<Option<String>, String> {
+    /// Clears the cached execution context so the next `evaluate` waits for
+    /// the post-navigation context; the wait happens inside `MainFrame::evaluate`.
+    pub fn navigate(
+        &self,
+        page_id: &str,
+        url: &str,
+        _timeout: Duration,
+    ) -> Result<Option<String>, String> {
         let mp = self
             .pages
             .get(page_id)
             .ok_or_else(|| format!("page {page_id} not found"))?;
-        let nav_id = mp
-            .page
+
+        // Force `evaluate` to wait for a fresh post-navigation context.
+        *mp.main_frame.execution_context_handle().lock().unwrap() = None;
+
+        mp.main_frame
             .navigate(url, Default::default())
-            .map_err(|e| format!("navigate failed: {e}"))?;
-
-        // Wait for the new execution context to appear (the persistent event
-        // handler in create_page sets it when Runtime.executionContextCreated fires).
-        Self::wait_for_exec_context(&mp.execution_context_id, EVENT_TIMEOUT)?;
-
-        Ok(nav_id)
+            .map_err(|e| format!("navigate failed: {e}"))
     }
 
     /// Evaluate JavaScript on a page.
-    ///
-    /// If the execution context is temporarily `None` (e.g. during a
-    /// client-side redirect), this will poll-wait up to `EVENT_TIMEOUT`
-    /// for it to reappear before giving up.
     pub fn evaluate(
         &self,
         page_id: &str,
         expression: &str,
+        timeout: Duration,
     ) -> Result<serde_json::Value, String> {
         let mp = self
             .pages
             .get(page_id)
             .ok_or_else(|| format!("page {page_id} not found"))?;
-        let exec_ctx =
-            Self::wait_for_exec_context(&mp.execution_context_id, EVENT_TIMEOUT)?;
         let result = mp
-            .page
-            .evaluate(expression, &exec_ctx)
+            .main_frame
+            .evaluate(expression, timeout)
             .map_err(|e| format!("evaluate failed: {e}"))?;
 
-        // Extract the inner value from {"result": {"value": ...}}
+        // Unwrap `{result: {value: …}}` to just the value, matching today's
+        // CLI output shape.
         let value = result
             .get("result")
             .and_then(|r| r.get("value"))
@@ -125,19 +124,18 @@ impl Instance {
         format: Option<&str>,
         quality: Option<u32>,
         path: Option<&str>,
+        timeout: Duration,
     ) -> Result<(Vec<u8>, String), String> {
         let mp = self
             .pages
             .get(page_id)
             .ok_or_else(|| format!("page {page_id} not found"))?;
 
-        // Get viewport dimensions via evaluate — wait for context if navigating.
-        let exec_ctx =
-            Self::wait_for_exec_context(&mp.execution_context_id, EVENT_TIMEOUT)?;
-
+        // Get viewport dimensions via evaluate (which itself waits for the
+        // execution context if necessary).
         let dims = mp
-            .page
-            .evaluate("[window.innerWidth, window.innerHeight]", &exec_ctx)
+            .main_frame
+            .evaluate("[window.innerWidth, window.innerHeight]", timeout)
             .map_err(|e| format!("failed to get viewport dimensions: {e}"))?;
 
         let (width, height) = {
@@ -169,18 +167,16 @@ impl Instance {
         };
 
         let bytes = mp
-            .page
+            .main_frame
             .screenshot(options)
             .map_err(|e| format!("screenshot failed: {e}"))?;
 
-        // Determine output path.
         let ext = if mime == "image/jpeg" { "jpg" } else { "png" };
         let out_path = match path {
             Some(p) => p.to_string(),
-            None => format!("/tmp/screenshot-{}.{ext}", page_id),
+            None => format!("/tmp/screenshot-{page_id}.{ext}"),
         };
 
-        // Write to file.
         std::fs::write(&out_path, &bytes)
             .map_err(|e| format!("failed to write screenshot: {e}"))?;
 
@@ -352,12 +348,13 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
         url: &str,
+        timeout: Duration,
     ) -> Result<Option<String>, String> {
         let inst = self
             .instances
             .get(instance_id)
             .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.navigate(page_id, url)
+        inst.navigate(page_id, url, timeout)
     }
 
     /// Evaluate JavaScript.
@@ -366,12 +363,13 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
         expression: &str,
+        timeout: Duration,
     ) -> Result<serde_json::Value, String> {
         let inst = self
             .instances
             .get(instance_id)
             .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.evaluate(page_id, expression)
+        inst.evaluate(page_id, expression, timeout)
     }
 
     /// Take a screenshot.
@@ -382,12 +380,13 @@ impl InstanceManager {
         format: Option<&str>,
         quality: Option<u32>,
         path: Option<&str>,
+        timeout: Duration,
     ) -> Result<(Vec<u8>, String), String> {
         let inst = self
             .instances
             .get(instance_id)
             .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.screenshot(page_id, format, quality, path)
+        inst.screenshot(page_id, format, quality, path, timeout)
     }
 
     /// Number of running instances.

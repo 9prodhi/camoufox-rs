@@ -6,6 +6,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::json;
 
@@ -167,7 +168,7 @@ fn dispatch(
             url,
         } => {
             let mgr = manager.lock().unwrap();
-            match mgr.navigate(&instance_id, &page_id, &url) {
+            match mgr.navigate(&instance_id, &page_id, &url, Duration::from_secs(30)) {
                 Ok(nav_id) => DaemonResponse::ok(json!({ "navigation_id": nav_id })),
                 Err(e) => DaemonResponse::err(e),
             }
@@ -179,7 +180,7 @@ fn dispatch(
             expression,
         } => {
             let mgr = manager.lock().unwrap();
-            match mgr.evaluate(&instance_id, &page_id, &expression) {
+            match mgr.evaluate(&instance_id, &page_id, &expression, Duration::from_secs(30)) {
                 Ok(result) => DaemonResponse::ok(json!({ "result": result })),
                 Err(e) => DaemonResponse::err(e),
             }
@@ -199,6 +200,7 @@ fn dispatch(
                 format.as_deref(),
                 quality,
                 path.as_deref(),
+                Duration::from_secs(30),
             ) {
                 Ok((bytes, out_path)) => DaemonResponse::ok(json!({
                     "bytes": bytes.len(),

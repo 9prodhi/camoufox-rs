@@ -20,12 +20,13 @@ use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 // ---------------------------------------------------------------------------
 
 /// Options for page navigation.
+///
+/// Top-frame-only — there is no `frame_id` override. `MainFrame::navigate`
+/// always operates on the main frame.
 #[derive(Debug, Clone, Default)]
 pub struct NavigateOptions {
     /// HTTP referer header to send with the navigation request.
     pub referer: Option<String>,
-    /// Frame ID to navigate. If `None`, navigates the main frame.
-    pub frame_id: Option<String>,
 }
 
 /// Options for taking a screenshot.

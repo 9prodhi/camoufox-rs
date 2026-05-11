@@ -14,7 +14,6 @@ use serde_json::json;
 
 use crate::api::browser::{Connection, ProxyConfig, Session};
 use crate::api::main_frame::MainFrame;
-use crate::api::page::Page;
 use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 
 // ---------------------------------------------------------------------------
@@ -234,8 +233,9 @@ pub struct Cookie {
 ///
 /// # Creating pages
 ///
-/// Use [`new_page`](BrowserContext::new_page) to create a new page in this
-/// context. The page will inherit the context's configuration.
+/// Use [`new_main_frame`](BrowserContext::new_main_frame) to create a new
+/// page in this context. The returned [`MainFrame`] is pinned to the top
+/// frame and inherits the context's configuration.
 ///
 /// # Cleanup
 ///
@@ -534,36 +534,6 @@ impl BrowserContext {
         }
 
         Ok(())
-    }
-
-    /// Create a new page in this context.
-    ///
-    /// Sends `Browser.newPage` and returns a [`Page`] handle. The caller
-    /// must separately listen for the `Browser.attachedToTarget` event to
-    /// obtain the page session's `sessionId` and wire it up.
-    ///
-    /// # Edge cases
-    ///
-    /// - First page creation is serialized by the browser to prevent race
-    ///   conditions (PROTOCOL.md Section 14, item 22).
-    /// - May throw `"Failed to override timezone"` if the timezone is invalid.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProtocolError`] if page creation fails.
-    pub fn new_page(&self) -> Result<Page, ProtocolError> {
-        let result = self.session().send(
-            "Browser.newPage",
-            json!({ "browserContextId": self.context_id }),
-        )?;
-
-        let target_id = result
-            .get("targetId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-
-        Ok(Page::new(target_id, self.context_id.clone()))
     }
 
     /// Timeout for waiting on `Browser.attachedToTarget` (Layer 1) and on

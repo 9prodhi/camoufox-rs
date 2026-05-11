@@ -18,8 +18,14 @@ use camoufox::process;
 use camoufox::protocol::client::Connection;
 use camoufox::transport::pipe::PipeTransport;
 
-const CAMOUFOX_BIN: &str = "/root/.cache/camoufox/camoufox";
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn camoufox_bin() -> String {
+    std::env::var("CAMOUFOX_BIN").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        format!("{home}/.cache/camoufox/camoufox")
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -67,7 +73,7 @@ fn setup() -> TestBrowser {
     let profile_dir = tempfile::tempdir().expect("failed to create temp profile dir");
 
     let config = LaunchConfig {
-        executable: PathBuf::from(CAMOUFOX_BIN),
+        executable: PathBuf::from(camoufox_bin()),
         profile_dir: Some(profile_dir.path().to_owned()),
         headless: true,
         ..Default::default()

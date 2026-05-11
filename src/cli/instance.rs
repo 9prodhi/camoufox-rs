@@ -18,8 +18,14 @@ use crate::config::LaunchConfig;
 use crate::protocol::client::Connection;
 use crate::transport::pipe::PipeTransport;
 
-const DEFAULT_EXECUTABLE: &str = "/root/.cache/camoufox/camoufox";
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn default_executable() -> String {
+    std::env::var("CAMOUFOX_BIN").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        format!("{home}/.cache/camoufox/camoufox")
+    })
+}
 
 // ---------------------------------------------------------------------------
 // ManagedPage
@@ -508,7 +514,9 @@ impl InstanceManager {
             tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
 
         let config = LaunchConfig {
-            executable: PathBuf::from(executable.unwrap_or(DEFAULT_EXECUTABLE)),
+            executable: PathBuf::from(
+                executable.map(|s| s.to_owned()).unwrap_or_else(default_executable),
+            ),
             profile_dir: Some(profile_dir.path().to_owned()),
             headless: headless.unwrap_or(true),
             ..Default::default()

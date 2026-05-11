@@ -5,6 +5,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+fn default_timeout() -> u64 {
+    30
+}
+
 // ---------------------------------------------------------------------------
 // Request
 // ---------------------------------------------------------------------------
@@ -38,6 +42,8 @@ pub enum DaemonRequest {
         instance_id: String,
         page_id: String,
         url: String,
+        #[serde(default = "default_timeout")]
+        timeout_secs: u64,
     },
 
     /// Evaluate JavaScript on a page.
@@ -45,6 +51,8 @@ pub enum DaemonRequest {
         instance_id: String,
         page_id: String,
         expression: String,
+        #[serde(default = "default_timeout")]
+        timeout_secs: u64,
     },
 
     /// Take a screenshot of a page.
@@ -57,6 +65,8 @@ pub enum DaemonRequest {
         quality: Option<u32>,
         #[serde(default)]
         path: Option<String>,
+        #[serde(default = "default_timeout")]
+        timeout_secs: u64,
     },
 
     /// Shut down the daemon and all instances.

@@ -49,6 +49,7 @@ fn main() {
             instance_id,
             page_id,
             url,
+            timeout,
         } => {
             run_client(
                 &sock,
@@ -56,6 +57,7 @@ fn main() {
                     instance_id,
                     page_id,
                     url,
+                    timeout_secs: timeout,
                 },
                 cli.json,
             );
@@ -65,6 +67,7 @@ fn main() {
             instance_id,
             page_id,
             expression,
+            timeout,
         } => {
             run_client(
                 &sock,
@@ -72,6 +75,7 @@ fn main() {
                     instance_id,
                     page_id,
                     expression,
+                    timeout_secs: timeout,
                 },
                 cli.json,
             );
@@ -83,6 +87,7 @@ fn main() {
             output,
             format,
             quality,
+            timeout,
         } => {
             run_client(
                 &sock,
@@ -92,6 +97,7 @@ fn main() {
                     format: Some(format),
                     quality,
                     path: output,
+                    timeout_secs: timeout,
                 },
                 cli.json,
             );

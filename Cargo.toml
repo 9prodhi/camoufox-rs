@@ -23,6 +23,9 @@ libc = "0.2.182"
 tempfile = "3"
 tiny_http = "0.12"
 
+[[example]]
+name = "web_browse"
+
 [features]
 default = []
 cli = ["clap", "env_logger", "tempfile"]

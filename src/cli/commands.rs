@@ -60,6 +60,9 @@ pub enum Command {
         page_id: String,
         /// URL to navigate to.
         url: String,
+        /// Timeout in seconds for waiting for execution context.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
     },
 
     /// Evaluate JavaScript on a page.
@@ -70,6 +73,9 @@ pub enum Command {
         page_id: String,
         /// JavaScript expression to evaluate.
         expression: String,
+        /// Timeout in seconds for waiting for execution context.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
     },
 
     /// Take a screenshot of a page.
@@ -87,6 +93,9 @@ pub enum Command {
         /// JPEG quality (0-100).
         #[arg(long)]
         quality: Option<u32>,
+        /// Timeout in seconds for waiting for execution context.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
     },
 
     /// Shut down the daemon and all browser instances.

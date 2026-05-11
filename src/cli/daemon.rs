@@ -6,7 +6,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde_json::json;
 
@@ -166,9 +165,11 @@ fn dispatch(
             instance_id,
             page_id,
             url,
+            timeout_secs,
         } => {
             let mgr = manager.lock().unwrap();
-            match mgr.navigate(&instance_id, &page_id, &url, Duration::from_secs(30)) {
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.navigate(&instance_id, &page_id, &url, timeout) {
                 Ok(nav_id) => DaemonResponse::ok(json!({ "navigation_id": nav_id })),
                 Err(e) => DaemonResponse::err(e),
             }
@@ -178,9 +179,11 @@ fn dispatch(
             instance_id,
             page_id,
             expression,
+            timeout_secs,
         } => {
             let mgr = manager.lock().unwrap();
-            match mgr.evaluate(&instance_id, &page_id, &expression, Duration::from_secs(30)) {
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.evaluate(&instance_id, &page_id, &expression, timeout) {
                 Ok(result) => DaemonResponse::ok(json!({ "result": result })),
                 Err(e) => DaemonResponse::err(e),
             }
@@ -192,15 +195,17 @@ fn dispatch(
             format,
             quality,
             path,
+            timeout_secs,
         } => {
             let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
             match mgr.screenshot(
                 &instance_id,
                 &page_id,
                 format.as_deref(),
                 quality,
                 path.as_deref(),
-                Duration::from_secs(30),
+                timeout,
             ) {
                 Ok((bytes, out_path)) => DaemonResponse::ok(json!({
                     "bytes": bytes.len(),

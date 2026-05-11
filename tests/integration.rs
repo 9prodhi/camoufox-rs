@@ -425,79 +425,33 @@ fn probe_page_get_frame_tree_available() {
 #[test]
 #[ignore]
 fn navigate_main_frame_with_cross_origin_iframe() {
-    // REGRESSION TEST for the cross-origin-iframe attach bug.
-    //
-    // When a page contains a fast cross-origin iframe (such as Amazon's
-    // aax-eu.amazon-adsystem.com ad-pixel), the iframe target races ahead
-    // of the main page target in `Browser.attachedToTarget` events. Today,
-    // `setup_page` accepts the first event and the resulting Page ends up
-    // operating against the iframe, not the top frame.
-    //
-    // This test should FAIL on current code and PASS after the Layer 1/2/3
-    // fixes land. It uses Page (today's API); a later task migrates it to
-    // MainFrame.
     use std::time::Duration;
 
     let server = fixtures::FixtureServer::start();
     let tb = setup();
-    let (_context, page, session_id) = setup_page(&tb.browser);
 
-    // Set up execution-context tracking the same way navigate_and_evaluate
-    // does — see existing test for reference.
-    let conn = tb.browser.connection().clone();
-    let exec_ctx = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-    let exec_ctx_clone = std::sync::Arc::clone(&exec_ctx);
-    let sid_clone = session_id.clone();
-    conn.on_event_global(Box::new(move |event| {
-        if event.session_id.as_deref().unwrap_or("") != sid_clone {
-            return;
-        }
-        if event.method == "Runtime.executionContextCreated" {
-            let is_main_world = event
-                .params
-                .get("auxData")
-                .and_then(|a| a.get("name"))
-                .and_then(|n| n.as_str())
-                .map(|n| n.is_empty())
-                .unwrap_or(true);
-            if is_main_world {
-                if let Some(ctx_id) = event
-                    .params
-                    .get("executionContextId")
-                    .and_then(|v| v.as_str())
-                {
-                    *exec_ctx_clone.lock().unwrap() = Some(ctx_id.to_owned());
-                }
-            }
-        }
-    }));
+    let context = tb
+        .browser
+        .new_context(ContextOptions::default())
+        .expect("failed to create context");
+    let main_frame = context
+        .new_main_frame()
+        .expect("failed to create main frame");
 
-    // Navigate to the main page (which embeds the cross-origin iframe).
-    page.navigate(&server.main_url, Default::default())
+    main_frame
+        .navigate(&server.main_url, Default::default())
         .expect("navigate failed");
 
-    // Poll for an execution context (up to 10 s).
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let ctx_id = loop {
-        if let Some(c) = exec_ctx.lock().unwrap().clone() {
-            break c;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("timed out waiting for execution context");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-
-    let body_text = page
-        .evaluate("document.body.innerText", &ctx_id)
-        .expect("evaluate failed");
-    let location = page
-        .evaluate("location.href", &ctx_id)
+    let body = main_frame
+        .evaluate("document.body.innerText", Duration::from_secs(15))
+        .expect("evaluate body failed");
+    let location = main_frame
+        .evaluate("location.href", Duration::from_secs(15))
         .expect("evaluate location.href failed");
 
-    let body_str = body_text
+    let body_str = body
         .pointer("/result/value")
-        .or_else(|| body_text.get("value"))
+        .or_else(|| body.get("value"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_owned();

@@ -7,30 +7,31 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
 
-use crate::api::{Browser, BrowserOptions, ContextOptions, Page, Rect, ScreenshotOptions};
+use crate::api::{Browser, BrowserOptions, ContextOptions, MainFrame};
+use crate::api::main_frame::{Rect, ScreenshotOptions};
 use crate::config::LaunchConfig;
 use crate::protocol::client::Connection;
 use crate::transport::pipe::PipeTransport;
 
-const DEFAULT_EXECUTABLE: &str = "/root/.cache/camoufox/camoufox";
-const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+fn default_executable() -> String {
+    std::env::var("CAMOUFOX_BIN").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        format!("{home}/.cache/camoufox/camoufox")
+    })
+}
 
 // ---------------------------------------------------------------------------
-// ManagedPage
+// ManagedMainFrame
 // ---------------------------------------------------------------------------
 
-/// A page with persistent execution context tracking.
-pub struct ManagedPage {
-    pub page: Page,
-    pub session_id: String,
-    /// The current execution context ID, updated by global event handlers.
-    pub execution_context_id: Arc<Mutex<Option<String>>>,
+/// A `MainFrame` plus its CLI-facing page label tracking. The label lives
+/// in the parent `HashMap` key; this struct just owns the frame.
+pub struct ManagedMainFrame {
+    pub main_frame: MainFrame,
 }
 
 // ---------------------------------------------------------------------------
@@ -44,326 +45,69 @@ pub struct Instance {
     pub version: Option<String>,
     pub pid: u32,
     _profile_dir: tempfile::TempDir,
-    pages: HashMap<String, ManagedPage>,
+    pages: HashMap<String, ManagedMainFrame>,
     page_counter: u32,
 }
 
 impl Instance {
-    /// Create a new page in this instance's context, fully wired with session
-    /// and execution context tracking.
-    ///
-    /// Replicates the `setup_page` pattern from integration tests.
+    /// Create a new page in this instance's context, fully wired with
+    /// session, top frame id, and execution context tracking.
     pub fn create_page(
         &mut self,
         context: &crate::api::BrowserContext,
     ) -> Result<String, String> {
-        let conn = self.browser.connection();
-
-        // 1. Register event handlers BEFORE creating the page.
-
-        // Listen for attachedToTarget on root session.
-        let (attach_tx, attach_rx) = mpsc::channel();
-        conn.on_event(
-            "",
-            "Browser.attachedToTarget",
-            Box::new(move |event| {
-                let session_id = event
-                    .params
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                let target_id = event
-                    .params
-                    .get("targetInfo")
-                    .and_then(|v| v.get("targetId"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                let _ = attach_tx.send((session_id, target_id));
-            }),
-        );
-
-        // Listen globally for Page.frameAttached.
-        let (frame_tx, frame_rx) = mpsc::channel::<(String, String)>();
-        conn.on_event_global(Box::new(move |event| {
-            if event.method == "Page.frameAttached" {
-                let frame_id = event
-                    .params
-                    .get("frameId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                let sid = event
-                    .session_id
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_owned();
-                let _ = frame_tx.send((sid, frame_id));
-            }
-        }));
-
-        // Listen for execution context events and Page.ready.
-        let (ctx_tx, ctx_rx) = mpsc::channel::<(String, String, bool)>();
-        {
-            let ctx_tx_created = ctx_tx.clone();
-            let ctx_tx_destroyed = ctx_tx;
-            conn.on_event_global(Box::new(move |event| {
-                if event.method == "Runtime.executionContextCreated" {
-                    let ctx_id = event
-                        .params
-                        .get("executionContextId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    let sid = event
-                        .session_id
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_owned();
-                    let _ = ctx_tx_created.send((sid, ctx_id, true));
-                } else if event.method == "Runtime.executionContextDestroyed" {
-                    let ctx_id = event
-                        .params
-                        .get("executionContextId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    let sid = event
-                        .session_id
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_owned();
-                    let _ = ctx_tx_destroyed.send((sid, ctx_id, false));
-                }
-            }));
-        }
-
-        let (ready_tx, ready_rx) = mpsc::channel::<String>();
-        conn.on_event_global(Box::new(move |event| {
-            if event.method == "Page.ready" {
-                let sid = event
-                    .session_id
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_owned();
-                let _ = ready_tx.send(sid);
-            }
-        }));
-
-        // 2. Create the page.
-        let mut page = context
-            .new_page()
+        let main_frame = context
+            .new_main_frame()
             .map_err(|e| format!("failed to create page: {e}"))?;
 
-        // 3. Wait for Browser.attachedToTarget.
-        let (session_id, _target_id) = attach_rx
-            .recv_timeout(EVENT_TIMEOUT)
-            .map_err(|_| "timeout waiting for Browser.attachedToTarget".to_string())?;
-
-        if session_id.is_empty() {
-            return Err("received empty sessionId from attachedToTarget".into());
-        }
-
-        // 4. Create page session and wire it.
-        let page_session = conn.create_session(session_id.clone());
-        page.set_session(page_session);
-
-        // 5. Wait for Page.frameAttached.
-        let main_frame_id = {
-            let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
-            let mut found = None;
-            while std::time::Instant::now() < deadline {
-                match frame_rx.recv_timeout(Duration::from_secs(2)) {
-                    Ok((sid, fid)) if sid == session_id && !fid.is_empty() => {
-                        found = Some(fid);
-                        break;
-                    }
-                    Ok(_) => continue,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            found.ok_or_else(|| "timeout waiting for Page.frameAttached".to_string())?
-        };
-        page.set_main_frame_id(main_frame_id);
-
-        // 6. Wait for Page.ready.
-        {
-            let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
-            loop {
-                match ready_rx.recv_timeout(Duration::from_secs(2)) {
-                    Ok(sid) if sid == session_id => break,
-                    Ok(_) => continue,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if std::time::Instant::now() >= deadline {
-                            return Err("timeout waiting for Page.ready".into());
-                        }
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err("channel disconnected waiting for Page.ready".into());
-                    }
-                }
-            }
-        }
-
-        // 7. Resolve the initial execution context.
-        let exec_ctx_id = {
-            use std::collections::HashSet;
-            let mut alive = HashSet::new();
-
-            // Drain already-received events.
-            loop {
-                match ctx_rx.try_recv() {
-                    Ok((sid, ctx_id, created)) if sid == session_id && !ctx_id.is_empty() => {
-                        if created {
-                            alive.insert(ctx_id);
-                        } else {
-                            alive.remove(&ctx_id);
-                        }
-                    }
-                    Ok(_) => continue,
-                    Err(_) => break,
-                }
-            }
-
-            if alive.is_empty() {
-                let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
-                while std::time::Instant::now() < deadline {
-                    match ctx_rx.recv_timeout(Duration::from_secs(2)) {
-                        Ok((sid, ctx_id, created))
-                            if sid == session_id && !ctx_id.is_empty() && created =>
-                        {
-                            alive.insert(ctx_id);
-                            break;
-                        }
-                        Ok((sid, ctx_id, false)) if sid == session_id => {
-                            alive.remove(&ctx_id);
-                        }
-                        Ok(_) => continue,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-            }
-
-            alive
-                .into_iter()
-                .next()
-                .ok_or_else(|| "no surviving execution context".to_string())?
-        };
-
-        // 8. Set up persistent execution context tracking for navigations.
-        let exec_ctx = Arc::new(Mutex::new(Some(exec_ctx_id)));
-        let exec_ctx_clone = Arc::clone(&exec_ctx);
-        let sid_clone = session_id.clone();
-        conn.on_event_global(Box::new(move |event| {
-            let event_sid = event.session_id.as_deref().unwrap_or("");
-            if event_sid != sid_clone {
-                return;
-            }
-            if event.method == "Runtime.executionContextCreated" {
-                if let Some(ctx_id) = event
-                    .params
-                    .get("executionContextId")
-                    .and_then(|v| v.as_str())
-                {
-                    *exec_ctx_clone.lock().unwrap() = Some(ctx_id.to_owned());
-                }
-            } else if event.method == "Runtime.executionContextDestroyed" {
-                if let Some(ctx_id) = event
-                    .params
-                    .get("executionContextId")
-                    .and_then(|v| v.as_str())
-                {
-                    let mut guard = exec_ctx_clone.lock().unwrap();
-                    if guard.as_deref() == Some(ctx_id) {
-                        *guard = None;
-                    }
-                }
-            }
-        }));
-
-        // Assign page ID.
         self.page_counter += 1;
         let page_id = format!("p{}", self.page_counter);
-
-        self.pages.insert(
-            page_id.clone(),
-            ManagedPage {
-                page,
-                session_id,
-                execution_context_id: exec_ctx,
-            },
-        );
-
+        self.pages
+            .insert(page_id.clone(), ManagedMainFrame { main_frame });
         Ok(page_id)
-    }
-
-    /// Wait for a page's execution context to become available, polling with a timeout.
-    fn wait_for_exec_context(
-        exec_ctx: &Arc<Mutex<Option<String>>>,
-        timeout: Duration,
-    ) -> Result<String, String> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if let Some(ctx) = exec_ctx.lock().unwrap().clone() {
-                return Ok(ctx);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(
-                    "timed out waiting for execution context (page may still be loading)"
-                        .to_string(),
-                );
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
     }
 
     /// Navigate a page to a URL.
     ///
-    /// Waits for the new execution context to be established after navigation
-    /// so that subsequent `evaluate`/`screenshot` calls don't hit a `None` context.
-    pub fn navigate(&self, page_id: &str, url: &str) -> Result<Option<String>, String> {
+    /// Clears the cached execution context so the next `evaluate` waits for
+    /// the post-navigation context; the wait happens inside `MainFrame::evaluate`.
+    pub fn navigate(
+        &self,
+        page_id: &str,
+        url: &str,
+        _timeout: Duration,
+    ) -> Result<Option<String>, String> {
         let mp = self
             .pages
             .get(page_id)
             .ok_or_else(|| format!("page {page_id} not found"))?;
-        let nav_id = mp
-            .page
+
+        // Force `evaluate` to wait for a fresh post-navigation context.
+        *mp.main_frame.execution_context_handle().lock().unwrap() = None;
+
+        mp.main_frame
             .navigate(url, Default::default())
-            .map_err(|e| format!("navigate failed: {e}"))?;
-
-        // Wait for the new execution context to appear (the persistent event
-        // handler in create_page sets it when Runtime.executionContextCreated fires).
-        Self::wait_for_exec_context(&mp.execution_context_id, EVENT_TIMEOUT)?;
-
-        Ok(nav_id)
+            .map_err(|e| format!("navigate failed: {e}"))
     }
 
     /// Evaluate JavaScript on a page.
-    ///
-    /// If the execution context is temporarily `None` (e.g. during a
-    /// client-side redirect), this will poll-wait up to `EVENT_TIMEOUT`
-    /// for it to reappear before giving up.
     pub fn evaluate(
         &self,
         page_id: &str,
         expression: &str,
+        timeout: Duration,
     ) -> Result<serde_json::Value, String> {
         let mp = self
             .pages
             .get(page_id)
             .ok_or_else(|| format!("page {page_id} not found"))?;
-        let exec_ctx =
-            Self::wait_for_exec_context(&mp.execution_context_id, EVENT_TIMEOUT)?;
         let result = mp
-            .page
-            .evaluate(expression, &exec_ctx)
+            .main_frame
+            .evaluate(expression, timeout)
             .map_err(|e| format!("evaluate failed: {e}"))?;
 
-        // Extract the inner value from {"result": {"value": ...}}
+        // Unwrap `{result: {value: …}}` to just the value, matching today's
+        // CLI output shape.
         let value = result
             .get("result")
             .and_then(|r| r.get("value"))
@@ -380,19 +124,18 @@ impl Instance {
         format: Option<&str>,
         quality: Option<u32>,
         path: Option<&str>,
+        timeout: Duration,
     ) -> Result<(Vec<u8>, String), String> {
         let mp = self
             .pages
             .get(page_id)
             .ok_or_else(|| format!("page {page_id} not found"))?;
 
-        // Get viewport dimensions via evaluate — wait for context if navigating.
-        let exec_ctx =
-            Self::wait_for_exec_context(&mp.execution_context_id, EVENT_TIMEOUT)?;
-
+        // Get viewport dimensions via evaluate (which itself waits for the
+        // execution context if necessary).
         let dims = mp
-            .page
-            .evaluate("[window.innerWidth, window.innerHeight]", &exec_ctx)
+            .main_frame
+            .evaluate("[window.innerWidth, window.innerHeight]", timeout)
             .map_err(|e| format!("failed to get viewport dimensions: {e}"))?;
 
         let (width, height) = {
@@ -424,18 +167,16 @@ impl Instance {
         };
 
         let bytes = mp
-            .page
+            .main_frame
             .screenshot(options)
             .map_err(|e| format!("screenshot failed: {e}"))?;
 
-        // Determine output path.
         let ext = if mime == "image/jpeg" { "jpg" } else { "png" };
         let out_path = match path {
             Some(p) => p.to_string(),
-            None => format!("/tmp/screenshot-{}.{ext}", page_id),
+            None => format!("/tmp/screenshot-{page_id}.{ext}"),
         };
 
-        // Write to file.
         std::fs::write(&out_path, &bytes)
             .map_err(|e| format!("failed to write screenshot: {e}"))?;
 
@@ -482,6 +223,7 @@ impl Instance {
 // ---------------------------------------------------------------------------
 
 /// Manages all browser instances for the daemon.
+#[derive(Default)]
 pub struct InstanceManager {
     instances: HashMap<String, Instance>,
     /// Per-instance context stored separately so we can borrow mutably.
@@ -508,7 +250,9 @@ impl InstanceManager {
             tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
 
         let config = LaunchConfig {
-            executable: PathBuf::from(executable.unwrap_or(DEFAULT_EXECUTABLE)),
+            executable: PathBuf::from(
+                executable.map(|s| s.to_owned()).unwrap_or_else(default_executable),
+            ),
             profile_dir: Some(profile_dir.path().to_owned()),
             headless: headless.unwrap_or(true),
             ..Default::default()
@@ -605,12 +349,13 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
         url: &str,
+        timeout: Duration,
     ) -> Result<Option<String>, String> {
         let inst = self
             .instances
             .get(instance_id)
             .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.navigate(page_id, url)
+        inst.navigate(page_id, url, timeout)
     }
 
     /// Evaluate JavaScript.
@@ -619,12 +364,13 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
         expression: &str,
+        timeout: Duration,
     ) -> Result<serde_json::Value, String> {
         let inst = self
             .instances
             .get(instance_id)
             .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.evaluate(page_id, expression)
+        inst.evaluate(page_id, expression, timeout)
     }
 
     /// Take a screenshot.
@@ -635,12 +381,13 @@ impl InstanceManager {
         format: Option<&str>,
         quality: Option<u32>,
         path: Option<&str>,
+        timeout: Duration,
     ) -> Result<(Vec<u8>, String), String> {
         let inst = self
             .instances
             .get(instance_id)
             .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.screenshot(page_id, format, quality, path)
+        inst.screenshot(page_id, format, quality, path, timeout)
     }
 
     /// Number of running instances.

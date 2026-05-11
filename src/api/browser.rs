@@ -244,7 +244,7 @@ impl Browser {
 
         // Apply context options. On failure, attempt to clean up the context.
         if let Err(e) = ctx.configure(&options) {
-            let _ = ctx.try_remove();
+            ctx.try_remove();
             return Err(e);
         }
 

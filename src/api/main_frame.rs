@@ -1,27 +1,32 @@
-//! Page domain wrapper.
+//! Main-frame domain wrapper.
 //!
-//! [`Page`] wraps a page session (specific `sessionId`) and provides methods
-//! for the `Page.*`, `Runtime.*`, `Network.*`, and `Heap.*` protocol domains.
+//! [`MainFrame`] wraps a page-scoped Juggler session pinned to the top frame
+//! of a page. Every field is populated from authoritative protocol responses
+//! at construction time, so a `MainFrame` cannot refer to a sub-frame.
 //!
-//! Pages are created via [`BrowserContext::new_page`](crate::api::context::BrowserContext::new_page)
-//! and represent a single tab/page in the browser.
+//! Created via
+//! [`BrowserContext::new_main_frame`](crate::api::context::BrowserContext::new_main_frame).
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
 use crate::api::browser::Session;
-use crate::protocol::errors::ProtocolError;
+use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 
 // ---------------------------------------------------------------------------
 // Supporting types
 // ---------------------------------------------------------------------------
 
 /// Options for page navigation.
+///
+/// Top-frame-only — there is no `frame_id` override. `MainFrame::navigate`
+/// always operates on the main frame.
 #[derive(Debug, Clone, Default)]
 pub struct NavigateOptions {
     /// HTTP referer header to send with the navigation request.
     pub referer: Option<String>,
-    /// Frame ID to navigate. If `None`, navigates the main frame.
-    pub frame_id: Option<String>,
 }
 
 /// Options for taking a screenshot.
@@ -158,57 +163,43 @@ pub struct Point {
 }
 
 // ---------------------------------------------------------------------------
-// Page
+// MainFrame
 // ---------------------------------------------------------------------------
 
-/// A page handle.
+/// A page handle pinned to the top frame.
 ///
-/// Wraps a page session for `Page.*`, `Runtime.*`, `Network.*`, and `Heap.*`
-/// commands. Each page has its own `sessionId` on the wire.
-///
-/// # Session lifecycle
-///
-/// The page session is created when the browser emits a
-/// `Browser.attachedToTarget` event. The page session is destroyed when the
-/// browser emits a `Browser.detachedFromTarget` event or when the page
-/// crashes.
-pub struct Page {
-    /// Page session with a specific `sessionId`. This will be set to a real
-    /// session once the `Browser.attachedToTarget` event is received.
-    session: Option<Session>,
-    /// Server-assigned target ID for this page.
+/// Every field is populated from authoritative protocol responses
+/// (`Browser.attachedToTarget` filtered to `type == "page"`, the chosen
+/// Layer-2 strategy, `Runtime.executionContextCreated` filtered to
+/// `auxData.frameId == frame_id`) — never from "first event seen". A
+/// `MainFrame` cannot be constructed referring to a sub-frame.
+pub struct MainFrame {
+    /// Page-scoped Juggler session.
+    session: Session,
+    /// Server-assigned target ID; the target has `type == "page"`.
     target_id: String,
-    /// Context ID that owns this page.
-    context_id: String,
-    /// Main frame ID, populated after initial page ready event.
-    main_frame_id: Option<String>,
+    /// Top frame ID, populated at construction time.
+    frame_id: String,
+    /// Latest known main-world execution context ID for this frame.
+    /// Updated by a `Runtime.executionContextCreated` listener registered
+    /// in `BrowserContext::new_main_frame`, filtered on `auxData.frameId`.
+    execution_context_id: Arc<Mutex<Option<String>>>,
 }
 
-impl Page {
-    /// Create a new page handle.
-    ///
-    /// The session is initially `None` and must be set via
-    /// [`set_session`](Page::set_session) when the `Browser.attachedToTarget`
-    /// event arrives.
-    pub(crate) fn new(target_id: String, context_id: String) -> Self {
-        Page {
-            session: None,
+impl MainFrame {
+    /// Internal constructor used by `BrowserContext::new_main_frame`.
+    pub(crate) fn new(
+        session: Session,
+        target_id: String,
+        frame_id: String,
+        execution_context_id: Arc<Mutex<Option<String>>>,
+    ) -> Self {
+        MainFrame {
+            session,
             target_id,
-            context_id,
-            main_frame_id: None,
+            frame_id,
+            execution_context_id,
         }
-    }
-
-    /// Attach a page session to this handle.
-    ///
-    /// Called by the connection layer when `Browser.attachedToTarget` arrives.
-    pub fn set_session(&mut self, session: Session) {
-        self.session = Some(session);
-    }
-
-    /// Set the main frame ID.
-    pub fn set_main_frame_id(&mut self, frame_id: String) {
-        self.main_frame_id = Some(frame_id);
     }
 
     /// Returns the target ID for this page.
@@ -216,32 +207,19 @@ impl Page {
         &self.target_id
     }
 
-    /// Returns the context ID that owns this page.
-    pub fn context_id(&self) -> &str {
-        &self.context_id
+    /// Returns the top frame ID.
+    pub fn frame_id(&self) -> &str {
+        &self.frame_id
     }
 
-    /// Returns the main frame ID, if known.
-    pub fn main_frame_id(&self) -> Option<&str> {
-        self.main_frame_id.as_deref()
+    /// Shared handle to the cached execution context id. Updated by the
+    /// listener registered in `BrowserContext::new_main_frame`.
+    pub(crate) fn execution_context_handle(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.execution_context_id)
     }
 
-    /// Get a reference to the page session, or return an error if not yet
-    /// attached.
-    fn session(&self) -> Result<&Session, ProtocolError> {
-        self.session.as_ref().ok_or_else(|| ProtocolError {
-            kind: crate::protocol::errors::ProtocolErrorKind::Closed,
-            method: None,
-            message: "page session not yet attached".into(),
-            data: None,
-            source: None,
-        })
-    }
-
-    /// Returns the frame ID to use for commands that require one.
-    /// Falls back to an empty string if the main frame ID is unknown.
-    fn frame_id(&self) -> &str {
-        self.main_frame_id.as_deref().unwrap_or("")
+    fn session(&self) -> &Session {
+        &self.session
     }
 
     // -----------------------------------------------------------------------
@@ -250,39 +228,40 @@ impl Page {
 
     /// Navigate to a URL.
     ///
-    /// Returns the navigation ID if a cross-document navigation was started.
-    /// Returns `None` for same-document navigations (e.g., hash changes).
+    /// Always navigates the top frame (no `frame_id` override). Returns the
+    /// navigation ID for cross-document navigations, `None` for same-document.
     ///
-    /// # Errors
-    ///
-    /// Returns a [`ProtocolError`] if the navigation command fails.
+    /// Invalidates the cached execution context on cross-document navigation
+    /// so a subsequent [`evaluate`](Self::evaluate) call waits for the new
+    /// document's main-world context rather than racing against the stale
+    /// pre-navigation context. (The Layer-3 destroyed-event listener also
+    /// clears the cache, but the event can arrive after the next evaluate.)
     pub fn navigate(
         &self,
         url: &str,
         options: NavigateOptions,
     ) -> Result<Option<String>, ProtocolError> {
-        let frame_id = options
-            .frame_id
-            .as_deref()
-            .unwrap_or_else(|| self.frame_id());
-
         let mut params = json!({
             "url": url,
-            "frameId": frame_id,
+            "frameId": self.frame_id,
         });
         if let Some(ref referer) = options.referer {
             params["referer"] = json!(referer);
         }
 
-        let result = self.session()?.send("Page.navigate", params)?;
-
-        // navigationId is null/absent/empty for same-document navigations.
+        let result = self.session().send("Page.navigate", params)?;
         let nav_id = result
             .get("navigationId")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_owned());
 
+        // Cross-document navigation invalidates the pre-nav exec context.
+        // Clear the cache so subsequent evaluate() calls wait for the new
+        // document's main-world context.
+        if nav_id.is_some() {
+            *self.execution_context_id.lock().unwrap() = None;
+        }
         Ok(nav_id)
     }
 
@@ -292,7 +271,7 @@ impl Page {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn reload(&self) -> Result<(), ProtocolError> {
-        self.session()?.send("Page.reload", json!({}))?;
+        self.session().send("Page.reload", json!({}))?;
         Ok(())
     }
 
@@ -305,7 +284,7 @@ impl Page {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn go_back(&self) -> Result<bool, ProtocolError> {
-        let result = self.session()?.send(
+        let result = self.session().send(
             "Page.goBack",
             json!({ "frameId": self.frame_id() }),
         )?;
@@ -324,7 +303,7 @@ impl Page {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn go_forward(&self) -> Result<bool, ProtocolError> {
-        let result = self.session()?.send(
+        let result = self.session().send(
             "Page.goForward",
             json!({ "frameId": self.frame_id() }),
         )?;
@@ -340,7 +319,7 @@ impl Page {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn bring_to_front(&self) -> Result<(), ProtocolError> {
-        self.session()?.send("Page.bringToFront", json!({}))?;
+        self.session().send("Page.bringToFront", json!({}))?;
         Ok(())
     }
 
@@ -359,7 +338,7 @@ impl Page {
             Some((w, h)) => json!({ "width": w, "height": h }),
             None => serde_json::Value::Null,
         };
-        self.session()?
+        self.session()
             .send("Page.setViewportSize", json!({ "viewportSize": viewport }))?;
         Ok(())
     }
@@ -383,7 +362,7 @@ impl Page {
         if let Some(ref c) = media.contrast {
             params["contrast"] = json!(c);
         }
-        self.session()?.send("Page.setEmulatedMedia", params)?;
+        self.session().send("Page.setEmulatedMedia", params)?;
         Ok(())
     }
 
@@ -393,7 +372,7 @@ impl Page {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn set_cache_disabled(&self, disabled: bool) -> Result<(), ProtocolError> {
-        self.session()?.send(
+        self.session().send(
             "Page.setCacheDisabled",
             json!({ "cacheDisabled": disabled }),
         )?;
@@ -423,7 +402,7 @@ impl Page {
             })
             .collect();
 
-        self.session()?
+        self.session()
             .send("Page.setInitScripts", json!({ "scripts": scripts_json }))?;
         Ok(())
     }
@@ -432,7 +411,8 @@ impl Page {
     ///
     /// This is a "sendMayFail" method; errors are silently swallowed.
     pub fn set_intercept_file_chooser_dialog(&self, enabled: bool) {
-        if let Ok(s) = self.session() {
+        {
+            let s = self.session();
             s.send_may_fail(
                 "Page.setInterceptFileChooserDialog",
                 json!({ "enabled": enabled }),
@@ -468,7 +448,7 @@ impl Page {
             params["omitDeviceScaleFactor"] = json!(omit);
         }
 
-        let result = self.session()?.send("Page.screenshot", params)?;
+        let result = self.session().send("Page.screenshot", params)?;
 
         let b64_data = result
             .get("data")
@@ -498,7 +478,7 @@ impl Page {
         frame_id: &str,
         object_id: &str,
     ) -> Result<serde_json::Value, ProtocolError> {
-        self.session()?.send(
+        self.session().send(
             "Page.describeNode",
             json!({
                 "frameId": frame_id,
@@ -535,7 +515,7 @@ impl Page {
                 "height": r.height,
             });
         }
-        self.session()?
+        self.session()
             .send("Page.scrollIntoViewIfNeeded", params)?;
         Ok(())
     }
@@ -548,7 +528,7 @@ impl Page {
         frame_id: &str,
         object_id: &str,
     ) -> Option<Vec<ContentQuad>> {
-        let s = self.session().ok()?;
+        let s = self.session();
         let result = s.send_may_fail(
             "Page.getContentQuads",
             json!({
@@ -595,7 +575,7 @@ impl Page {
         object_id: &str,
         files: &[&str],
     ) -> Result<(), ProtocolError> {
-        self.session()?.send(
+        self.session().send(
             "Page.setFileInputFiles",
             json!({
                 "frameId": frame_id,
@@ -612,7 +592,7 @@ impl Page {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn close(&self) -> Result<(), ProtocolError> {
-        self.session()?.send("Page.close", json!({}))?;
+        self.session().send("Page.close", json!({}))?;
         Ok(())
     }
 
@@ -640,7 +620,7 @@ impl Page {
         if let Some(ref text) = params.text {
             p["text"] = json!(text);
         }
-        self.session()?.send("Page.dispatchKeyEvent", p)?;
+        self.session().send("Page.dispatchKeyEvent", p)?;
         Ok(())
     }
 
@@ -650,7 +630,7 @@ impl Page {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn insert_text(&self, text: &str) -> Result<(), ProtocolError> {
-        self.session()?
+        self.session()
             .send("Page.insertText", json!({ "text": text }))?;
         Ok(())
     }
@@ -675,7 +655,7 @@ impl Page {
         if let Some(cc) = params.click_count {
             p["clickCount"] = json!(cc);
         }
-        self.session()?.send("Page.dispatchMouseEvent", p)?;
+        self.session().send("Page.dispatchMouseEvent", p)?;
         Ok(())
     }
 
@@ -688,7 +668,7 @@ impl Page {
         &self,
         params: WheelEventParams,
     ) -> Result<(), ProtocolError> {
-        self.session()?.send(
+        self.session().send(
             "Page.dispatchWheelEvent",
             json!({
                 "x": params.x,
@@ -711,7 +691,7 @@ impl Page {
         &self,
         params: TapEventParams,
     ) -> Result<(), ProtocolError> {
-        self.session()?.send(
+        self.session().send(
             "Page.dispatchTapEvent",
             json!({
                 "x": params.x,
@@ -735,7 +715,8 @@ impl Page {
         accept: bool,
         prompt_text: Option<&str>,
     ) {
-        if let Ok(s) = self.session() {
+        {
+            let s = self.session();
             let mut params = json!({
                 "dialogId": dialog_id,
                 "accept": accept,
@@ -751,34 +732,89 @@ impl Page {
     // Runtime domain methods
     // -----------------------------------------------------------------------
 
-    /// Evaluate a JavaScript expression.
+    /// Evaluate a JavaScript expression in the top-frame main world.
     ///
-    /// Returns the result as a JSON value. The expression is evaluated in
-    /// the main execution context of the main frame.
+    /// Polls the cached execution context (up to `timeout`); if `evaluate`
+    /// fails with a "context destroyed" error (typical during SPA
+    /// navigation), retries up to 5 times after waiting for a fresh
+    /// context.
     ///
-    /// # Error handling
+    /// # Note on `Runtime.executionContextDestroyed`
     ///
-    /// If the expression throws, the error details are in the
-    /// `exceptionDetails` field of the raw response. This method returns
-    /// the full response value so the caller can inspect both `result`
-    /// and `exceptionDetails`.
+    /// The Layer-3 listener installed by
+    /// [`BrowserContext::new_main_frame`](crate::api::context::BrowserContext::new_main_frame)
+    /// proactively clears the cached execution context when its
+    /// `Runtime.executionContextDestroyed` matches, so the next call here
+    /// sees `None` and waits for a fresh context.
     ///
-    /// # Errors
-    ///
-    /// Returns a [`ProtocolError`] if the command fails.
+    /// As a safety net, this method ALSO retries up to 5 times on a
+    /// "context destroyed" error response — useful when an evaluate
+    /// happens to race the destroyed event over the wire.
     pub fn evaluate(
         &self,
         expression: &str,
-        execution_context_id: &str,
+        timeout: Duration,
     ) -> Result<serde_json::Value, ProtocolError> {
-        self.session()?.send(
-            "Runtime.evaluate",
-            json!({
-                "expression": expression,
-                "returnByValue": true,
-                "executionContextId": execution_context_id,
-            }),
-        )
+        const MAX_RETRIES: u32 = 5;
+        let deadline = Instant::now() + timeout;
+        let mut bad_ctx: Option<String> = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            if Instant::now() >= deadline {
+                break;
+            }
+
+            // Acquire a usable execution context, skipping any known-bad one.
+            let exec_ctx = loop {
+                let cur = self.execution_context_id.lock().unwrap().clone();
+                match cur {
+                    Some(c) if bad_ctx.as_ref() != Some(&c) => break c,
+                    _ => {
+                        *self.execution_context_id.lock().unwrap() = None;
+                        if Instant::now() >= deadline {
+                            return Err(ProtocolError {
+                                kind: ProtocolErrorKind::Closed,
+                                method: Some("Runtime.evaluate".into()),
+                                message: "timed out waiting for execution context".into(),
+                                data: None,
+                                source: None,
+                            });
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            };
+
+            match self.session().send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": expression,
+                    "returnByValue": true,
+                    "executionContextId": &exec_ctx,
+                }),
+            ) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let is_ctx_err = msg.contains("execution context")
+                        || msg.contains("Failed to find");
+                    if attempt < MAX_RETRIES && is_ctx_err {
+                        bad_ctx = Some(exec_ctx);
+                        std::thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(ProtocolError {
+            kind: ProtocolErrorKind::Closed,
+            method: Some("Runtime.evaluate".into()),
+            message: format!("evaluate failed after {MAX_RETRIES} retries"),
+            data: None,
+            source: None,
+        })
     }
 
     /// Call a JavaScript function with arguments.
@@ -799,7 +835,7 @@ impl Page {
         args: Vec<serde_json::Value>,
         execution_context_id: &str,
     ) -> Result<serde_json::Value, ProtocolError> {
-        self.session()?.send(
+        self.session().send(
             "Runtime.callFunction",
             json!({
                 "functionDeclaration": declaration,
@@ -820,7 +856,7 @@ impl Page {
         execution_context_id: &str,
         object_id: &str,
     ) -> Result<serde_json::Value, ProtocolError> {
-        self.session()?.send(
+        self.session().send(
             "Runtime.getObjectProperties",
             json!({
                 "executionContextId": execution_context_id,
@@ -842,7 +878,7 @@ impl Page {
         execution_context_id: &str,
         object_id: &str,
     ) -> Result<(), ProtocolError> {
-        self.session()?.send(
+        self.session().send(
             "Runtime.disposeObject",
             json!({
                 "executionContextId": execution_context_id,
@@ -867,7 +903,7 @@ impl Page {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn set_request_interception(&self, enabled: bool) -> Result<(), ProtocolError> {
-        let s = self.session()?;
+        let s = self.session();
         s.send(
             "Network.setRequestInterception",
             json!({ "enabled": enabled }),
@@ -893,7 +929,7 @@ impl Page {
             .iter()
             .map(|(name, value)| json!({"name": name, "value": value}))
             .collect();
-        self.session()?.send(
+        self.session().send(
             "Network.setExtraHTTPHeaders",
             json!({ "headers": headers_json }),
         )?;
@@ -912,7 +948,7 @@ impl Page {
         &self,
         request_id: &str,
     ) -> Result<(Vec<u8>, bool), ProtocolError> {
-        let result = self.session()?.send(
+        let result = self.session().send(
             "Network.getResponseBody",
             json!({ "requestId": request_id }),
         )?;
@@ -948,7 +984,8 @@ impl Page {
         headers: Option<&[(&str, &str)]>,
         post_data: Option<&str>,
     ) {
-        if let Ok(s) = self.session() {
+        {
+            let s = self.session();
             let mut params = json!({ "requestId": request_id });
             if let Some(u) = url {
                 params["url"] = json!(u);
@@ -981,7 +1018,8 @@ impl Page {
         headers: &[(&str, &str)],
         base64_body: &str,
     ) {
-        if let Ok(s) = self.session() {
+        {
+            let s = self.session();
             let headers_json: Vec<serde_json::Value> = headers
                 .iter()
                 .map(|(name, value)| json!({"name": name, "value": value}))
@@ -1010,7 +1048,8 @@ impl Page {
     ///
     /// This is a "sendMayFail" method; the request may already be cancelled.
     pub fn abort_intercepted_request(&self, request_id: &str, error_code: &str) {
-        if let Ok(s) = self.session() {
+        {
+            let s = self.session();
             s.send_may_fail(
                 "Network.abortInterceptedRequest",
                 json!({
@@ -1031,7 +1070,7 @@ impl Page {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn collect_garbage(&self) -> Result<(), ProtocolError> {
-        self.session()?
+        self.session()
             .send("Heap.collectGarbage", json!({}))?;
         Ok(())
     }
@@ -1051,7 +1090,7 @@ impl Page {
         height: u32,
         quality: u32,
     ) -> Result<(), ProtocolError> {
-        self.session()?.send(
+        self.session().send(
             "Page.startScreencast",
             json!({
                 "width": width,
@@ -1066,7 +1105,8 @@ impl Page {
     ///
     /// This is a "sendMayFail" method; the page may have navigated.
     pub fn stop_screencast(&self) {
-        if let Ok(s) = self.session() {
+        {
+            let s = self.session();
             s.send_may_fail("Page.stopScreencast", json!({}));
         }
     }
@@ -1075,7 +1115,8 @@ impl Page {
     ///
     /// This is a "sendMayFail" method; the page may have navigated.
     pub fn screencast_frame_ack(&self) {
-        if let Ok(s) = self.session() {
+        {
+            let s = self.session();
             s.send_may_fail("Page.screencastFrameAck", json!({}));
         }
     }
@@ -1091,7 +1132,7 @@ impl Page {
         worker_id: &str,
         message: &str,
     ) -> Result<(), ProtocolError> {
-        self.session()?.send(
+        self.session().send(
             "Page.sendMessageToWorker",
             json!({
                 "frameId": frame_id,
@@ -1124,21 +1165,19 @@ impl Page {
             params["objectId"] = json!(oid);
         }
 
-        let result = self.session()?.send("Page.adoptNode", params)?;
+        let result = self.session().send("Page.adoptNode", params)?;
 
         let remote_object = result.get("remoteObject").cloned();
         Ok(remote_object)
     }
 }
 
-impl std::fmt::Debug for Page {
+impl std::fmt::Debug for MainFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Page")
+        f.debug_struct("MainFrame")
             .field("target_id", &self.target_id)
-            .field("context_id", &self.context_id)
-            .field("main_frame_id", &self.main_frame_id)
-            .field("has_session", &self.session.is_some())
-            .finish()
+            .field("frame_id", &self.frame_id)
+            .finish_non_exhaustive()
     }
 }
 

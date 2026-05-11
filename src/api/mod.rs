@@ -5,7 +5,7 @@
 //!
 //! - [`Browser`] — top-level handle wrapping the root session.
 //! - [`BrowserContext`] — an isolated browser context (profile).
-//! - [`Page`] — a single page/tab within a context.
+//! - [`MainFrame`] — a single page/tab within a context, pinned to its top frame.
 //!
 //! # Usage
 //!
@@ -15,17 +15,17 @@
 //! // After establishing a Connection via transport + protocol layers:
 //! // let browser = Browser::connect(connection, BrowserOptions::default())?;
 //! // let context = browser.new_context(Default::default())?;
-//! // let page = context.new_page()?;
-//! // page.navigate("https://example.com", Default::default())?;
+//! // let main_frame = context.new_main_frame()?;
+//! // main_frame.navigate("https://example.com", Default::default())?;
 //! ```
 
 pub mod browser;
 pub mod context;
-pub mod page;
+pub mod main_frame;
 
 pub use browser::{Browser, BrowserOptions, ProxyConfig};
 pub use context::{BrowserContext, ContextOptions, Cookie, CookieOptions, Geolocation, Viewport};
-pub use page::{
-    KeyEventParams, MouseEventParams, NavigateOptions, Page, Rect, ScreenshotOptions,
+pub use main_frame::{
+    KeyEventParams, MainFrame, MouseEventParams, NavigateOptions, Rect, ScreenshotOptions,
     WheelEventParams,
 };

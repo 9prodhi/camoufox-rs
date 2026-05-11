@@ -9,17 +9,22 @@
 
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::mpsc;
 use std::time::Duration;
 
-use camoufox::api::{Browser, BrowserContext, BrowserOptions, ContextOptions, Page};
+use camoufox::api::{Browser, BrowserOptions, ContextOptions};
 use camoufox::config::LaunchConfig;
 use camoufox::process;
 use camoufox::protocol::client::Connection;
 use camoufox::transport::pipe::PipeTransport;
 
-const CAMOUFOX_BIN: &str = "/root/.cache/camoufox/camoufox";
-const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+mod fixtures;
+
+fn camoufox_bin() -> String {
+    std::env::var("CAMOUFOX_BIN").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        format!("{home}/.cache/camoufox/camoufox")
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -67,7 +72,7 @@ fn setup() -> TestBrowser {
     let profile_dir = tempfile::tempdir().expect("failed to create temp profile dir");
 
     let config = LaunchConfig {
-        executable: PathBuf::from(CAMOUFOX_BIN),
+        executable: PathBuf::from(camoufox_bin()),
         profile_dir: Some(profile_dir.path().to_owned()),
         headless: true,
         ..Default::default()
@@ -88,105 +93,6 @@ fn setup() -> TestBrowser {
         child: launched.child,
         _profile_dir: profile_dir,
     }
-}
-
-/// Full page setup: create context, create page, wire session, wait for frame.
-///
-/// Returns `(context, page, session_id)` with the page fully wired (session
-/// attached, main frame ID set from `Page.frameAttached` event).
-fn setup_page(browser: &Browser) -> (BrowserContext, Page, String) {
-    let conn = browser.connection();
-
-    // 1. Register handlers BEFORE creating the page to avoid missing events.
-
-    // Listen for attachedToTarget on the root session.
-    let (attach_tx, attach_rx) = mpsc::channel();
-    conn.on_event(
-        "",
-        "Browser.attachedToTarget",
-        Box::new(move |event| {
-            let session_id = event
-                .params
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let target_id = event
-                .params
-                .get("targetInfo")
-                .and_then(|v| v.get("targetId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let _ = attach_tx.send((session_id, target_id));
-        }),
-    );
-
-    // Listen globally for Page.frameAttached to get the real frameId.
-    // The frameId format in Camoufox is "mainframe-<browserId>", NOT the targetId.
-    let (frame_tx, frame_rx) = mpsc::channel::<(String, String)>();
-    conn.on_event_global(Box::new(move |event| {
-        if event.method == "Page.frameAttached" {
-            let frame_id = event
-                .params
-                .get("frameId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let sid = event
-                .session_id
-                .as_deref()
-                .unwrap_or("")
-                .to_owned();
-            let _ = frame_tx.send((sid, frame_id));
-        }
-    }));
-
-    // 2. Create context and page.
-    let context = browser
-        .new_context(ContextOptions::default())
-        .expect("failed to create context");
-
-    let mut page = context.new_page().expect("failed to create page");
-
-    // 3. Wait for attachedToTarget.
-    let (session_id, target_id) = attach_rx
-        .recv_timeout(EVENT_TIMEOUT)
-        .expect("timeout waiting for Browser.attachedToTarget");
-
-    assert!(!session_id.is_empty(), "session_id should not be empty");
-    assert!(!target_id.is_empty(), "target_id should not be empty");
-    assert_eq!(
-        page.target_id(),
-        target_id,
-        "target_id should match the page"
-    );
-
-    // 4. Create the page session and wire it to the page.
-    let page_session = conn.create_session(session_id.clone());
-    page.set_session(page_session);
-
-    // 5. Wait for Page.frameAttached to get the real main frame ID.
-    let main_frame_id = {
-        let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
-        let mut found = None;
-        while std::time::Instant::now() < deadline {
-            match frame_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok((sid, fid)) if sid == session_id && !fid.is_empty() => {
-                    found = Some(fid);
-                    break;
-                }
-                Ok(_) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        found.expect("did not receive Page.frameAttached for our page session")
-    };
-
-    page.set_main_frame_id(main_frame_id);
-
-    (context, page, session_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -216,14 +122,18 @@ fn spawn_and_bootstrap() {
 fn create_context_and_page() {
     let tb = setup();
 
-    let (_context, page, session_id) = setup_page(&tb.browser);
+    let context = tb
+        .browser
+        .new_context(ContextOptions::default())
+        .expect("failed to create context");
+    let main_frame = context
+        .new_main_frame()
+        .expect("failed to create main frame");
 
-    // The page should have a session wired and be usable.
-    assert!(!session_id.is_empty());
-    assert!(page.main_frame_id().is_some());
+    assert!(!main_frame.frame_id().is_empty());
 
-    // Navigate to verify the session works (use a data URI to avoid network).
-    let nav_result = page.navigate("https://example.com", Default::default());
+    let nav_result =
+        main_frame.navigate("https://example.com", Default::default());
     assert!(
         nav_result.is_ok(),
         "navigate failed: {:?}",
@@ -236,144 +146,111 @@ fn create_context_and_page() {
 #[test]
 #[ignore]
 fn navigate_and_evaluate() {
+    use std::time::Duration;
+
     let tb = setup();
-    let conn = tb.browser.connection().clone();
+    let context = tb
+        .browser
+        .new_context(ContextOptions::default())
+        .expect("failed to create context");
+    let main_frame = context
+        .new_main_frame()
+        .expect("failed to create main frame");
 
-    // Track execution context lifecycle globally. During page init, contexts
-    // are created and destroyed (transient about:blank navigations). We need
-    // the LAST surviving context for our page session.
-    let (ctx_tx, ctx_rx) = mpsc::channel::<(String, String, bool)>(); // (sid, ctx_id, created)
-    let ctx_tx2 = ctx_tx.clone();
-    conn.on_event_global(Box::new(move |event| {
-        if event.method == "Runtime.executionContextCreated" {
-            let ctx_id = event
-                .params
-                .get("executionContextId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let sid = event
-                .session_id
-                .as_deref()
-                .unwrap_or("")
-                .to_owned();
-            let _ = ctx_tx.send((sid, ctx_id, true));
-        } else if event.method == "Runtime.executionContextDestroyed" {
-            let ctx_id = event
-                .params
-                .get("executionContextId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let sid = event
-                .session_id
-                .as_deref()
-                .unwrap_or("")
-                .to_owned();
-            let _ = ctx_tx2.send((sid, ctx_id, false));
-        }
-    }));
+    main_frame
+        .navigate("https://example.com", Default::default())
+        .expect("navigate failed");
 
-    // Also wait for Page.ready to know when transient navigations are done.
-    let (ready_tx, ready_rx) = mpsc::channel::<String>();
-    conn.on_event_global(Box::new(move |event| {
-        if event.method == "Page.ready" {
-            let sid = event
-                .session_id
-                .as_deref()
-                .unwrap_or("")
-                .to_owned();
-            let _ = ready_tx.send(sid);
-        }
-    }));
-
-    let (_context, page, session_id) = setup_page(&tb.browser);
-
-    // Wait for Page.ready on our session (signals transient navs are done).
-    {
-        let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
-        loop {
-            match ready_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(sid) if sid == session_id => break,
-                Ok(_) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if std::time::Instant::now() >= deadline {
-                        panic!("timeout waiting for Page.ready");
-                    }
-                    continue;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("channel disconnected waiting for Page.ready")
-                }
-            }
-        }
-    }
-
-    // Now collect execution context events. Track creates/destroys to find
-    // the surviving context.
-    let exec_ctx_id = {
-        use std::collections::HashSet;
-        let mut alive = HashSet::new();
-
-        // Drain all already-received events.
-        loop {
-            match ctx_rx.try_recv() {
-                Ok((sid, ctx_id, created)) if sid == session_id && !ctx_id.is_empty() => {
-                    if created {
-                        alive.insert(ctx_id);
-                    } else {
-                        alive.remove(&ctx_id);
-                    }
-                }
-                Ok(_) => continue,
-                Err(_) => break,
-            }
-        }
-
-        // If we found a surviving context, use it; otherwise wait briefly.
-        if alive.is_empty() {
-            let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
-            while std::time::Instant::now() < deadline {
-                match ctx_rx.recv_timeout(Duration::from_secs(2)) {
-                    Ok((sid, ctx_id, created))
-                        if sid == session_id && !ctx_id.is_empty() && created =>
-                    {
-                        alive.insert(ctx_id);
-                        break;
-                    }
-                    Ok((sid, ctx_id, false)) if sid == session_id => {
-                        alive.remove(&ctx_id);
-                    }
-                    Ok(_) => continue,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-        }
-
-        alive
-            .into_iter()
-            .next()
-            .expect("no surviving execution context for our page session")
-    };
-
-    // Evaluate a simple expression.
-    let result = page
-        .evaluate("1 + 1", &exec_ctx_id)
+    let title = main_frame
+        .evaluate("document.title", Duration::from_secs(15))
         .expect("evaluate failed");
+    let title_str = title
+        .pointer("/result/value")
+        .or_else(|| title.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
-    // The result shape is {"result": {"value": 2}}. Extract the inner value.
-    let value = result
-        .get("result")
-        .and_then(|r| r.get("value"))
-        .or_else(|| result.get("value"))
-        .cloned()
-        .unwrap_or(result.clone());
-    assert_eq!(
-        value,
-        serde_json::json!(2),
-        "expected 1+1=2, got: {result}"
+    assert!(
+        title_str.to_lowercase().contains("example"),
+        "title should contain 'example', got: {title_str:?}"
     );
 
     tb.teardown();
+}
+
+#[test]
+#[ignore]
+fn navigate_main_frame_with_cross_origin_iframe() {
+    // REGRESSION TEST for the cross-origin-iframe attach bug.
+    //
+    // When a page contains a fast cross-origin iframe (such as Amazon's
+    // aax-eu.amazon-adsystem.com ad-pixel), the iframe's main-world
+    // execution context arrives shortly after the top frame's, and the old
+    // code's unfiltered Runtime.executionContextCreated handler would
+    // overwrite the cached context with the iframe's. Subsequent
+    // `evaluate` then ran in the iframe.
+    //
+    // What this test exercises:
+    //   - Layer 3 fix (auxData.frameId filter on
+    //     Runtime.executionContextCreated): YES, end-to-end.
+    //   - Layer 1 fix (targetInfo.type == "page" on attachedToTarget):
+    //     NOT end-to-end. At new_main_frame() time only the top page target
+    //     exists; the iframe target appears later via navigation.
+    //   - Layer 2 fix (parentFrameId.is_empty() on Page.frameAttached):
+    //     NOT end-to-end. At new_main_frame() time only the top frame
+    //     exists; iframe frames attach later.
+    //
+    // Layers 1 and 2 are exercised by inspection of the filter predicates
+    // in src/api/context.rs.
+    use std::time::Duration;
+
+    let server = fixtures::FixtureServer::start();
+    let tb = setup();
+
+    let context = tb
+        .browser
+        .new_context(ContextOptions::default())
+        .expect("failed to create context");
+    let main_frame = context
+        .new_main_frame()
+        .expect("failed to create main frame");
+
+    main_frame
+        .navigate(&server.main_url, Default::default())
+        .expect("navigate failed");
+
+    let body = main_frame
+        .evaluate("document.body.innerText", Duration::from_secs(15))
+        .expect("evaluate body failed");
+    let location = main_frame
+        .evaluate("location.href", Duration::from_secs(15))
+        .expect("evaluate location.href failed");
+
+    let body_str = body
+        .pointer("/result/value")
+        .or_else(|| body.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let loc_str = location
+        .pointer("/result/value")
+        .or_else(|| location.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    tb.teardown();
+
+    assert!(
+        body_str.contains("MAIN_SENTINEL_8f3a2b1c"),
+        "evaluate should run in main frame; body was: {body_str:?}"
+    );
+    assert!(
+        !body_str.contains("IFRAME_SENTINEL_4e9d7c0a"),
+        "evaluate must NOT run in iframe; body was: {body_str:?}"
+    );
+    assert_eq!(
+        loc_str, server.main_url,
+        "location.href should be the main page, not the iframe"
+    );
 }

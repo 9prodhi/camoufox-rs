@@ -6,14 +6,16 @@
 //! [`Browser::new_context`](crate::api::browser::Browser::new_context)
 //! and destroyed via [`BrowserContext::close`].
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::api::browser::{Connection, ProxyConfig, Session};
+use crate::api::main_frame::MainFrame;
 use crate::api::page::Page;
-use crate::protocol::errors::ProtocolError;
+use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 
 // ---------------------------------------------------------------------------
 // Context configuration types
@@ -562,6 +564,249 @@ impl BrowserContext {
             .to_owned();
 
         Ok(Page::new(target_id, self.context_id.clone()))
+    }
+
+    /// Timeout for waiting on `Browser.attachedToTarget` (Layer 1) and on
+    /// the main frame's `Page.frameAttached` event (Layer 2).
+    const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Create a new page and return a fully-wired [`MainFrame`].
+    ///
+    /// Sends `Browser.newPage`, waits for a `Browser.attachedToTarget` event
+    /// **filtered to `targetInfo.type == "page"`** (Layer 1 fix), waits for a
+    /// `Page.frameAttached` event on the new session whose `parentFrameId`
+    /// is empty/absent (Layer 2 fix — hybrid fallback because
+    /// `Page.getFrameTree` is not supported in this Camoufox build), and
+    /// subscribes a `Runtime.executionContextCreated` listener **filtered to
+    /// `auxData.frameId == frame_id` and `auxData.name == ""`** (Layer 3 fix).
+    /// Together these make it structurally impossible for the returned
+    /// `MainFrame` to refer to a sub-frame.
+    ///
+    /// # Errors
+    ///
+    /// - `"timeout waiting for type=='page' attach …"` — `ATTACH_TIMEOUT`
+    ///   elapsed and no matching `Browser.attachedToTarget` was seen. The
+    ///   error message lists any skipped attaches (up to 16) for triage.
+    /// - `"timeout waiting for main frame attach …"` — `ATTACH_TIMEOUT`
+    ///   elapsed and no `Page.frameAttached` with `parentFrameId` absent
+    ///   was seen on the page session.
+    pub fn new_main_frame(&self) -> Result<MainFrame, ProtocolError> {
+        const MAX_SKIPPED_ATTACHES: usize = 16;
+        let conn = &self.connection;
+
+        // === Layer 1 fix: only signal on type == "page" attaches. ===
+        //
+        // Listener registered BEFORE Browser.newPage to avoid missing the
+        // event. Skipped attaches go into a bounded Vec for the timeout
+        // diagnostic.
+        let (attach_tx, attach_rx) = mpsc::channel::<(String, String)>();
+        let skipped: Arc<Mutex<Vec<(String, Option<String>)>>> =
+            Arc::new(Mutex::new(Vec::with_capacity(MAX_SKIPPED_ATTACHES)));
+        let skipped_clone = Arc::clone(&skipped);
+        conn.on_event(
+            "",
+            "Browser.attachedToTarget",
+            Box::new(move |event| {
+                let ti = event.params.get("targetInfo");
+                let t_type = ti
+                    .and_then(|v| v.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let t_url = ti
+                    .and_then(|v| v.get("url"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned());
+
+                if t_type == "page" {
+                    let session_id = event
+                        .params
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let target_id = ti
+                        .and_then(|v| v.get("targetId"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let _ = attach_tx.send((session_id, target_id));
+                } else {
+                    let mut s = skipped_clone.lock().unwrap();
+                    if s.len() < MAX_SKIPPED_ATTACHES {
+                        s.push((t_type.to_owned(), t_url));
+                    }
+                }
+            }),
+        );
+
+        // === Layer 2 fix (hybrid fallback): listen for Page.frameAttached
+        // with no parentFrameId. ===
+        //
+        // Registered BEFORE Browser.newPage. Filtered on receive by
+        // session_id (we don't know the session_id yet at register time).
+        let (frame_tx, frame_rx) = mpsc::channel::<(String, String)>(); // (sid, frame_id)
+        conn.on_event_global(Box::new(move |event| {
+            if event.method != "Page.frameAttached" {
+                return;
+            }
+            let parent = event
+                .params
+                .get("parentFrameId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !parent.is_empty() {
+                return; // sub-frame; skip
+            }
+            let sid = event
+                .session_id
+                .as_deref()
+                .unwrap_or("")
+                .to_owned();
+            let fid = event
+                .params
+                .get("frameId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if !fid.is_empty() {
+                let _ = frame_tx.send((sid, fid));
+            }
+        }));
+
+        // === Send Browser.newPage. ===
+        let result = self.session().send(
+            "Browser.newPage",
+            json!({ "browserContextId": self.context_id }),
+        )?;
+        let expected_target_id = result
+            .get("targetId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+
+        // === Wait for the page-typed attachedToTarget. ===
+        let deadline = Instant::now() + Self::ATTACH_TIMEOUT;
+        let (session_id, _target_id) = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let snapshot = skipped.lock().unwrap().clone();
+                let summary: Vec<String> = snapshot
+                    .iter()
+                    .map(|(k, u)| match u {
+                        Some(u) => format!("{{type:'{k}', url:'{u}'}}"),
+                        None => format!("{{type:'{k}'}}"),
+                    })
+                    .collect();
+                let msg = format!(
+                    "timeout waiting for type=='page' attach after {}s; saw {} skipped: [{}]",
+                    Self::ATTACH_TIMEOUT.as_secs(),
+                    snapshot.len(),
+                    summary.join(", "),
+                );
+                return Err(ProtocolError {
+                    kind: ProtocolErrorKind::Closed,
+                    method: Some("Browser.attachedToTarget".into()),
+                    message: msg,
+                    data: None,
+                    source: None,
+                });
+            }
+            match attach_rx.recv_timeout(remaining) {
+                Ok((sid, tid))
+                    if !sid.is_empty()
+                        && (expected_target_id.is_empty() || tid == expected_target_id) =>
+                {
+                    break (sid, tid)
+                }
+                Ok(_) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProtocolError {
+                        kind: ProtocolErrorKind::Closed,
+                        method: Some("Browser.attachedToTarget".into()),
+                        message: "attach channel disconnected".into(),
+                        data: None,
+                        source: None,
+                    });
+                }
+            }
+        };
+
+        // === Build the page session. ===
+        let page_session = conn.create_session(session_id.clone());
+
+        // === Layer 2 fix: wait for the top-frame Page.frameAttached. ===
+        let frame_deadline = Instant::now() + Self::ATTACH_TIMEOUT;
+        let frame_id = loop {
+            let remaining = frame_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ProtocolError {
+                    kind: ProtocolErrorKind::Closed,
+                    method: Some("Page.frameAttached".into()),
+                    message: format!(
+                        "timeout waiting for main frame attach (no parentFrameId) after {}s",
+                        Self::ATTACH_TIMEOUT.as_secs(),
+                    ),
+                    data: None,
+                    source: None,
+                });
+            }
+            match frame_rx.recv_timeout(remaining) {
+                Ok((sid, fid)) if sid == session_id && !fid.is_empty() => break fid,
+                Ok(_) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProtocolError {
+                        kind: ProtocolErrorKind::Closed,
+                        method: Some("Page.frameAttached".into()),
+                        message: "frame channel disconnected".into(),
+                        data: None,
+                        source: None,
+                    });
+                }
+            }
+        };
+
+        // === Layer 3 fix: subscribe with frame_id + main-world filter. ===
+        let exec_ctx: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let exec_ctx_clone = Arc::clone(&exec_ctx);
+        let sid_for_listener = session_id.clone();
+        let frame_id_for_listener = frame_id.clone();
+        conn.on_event_global(Box::new(move |event| {
+            if event.session_id.as_deref().unwrap_or("") != sid_for_listener {
+                return;
+            }
+            if event.method != "Runtime.executionContextCreated" {
+                return;
+            }
+            let aux = event.params.get("auxData");
+            let event_frame_id = aux
+                .and_then(|a| a.get("frameId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let is_main_world = aux
+                .and_then(|a| a.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|n| n.is_empty())
+                .unwrap_or(true);
+            if event_frame_id != frame_id_for_listener || !is_main_world {
+                return;
+            }
+            if let Some(ctx_id) = event
+                .params
+                .get("executionContextId")
+                .and_then(|v| v.as_str())
+            {
+                *exec_ctx_clone.lock().unwrap() = Some(ctx_id.to_owned());
+            }
+        }));
+
+        Ok(MainFrame::new(
+            page_session,
+            expected_target_id,
+            frame_id,
+            exec_ctx,
+        ))
     }
 
     /// Set cookies for this context.

@@ -21,10 +21,12 @@
 
 pub mod browser;
 pub mod context;
+pub mod main_frame;
 pub mod page;
 
 pub use browser::{Browser, BrowserOptions, ProxyConfig};
 pub use context::{BrowserContext, ContextOptions, Cookie, CookieOptions, Geolocation, Viewport};
+pub use main_frame::MainFrame;
 pub use page::{
     KeyEventParams, MouseEventParams, NavigateOptions, Page, Rect, ScreenshotOptions,
     WheelEventParams,

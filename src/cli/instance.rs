@@ -7,18 +7,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
 
-use crate::api::{Browser, BrowserOptions, ContextOptions, Page, Rect, ScreenshotOptions};
+use crate::api::{Browser, BrowserOptions, ContextOptions, MainFrame, Rect, ScreenshotOptions};
 use crate::config::LaunchConfig;
 use crate::protocol::client::Connection;
 use crate::transport::pipe::PipeTransport;
-
-const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn default_executable() -> String {
     std::env::var("CAMOUFOX_BIN").unwrap_or_else(|_| {
@@ -28,15 +24,13 @@ fn default_executable() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// ManagedPage
+// ManagedMainFrame
 // ---------------------------------------------------------------------------
 
-/// A page with persistent execution context tracking.
-pub struct ManagedPage {
-    pub page: Page,
-    pub session_id: String,
-    /// The current execution context ID, updated by global event handlers.
-    pub execution_context_id: Arc<Mutex<Option<String>>>,
+/// A `MainFrame` plus its CLI-facing page label tracking. The label lives
+/// in the parent `HashMap` key; this struct just owns the frame.
+pub struct ManagedMainFrame {
+    pub main_frame: MainFrame,
 }
 
 // ---------------------------------------------------------------------------
@@ -50,281 +44,26 @@ pub struct Instance {
     pub version: Option<String>,
     pub pid: u32,
     _profile_dir: tempfile::TempDir,
-    pages: HashMap<String, ManagedPage>,
+    pages: HashMap<String, ManagedMainFrame>,
     page_counter: u32,
 }
 
 impl Instance {
-    /// Create a new page in this instance's context, fully wired with session
-    /// and execution context tracking.
-    ///
-    /// Replicates the `setup_page` pattern from integration tests.
+    /// Create a new page in this instance's context, fully wired with
+    /// session, top frame id, and execution context tracking.
     pub fn create_page(
         &mut self,
         context: &crate::api::BrowserContext,
     ) -> Result<String, String> {
-        let conn = self.browser.connection();
-
-        // 1. Register event handlers BEFORE creating the page.
-
-        // Listen for attachedToTarget on root session.
-        let (attach_tx, attach_rx) = mpsc::channel();
-        conn.on_event(
-            "",
-            "Browser.attachedToTarget",
-            Box::new(move |event| {
-                let session_id = event
-                    .params
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                let target_id = event
-                    .params
-                    .get("targetInfo")
-                    .and_then(|v| v.get("targetId"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                let _ = attach_tx.send((session_id, target_id));
-            }),
-        );
-
-        // Listen globally for Page.frameAttached.
-        let (frame_tx, frame_rx) = mpsc::channel::<(String, String)>();
-        conn.on_event_global(Box::new(move |event| {
-            if event.method == "Page.frameAttached" {
-                let frame_id = event
-                    .params
-                    .get("frameId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                let sid = event
-                    .session_id
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_owned();
-                let _ = frame_tx.send((sid, frame_id));
-            }
-        }));
-
-        // Listen for execution context events and Page.ready.
-        let (ctx_tx, ctx_rx) = mpsc::channel::<(String, String, bool)>();
-        {
-            let ctx_tx_created = ctx_tx.clone();
-            let ctx_tx_destroyed = ctx_tx;
-            conn.on_event_global(Box::new(move |event| {
-                if event.method == "Runtime.executionContextCreated" {
-                    let ctx_id = event
-                        .params
-                        .get("executionContextId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    let sid = event
-                        .session_id
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_owned();
-                    let _ = ctx_tx_created.send((sid, ctx_id, true));
-                } else if event.method == "Runtime.executionContextDestroyed" {
-                    let ctx_id = event
-                        .params
-                        .get("executionContextId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    let sid = event
-                        .session_id
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_owned();
-                    let _ = ctx_tx_destroyed.send((sid, ctx_id, false));
-                }
-            }));
-        }
-
-        let (ready_tx, ready_rx) = mpsc::channel::<String>();
-        conn.on_event_global(Box::new(move |event| {
-            if event.method == "Page.ready" {
-                let sid = event
-                    .session_id
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_owned();
-                let _ = ready_tx.send(sid);
-            }
-        }));
-
-        // 2. Create the page.
-        let mut page = context
-            .new_page()
+        let main_frame = context
+            .new_main_frame()
             .map_err(|e| format!("failed to create page: {e}"))?;
 
-        // 3. Wait for Browser.attachedToTarget.
-        let (session_id, _target_id) = attach_rx
-            .recv_timeout(EVENT_TIMEOUT)
-            .map_err(|_| "timeout waiting for Browser.attachedToTarget".to_string())?;
-
-        if session_id.is_empty() {
-            return Err("received empty sessionId from attachedToTarget".into());
-        }
-
-        // 4. Create page session and wire it.
-        let page_session = conn.create_session(session_id.clone());
-        page.set_session(page_session);
-
-        // 5. Wait for Page.frameAttached.
-        let main_frame_id = {
-            let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
-            let mut found = None;
-            while std::time::Instant::now() < deadline {
-                match frame_rx.recv_timeout(Duration::from_secs(2)) {
-                    Ok((sid, fid)) if sid == session_id && !fid.is_empty() => {
-                        found = Some(fid);
-                        break;
-                    }
-                    Ok(_) => continue,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            found.ok_or_else(|| "timeout waiting for Page.frameAttached".to_string())?
-        };
-        page.set_main_frame_id(main_frame_id);
-
-        // 6. Wait for Page.ready.
-        {
-            let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
-            loop {
-                match ready_rx.recv_timeout(Duration::from_secs(2)) {
-                    Ok(sid) if sid == session_id => break,
-                    Ok(_) => continue,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if std::time::Instant::now() >= deadline {
-                            return Err("timeout waiting for Page.ready".into());
-                        }
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err("channel disconnected waiting for Page.ready".into());
-                    }
-                }
-            }
-        }
-
-        // 7. Resolve the initial execution context.
-        let exec_ctx_id = {
-            use std::collections::HashSet;
-            let mut alive = HashSet::new();
-
-            // Drain already-received events.
-            loop {
-                match ctx_rx.try_recv() {
-                    Ok((sid, ctx_id, created)) if sid == session_id && !ctx_id.is_empty() => {
-                        if created {
-                            alive.insert(ctx_id);
-                        } else {
-                            alive.remove(&ctx_id);
-                        }
-                    }
-                    Ok(_) => continue,
-                    Err(_) => break,
-                }
-            }
-
-            if alive.is_empty() {
-                let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
-                while std::time::Instant::now() < deadline {
-                    match ctx_rx.recv_timeout(Duration::from_secs(2)) {
-                        Ok((sid, ctx_id, created))
-                            if sid == session_id && !ctx_id.is_empty() && created =>
-                        {
-                            alive.insert(ctx_id);
-                            break;
-                        }
-                        Ok((sid, ctx_id, false)) if sid == session_id => {
-                            alive.remove(&ctx_id);
-                        }
-                        Ok(_) => continue,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-            }
-
-            alive
-                .into_iter()
-                .next()
-                .ok_or_else(|| "no surviving execution context".to_string())?
-        };
-
-        // 8. Set up persistent execution context tracking for navigations.
-        let exec_ctx = Arc::new(Mutex::new(Some(exec_ctx_id)));
-        let exec_ctx_clone = Arc::clone(&exec_ctx);
-        let sid_clone = session_id.clone();
-        conn.on_event_global(Box::new(move |event| {
-            let event_sid = event.session_id.as_deref().unwrap_or("");
-            if event_sid != sid_clone {
-                return;
-            }
-            if event.method == "Runtime.executionContextCreated" {
-                if let Some(ctx_id) = event
-                    .params
-                    .get("executionContextId")
-                    .and_then(|v| v.as_str())
-                {
-                    *exec_ctx_clone.lock().unwrap() = Some(ctx_id.to_owned());
-                }
-            } else if event.method == "Runtime.executionContextDestroyed" {
-                if let Some(ctx_id) = event
-                    .params
-                    .get("executionContextId")
-                    .and_then(|v| v.as_str())
-                {
-                    let mut guard = exec_ctx_clone.lock().unwrap();
-                    if guard.as_deref() == Some(ctx_id) {
-                        *guard = None;
-                    }
-                }
-            }
-        }));
-
-        // Assign page ID.
         self.page_counter += 1;
         let page_id = format!("p{}", self.page_counter);
-
-        self.pages.insert(
-            page_id.clone(),
-            ManagedPage {
-                page,
-                session_id,
-                execution_context_id: exec_ctx,
-            },
-        );
-
+        self.pages
+            .insert(page_id.clone(), ManagedMainFrame { main_frame });
         Ok(page_id)
-    }
-
-    /// Wait for a page's execution context to become available, polling with a timeout.
-    fn wait_for_exec_context(
-        exec_ctx: &Arc<Mutex<Option<String>>>,
-        timeout: Duration,
-    ) -> Result<String, String> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if let Some(ctx) = exec_ctx.lock().unwrap().clone() {
-                return Ok(ctx);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(
-                    "timed out waiting for execution context (page may still be loading)"
-                        .to_string(),
-                );
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
     }
 
     /// Navigate a page to a URL.

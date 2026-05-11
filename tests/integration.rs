@@ -383,3 +383,39 @@ fn navigate_and_evaluate() {
 
     tb.teardown();
 }
+
+#[test]
+#[ignore]
+fn probe_page_get_frame_tree_available() {
+    // PROBE: confirms Page.getFrameTree exists in this Camoufox build before
+    // the design depends on it. Remove this test in the cleanup task at the
+    // end of the plan.
+    let tb = setup();
+    let (_context, page, _session_id) = setup_page(&tb.browser);
+
+    // Use the page's session to call Page.getFrameTree directly via the
+    // raw protocol. We don't have a wrapper for it yet — that's the point.
+    let conn = tb.browser.connection();
+    let page_session = conn.create_session(_session_id);
+    let result = page_session
+        .send("Page.getFrameTree", serde_json::json!({}))
+        .expect("Page.getFrameTree should succeed");
+
+    let frame_id = result
+        .pointer("/frameTree/frame/frameId")
+        .or_else(|| result.pointer("/frameTree/frame/id"))
+        .and_then(|v| v.as_str())
+        .expect("frameTree.frame should have a frameId");
+
+    assert!(!frame_id.is_empty(), "main frame id should be non-empty");
+
+    // The frame id from getFrameTree must match the one we got from
+    // Page.frameAttached during setup — that's the whole point of the fix.
+    assert_eq!(
+        Some(frame_id),
+        page.main_frame_id(),
+        "getFrameTree main frame id should equal the frameAttached main frame id"
+    );
+
+    tb.teardown();
+}

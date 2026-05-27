@@ -249,7 +249,9 @@ impl MainFrame {
             params["referer"] = json!(referer);
         }
 
-        let result = self.session().send("Page.navigate", params)?;
+        let result = self
+            .session()
+            .send_navigate("Page.navigate", params, &self.frame_id)?;
         let nav_id = result
             .get("navigationId")
             .and_then(|v| v.as_str())
@@ -284,10 +286,9 @@ impl MainFrame {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn go_back(&self) -> Result<bool, ProtocolError> {
-        let result = self.session().send(
-            "Page.goBack",
-            json!({ "frameId": self.frame_id() }),
-        )?;
+        let result = self
+            .session()
+            .send("Page.goBack", json!({ "frameId": self.frame_id() }))?;
         Ok(result
             .get("success")
             .and_then(|v| v.as_bool())
@@ -303,10 +304,9 @@ impl MainFrame {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn go_forward(&self) -> Result<bool, ProtocolError> {
-        let result = self.session().send(
-            "Page.goForward",
-            json!({ "frameId": self.frame_id() }),
-        )?;
+        let result = self
+            .session()
+            .send("Page.goForward", json!({ "frameId": self.frame_id() }))?;
         Ok(result
             .get("success")
             .and_then(|v| v.as_bool())
@@ -330,10 +330,7 @@ impl MainFrame {
     /// # Errors
     ///
     /// Returns a [`ProtocolError`] if the command fails.
-    pub fn set_viewport_size(
-        &self,
-        size: Option<(u32, u32)>,
-    ) -> Result<(), ProtocolError> {
+    pub fn set_viewport_size(&self, size: Option<(u32, u32)>) -> Result<(), ProtocolError> {
         let viewport = match size {
             Some((w, h)) => json!({ "width": w, "height": h }),
             None => serde_json::Value::Null,
@@ -428,10 +425,7 @@ impl MainFrame {
     ///
     /// Returns a [`ProtocolError`] if the screenshot command fails, or if
     /// the base64 data cannot be decoded.
-    pub fn screenshot(
-        &self,
-        options: ScreenshotOptions,
-    ) -> Result<Vec<u8>, ProtocolError> {
+    pub fn screenshot(&self, options: ScreenshotOptions) -> Result<Vec<u8>, ProtocolError> {
         let mut params = json!({
             "mimeType": options.mime_type,
             "clip": {
@@ -450,10 +444,7 @@ impl MainFrame {
 
         let result = self.session().send("Page.screenshot", params)?;
 
-        let b64_data = result
-            .get("data")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let b64_data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
 
         // Decode base64 using a simple decoder. We avoid adding a dependency
         // on the `base64` crate by implementing a minimal decoder.
@@ -463,6 +454,7 @@ impl MainFrame {
             message: msg,
             data: None,
             source: None,
+            download_info: None,
         })
     }
 
@@ -515,19 +507,14 @@ impl MainFrame {
                 "height": r.height,
             });
         }
-        self.session()
-            .send("Page.scrollIntoViewIfNeeded", params)?;
+        self.session().send("Page.scrollIntoViewIfNeeded", params)?;
         Ok(())
     }
 
     /// Get content quads for a DOM element.
     ///
     /// This is a "sendMayFail" method; returns `None` on error.
-    pub fn get_content_quads(
-        &self,
-        frame_id: &str,
-        object_id: &str,
-    ) -> Option<Vec<ContentQuad>> {
+    pub fn get_content_quads(&self, frame_id: &str, object_id: &str) -> Option<Vec<ContentQuad>> {
         let s = self.session();
         let result = s.send_may_fail(
             "Page.getContentQuads",
@@ -605,10 +592,7 @@ impl MainFrame {
     /// # Errors
     ///
     /// Returns a [`ProtocolError`] if the command fails.
-    pub fn dispatch_key_event(
-        &self,
-        params: KeyEventParams,
-    ) -> Result<(), ProtocolError> {
+    pub fn dispatch_key_event(&self, params: KeyEventParams) -> Result<(), ProtocolError> {
         let mut p = json!({
             "type": params.r#type,
             "keyCode": params.key_code,
@@ -640,10 +624,7 @@ impl MainFrame {
     /// # Errors
     ///
     /// Returns a [`ProtocolError`] if the command fails.
-    pub fn dispatch_mouse_event(
-        &self,
-        params: MouseEventParams,
-    ) -> Result<(), ProtocolError> {
+    pub fn dispatch_mouse_event(&self, params: MouseEventParams) -> Result<(), ProtocolError> {
         let mut p = json!({
             "type": params.r#type,
             "button": params.button,
@@ -664,10 +645,7 @@ impl MainFrame {
     /// # Errors
     ///
     /// Returns a [`ProtocolError`] if the command fails.
-    pub fn dispatch_wheel_event(
-        &self,
-        params: WheelEventParams,
-    ) -> Result<(), ProtocolError> {
+    pub fn dispatch_wheel_event(&self, params: WheelEventParams) -> Result<(), ProtocolError> {
         self.session().send(
             "Page.dispatchWheelEvent",
             json!({
@@ -687,10 +665,7 @@ impl MainFrame {
     /// # Errors
     ///
     /// Returns a [`ProtocolError`] if the command fails.
-    pub fn dispatch_tap_event(
-        &self,
-        params: TapEventParams,
-    ) -> Result<(), ProtocolError> {
+    pub fn dispatch_tap_event(&self, params: TapEventParams) -> Result<(), ProtocolError> {
         self.session().send(
             "Page.dispatchTapEvent",
             json!({
@@ -709,12 +684,7 @@ impl MainFrame {
     /// Handle a dialog (alert, confirm, prompt, beforeunload).
     ///
     /// This is a "sendMayFail" method; the dialog may already be handled.
-    pub fn handle_dialog(
-        &self,
-        dialog_id: &str,
-        accept: bool,
-        prompt_text: Option<&str>,
-    ) {
+    pub fn handle_dialog(&self, dialog_id: &str, accept: bool, prompt_text: Option<&str>) {
         {
             let s = self.session();
             let mut params = json!({
@@ -778,6 +748,7 @@ impl MainFrame {
                                 message: "timed out waiting for execution context".into(),
                                 data: None,
                                 source: None,
+                                download_info: None,
                             });
                         }
                         std::thread::sleep(Duration::from_millis(100));
@@ -796,8 +767,8 @@ impl MainFrame {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     let msg = format!("{e}");
-                    let is_ctx_err = msg.contains("execution context")
-                        || msg.contains("Failed to find");
+                    let is_ctx_err =
+                        msg.contains("execution context") || msg.contains("Failed to find");
                     if attempt < MAX_RETRIES && is_ctx_err {
                         bad_ctx = Some(exec_ctx);
                         std::thread::sleep(Duration::from_millis(300));
@@ -814,6 +785,7 @@ impl MainFrame {
             message: format!("evaluate failed after {MAX_RETRIES} retries"),
             data: None,
             source: None,
+            download_info: None,
         })
     }
 
@@ -909,10 +881,7 @@ impl MainFrame {
             json!({ "enabled": enabled }),
         )?;
         // Playwright also disables cache when interception is on.
-        s.send(
-            "Page.setCacheDisabled",
-            json!({ "cacheDisabled": enabled }),
-        )?;
+        s.send("Page.setCacheDisabled", json!({ "cacheDisabled": enabled }))?;
         Ok(())
     }
 
@@ -921,10 +890,7 @@ impl MainFrame {
     /// # Errors
     ///
     /// Returns a [`ProtocolError`] if the command fails.
-    pub fn set_extra_http_headers(
-        &self,
-        headers: &[(&str, &str)],
-    ) -> Result<(), ProtocolError> {
+    pub fn set_extra_http_headers(&self, headers: &[(&str, &str)]) -> Result<(), ProtocolError> {
         let headers_json: Vec<serde_json::Value> = headers
             .iter()
             .map(|(name, value)| json!({"name": name, "value": value}))
@@ -944,10 +910,7 @@ impl MainFrame {
     /// # Errors
     ///
     /// Returns a [`ProtocolError`] if the command fails.
-    pub fn get_response_body(
-        &self,
-        request_id: &str,
-    ) -> Result<(Vec<u8>, bool), ProtocolError> {
+    pub fn get_response_body(&self, request_id: &str) -> Result<(Vec<u8>, bool), ProtocolError> {
         let result = self.session().send(
             "Network.getResponseBody",
             json!({ "requestId": request_id }),
@@ -968,6 +931,7 @@ impl MainFrame {
             message: msg,
             data: None,
             source: None,
+            download_info: None,
         })?;
 
         Ok((body, evicted))
@@ -1070,8 +1034,7 @@ impl MainFrame {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn collect_garbage(&self) -> Result<(), ProtocolError> {
-        self.session()
-            .send("Heap.collectGarbage", json!({}))?;
+        self.session().send("Heap.collectGarbage", json!({}))?;
         Ok(())
     }
 
@@ -1245,26 +1208,17 @@ mod tests {
 
     #[test]
     fn test_decode_base64_hello() {
-        assert_eq!(
-            decode_base64("SGVsbG8=").unwrap(),
-            b"Hello".to_vec()
-        );
+        assert_eq!(decode_base64("SGVsbG8=").unwrap(), b"Hello".to_vec());
     }
 
     #[test]
     fn test_decode_base64_no_padding() {
-        assert_eq!(
-            decode_base64("SGVsbG8").unwrap(),
-            b"Hello".to_vec()
-        );
+        assert_eq!(decode_base64("SGVsbG8").unwrap(), b"Hello".to_vec());
     }
 
     #[test]
     fn test_decode_base64_with_whitespace() {
-        assert_eq!(
-            decode_base64("SGVs\nbG8=").unwrap(),
-            b"Hello".to_vec()
-        );
+        assert_eq!(decode_base64("SGVs\nbG8=").unwrap(), b"Hello".to_vec());
     }
 
     #[test]

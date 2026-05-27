@@ -175,6 +175,35 @@ impl Browser {
             session.send("Browser.setBrowserProxy", proxy.to_json())?;
         }
 
+        // Step 4: Set browser-wide download behavior to "cancel".
+        //
+        // Without this, a navigation to an attachment-style URL (e.g. a
+        // `Content-Disposition: attachment` response) wedges the protocol
+        // layer — Juggler diverts the response into a download flow,
+        // `Page.navigate` never resolves, and the blocked caller parks
+        // forever. By setting `behavior: cancel` we tell the browser to
+        // emit `Browser.downloadCreated` (which the connection's reader
+        // thread intercepts to unblock the navigate caller with a
+        // structured `NavigationBecameDownload` error) but write nothing
+        // to disk.
+        //
+        // `Browser.setDownloadOptions` accepts an optional
+        // `browserContextId`; omitting it sets the global default that
+        // applies to all contexts that do not override it via
+        // [`ContextOptions::download_options`]. Failures here are
+        // demoted to a debug log: older browser builds may not understand
+        // the call, and download-detection is a defense-in-depth measure
+        // rather than a hard requirement for bootstrap.
+        let dl_params = json!({
+            "downloadOptions": { "behavior": "cancel" }
+        });
+        if let Err(e) = session.send("Browser.setDownloadOptions", dl_params) {
+            log::debug!(
+                "Browser.setDownloadOptions(cancel) failed at bootstrap; \
+                 download detection may be limited: {e}"
+            );
+        }
+
         Ok(Browser {
             session,
             connection,
@@ -221,10 +250,7 @@ impl Browser {
     /// Returns a [`ProtocolError`] if context creation or configuration fails.
     /// `Browser.enable` must have been called first (handled automatically by
     /// [`connect`](Browser::connect)).
-    pub fn new_context(
-        &self,
-        options: ContextOptions,
-    ) -> Result<BrowserContext, ProtocolError> {
+    pub fn new_context(&self, options: ContextOptions) -> Result<BrowserContext, ProtocolError> {
         let result = self.session.send(
             "Browser.createBrowserContext",
             json!({ "removeOnDetach": true }),
@@ -236,11 +262,7 @@ impl Browser {
             .unwrap_or("")
             .to_owned();
 
-        let ctx = BrowserContext::new(
-            context_id,
-            &self.session,
-            Arc::clone(&self.connection),
-        );
+        let ctx = BrowserContext::new(context_id, &self.session, Arc::clone(&self.connection));
 
         // Apply context options. On failure, attempt to clean up the context.
         if let Err(e) = ctx.configure(&options) {

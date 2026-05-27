@@ -132,8 +132,7 @@ fn create_context_and_page() {
 
     assert!(!main_frame.frame_id().is_empty());
 
-    let nav_result =
-        main_frame.navigate("https://example.com", Default::default());
+    let nav_result = main_frame.navigate("https://example.com", Default::default());
     assert!(
         nav_result.is_ok(),
         "navigate failed: {:?}",
@@ -174,6 +173,60 @@ fn navigate_and_evaluate() {
         title_str.to_lowercase().contains("example"),
         "title should contain 'example', got: {title_str:?}"
     );
+
+    tb.teardown();
+}
+
+#[test]
+#[ignore]
+fn navigate_to_attachment_returns_navigation_became_download() {
+    // REGRESSION TEST for the SCI sci-get-pdf wedge.
+    //
+    // When the renderer receives `Content-Disposition: attachment` it
+    // diverts the response into a download flow without creating a
+    // document, so `Page.navigate` never sends a response. Before the
+    // download-detection patch this parked the caller forever; with the
+    // patch the connection's reader thread catches `Browser.downloadCreated`
+    // and resolves the pending navigate with
+    // `ProtocolErrorKind::NavigationBecameDownload`.
+    //
+    // Run with:
+    //   cargo test --test integration -- --ignored \
+    //       navigate_to_attachment_returns_navigation_became_download \
+    //       --test-threads=1
+    use camoufox::protocol::errors::ProtocolErrorKind;
+    use std::time::Instant;
+
+    let server = fixtures::AttachmentServer::start();
+    let tb = setup();
+
+    let context = tb
+        .browser
+        .new_context(ContextOptions::default())
+        .expect("failed to create context");
+    let main_frame = context
+        .new_main_frame()
+        .expect("failed to create main frame");
+
+    let start = Instant::now();
+    let result = main_frame.navigate(&server.url, Default::default());
+    let elapsed = start.elapsed();
+
+    // Must surface as an error, not hang. We give a generous upper bound
+    // (10s) — empirically the event arrives within a few hundred ms.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "navigate should return promptly, took {elapsed:?}"
+    );
+
+    let err = result.expect_err("navigate to attachment URL must error");
+    assert_eq!(
+        err.kind,
+        ProtocolErrorKind::NavigationBecameDownload,
+        "expected NavigationBecameDownload, got {err:?}"
+    );
+    let info = err.download_info.as_ref().expect("download_info populated");
+    assert!(info.url.contains("file.pdf"));
 
     tb.teardown();
 }

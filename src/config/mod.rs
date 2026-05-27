@@ -320,10 +320,7 @@ mod tests {
             args: vec!["--profile=/foo".into()],
             ..Default::default()
         };
-        assert!(matches!(
-            cfg.validate(),
-            Err(ConfigError::ForbiddenArg(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(ConfigError::ForbiddenArg(_))));
     }
 
     #[test]
@@ -332,10 +329,7 @@ mod tests {
             args: vec!["-juggler-pipe".into()],
             ..Default::default()
         };
-        assert!(matches!(
-            cfg.validate(),
-            Err(ConfigError::ForbiddenArg(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(ConfigError::ForbiddenArg(_))));
     }
 
     #[test]

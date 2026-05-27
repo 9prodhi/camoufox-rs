@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
+use crate::protocol::errors::{DownloadInfo, ProtocolError, ProtocolErrorKind};
 use crate::protocol::events::{EventHandler, EventRouter};
 use crate::protocol::pending::PendingMap;
 use crate::protocol::state::{ConnectionState, IdGenerator, SessionState};
 use crate::protocol::types::{
-    EventMessage, IncomingMessage, Request, ResponseMessage, SessionId,
+    EventMessage, IncomingMessage, MessageId, Request, ResponseMessage, SessionId,
     BROWSER_CLOSE_MESSAGE_ID,
 };
 use crate::transport::Transport;
@@ -24,6 +24,23 @@ struct ConnectionInner {
     sessions: HashMap<String, SessionInner>,
     /// Event subscription router.
     events: EventRouter,
+    /// Active `Page.navigate` requests indexed by `frameId`.
+    ///
+    /// When a `Browser.downloadCreated` event arrives, this map lets the
+    /// reader thread find the matching pending navigation and surface a
+    /// [`ProtocolErrorKind::NavigationBecameDownload`] error to the
+    /// blocked `Session::send` caller — without it, the renderer never
+    /// sends a `Page.navigate` response (it diverted into a download flow)
+    /// and the caller would park forever.
+    pending_navs: HashMap<String, PendingNav>,
+}
+
+/// A `Page.navigate` request that is currently in flight, recorded by
+/// `frameId` for cross-referencing with `Browser.downloadCreated`.
+#[derive(Debug, Clone)]
+struct PendingNav {
+    session_key: String,
+    request_id: MessageId,
 }
 
 /// Per-session state and pending request map.
@@ -135,6 +152,7 @@ impl Connection {
             id_gen: IdGenerator::new(),
             sessions: HashMap::new(),
             events: EventRouter::new(),
+            pending_navs: HashMap::new(),
         }));
 
         // Create root session
@@ -252,12 +270,13 @@ impl Connection {
             message: format!("failed to serialize Browser.close: {e}"),
             data: None,
             source: Some(Box::new(e)),
+            download_info: None,
         })?;
 
         let _lock = self.write_lock.lock().unwrap();
-        self.transport.send(&value).map_err(|e| {
-            ProtocolError::transport(e)
-        })?;
+        self.transport
+            .send(&value)
+            .map_err(ProtocolError::transport)?;
 
         Ok(())
     }
@@ -336,9 +355,10 @@ impl Session {
             }
 
             // Pre-send check: session state
-            let session = guard.sessions.get(&self.session_key).ok_or_else(|| {
-                ProtocolError::closed(Some(method.to_owned()))
-            })?;
+            let session = guard
+                .sessions
+                .get(&self.session_key)
+                .ok_or_else(|| ProtocolError::closed(Some(method.to_owned())))?;
 
             match session.state {
                 SessionState::Disposed => {
@@ -372,6 +392,7 @@ impl Session {
                         message: format!("failed to serialize request: {e}"),
                         data: None,
                         source: Some(Box::new(e)),
+                        download_info: None,
                     });
                 }
             };
@@ -391,6 +412,143 @@ impl Session {
             Ok(result) => result,
             Err(_) => Err(ProtocolError::closed(Some(method.to_owned()))),
         }
+    }
+
+    /// Send a `Page.navigate` (or any frame-scoped navigation) with download
+    /// detection.
+    ///
+    /// While the request is in flight, the connection records
+    /// `(frame_id → request_id)` so that an incoming
+    /// `Browser.downloadCreated` event for the same frame can resolve the
+    /// pending request with [`ProtocolErrorKind::NavigationBecameDownload`]
+    /// instead of letting the caller block forever (the browser never sends
+    /// a `Page.navigate` response when it diverts the navigation into a
+    /// download flow).
+    ///
+    /// The pending-nav entry is always cleaned up on return — whether the
+    /// response was a normal success, an error, a close, or a
+    /// download-detected resolution.
+    pub fn send_navigate(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        frame_id: &str,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        // Send-with-registration. We allocate the message ID, register the
+        // pending nav under our frame_id, then run the rest of `send`'s
+        // logic inline. We can't piggy-back on `send` because we need the
+        // allocated ID *before* the request goes out.
+        let (rx, value, id) = {
+            let mut guard = self.inner.lock().unwrap();
+
+            if guard.state.is_closed() {
+                return Err(ProtocolError::closed(Some(method.to_owned())));
+            }
+
+            let session = guard
+                .sessions
+                .get(&self.session_key)
+                .ok_or_else(|| ProtocolError::closed(Some(method.to_owned())))?;
+
+            match session.state {
+                SessionState::Disposed => {
+                    return Err(ProtocolError::closed(Some(method.to_owned())));
+                }
+                SessionState::Crashed => {
+                    return Err(ProtocolError::crashed(Some(method.to_owned())));
+                }
+                SessionState::Active => {}
+            }
+
+            let id = guard.id_gen.next();
+            let session = guard.sessions.get_mut(&self.session_key).unwrap();
+            let rx = session.pending.insert(id, method.to_owned());
+
+            // Register the pending nav. If a prior nav for the same frame is
+            // still tracked, log and overwrite — the older entry's response
+            // path will simply not get a download-translated error, but the
+            // pending slot itself is independent and will resolve normally.
+            if let Some(prev) = guard.pending_navs.get(frame_id) {
+                log::debug!(
+                    "register_pending_nav: overwriting prior nav for frame {} (was id={})",
+                    frame_id,
+                    prev.request_id,
+                );
+            }
+            guard.pending_navs.insert(
+                frame_id.to_owned(),
+                PendingNav {
+                    session_key: self.session_key.clone(),
+                    request_id: id,
+                },
+            );
+
+            let request = Request {
+                id,
+                method: method.to_owned(),
+                params,
+                session_id: self.session_id.clone(),
+            };
+            let value = match serde_json::to_value(&request) {
+                Ok(v) => v,
+                Err(e) => {
+                    let session = guard.sessions.get_mut(&self.session_key).unwrap();
+                    session.pending.resolve(id, Ok(serde_json::Value::Null));
+                    // Drop the pending-nav entry too.
+                    if let Some(p) = guard.pending_navs.get(frame_id) {
+                        if p.request_id == id {
+                            guard.pending_navs.remove(frame_id);
+                        }
+                    }
+                    return Err(ProtocolError {
+                        kind: ProtocolErrorKind::Transport,
+                        method: Some(request.method),
+                        message: format!("failed to serialize request: {e}"),
+                        data: None,
+                        source: Some(Box::new(e)),
+                        download_info: None,
+                    });
+                }
+            };
+
+            (rx, value, id)
+        };
+
+        {
+            let _lock = self.write_lock.lock().unwrap();
+            if let Err(e) = self.transport.send(&value) {
+                // Clean up the pending-nav entry on send failure.
+                let mut guard = self.inner.lock().unwrap();
+                if let Some(p) = guard.pending_navs.get(frame_id) {
+                    if p.request_id == id {
+                        guard.pending_navs.remove(frame_id);
+                    }
+                }
+                return Err(ProtocolError::transport(e));
+            }
+        }
+
+        // Block on the response. The reader thread may resolve us with a
+        // `NavigationBecameDownload` error if it sees a matching download
+        // event before the (never-coming) navigate response.
+        let outcome = match rx.recv() {
+            Ok(result) => result,
+            Err(_) => Err(ProtocolError::closed(Some(method.to_owned()))),
+        };
+
+        // Always clear the pending-nav entry, but only if it still points at
+        // *our* request (a later navigation for the same frame may have
+        // overwritten it).
+        {
+            let mut guard = self.inner.lock().unwrap();
+            if let Some(p) = guard.pending_navs.get(frame_id) {
+                if p.request_id == id {
+                    guard.pending_navs.remove(frame_id);
+                }
+            }
+        }
+
+        outcome
     }
 
     /// Send a protocol method, swallowing errors (fire-and-forget).
@@ -491,8 +649,76 @@ fn handle_response(inner: &Arc<Mutex<ConnectionInner>>, response: ResponseMessag
 }
 
 fn handle_event(inner: &Arc<Mutex<ConnectionInner>>, event: EventMessage) {
+    // Intercept Browser.downloadCreated first: if it matches a pending
+    // navigation, resolve that pending request with a structured error so
+    // the blocked send_navigate caller unparks. We do this *before*
+    // dispatching to user event handlers so the resolution races nothing.
+    if event.method == "Browser.downloadCreated" {
+        handle_download_created(inner, &event);
+    }
+
     let guard = inner.lock().unwrap();
     guard.events.dispatch(&event);
+}
+
+/// Match an incoming `Browser.downloadCreated` event against the pending-nav
+/// map and resolve any matching pending request with a
+/// [`ProtocolErrorKind::NavigationBecameDownload`] error.
+fn handle_download_created(inner: &Arc<Mutex<ConnectionInner>>, event: &EventMessage) {
+    let frame_id = event
+        .params
+        .get("frameId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+    let url = event
+        .params
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned())
+        .unwrap_or_default();
+    let download_id = event
+        .params
+        .get("uuid")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+
+    let Some(frame_id) = frame_id else {
+        log::warn!(
+            "Browser.downloadCreated: no frameId in params, cannot match to a pending navigation"
+        );
+        return;
+    };
+
+    let mut guard = inner.lock().unwrap();
+    let Some(pending) = guard.pending_navs.remove(&frame_id) else {
+        log::warn!(
+            "Browser.downloadCreated for frame {} has no matching pending navigation (download_id={:?})",
+            frame_id,
+            download_id,
+        );
+        return;
+    };
+
+    let info = DownloadInfo {
+        url,
+        frame_id: Some(frame_id),
+        download_id,
+    };
+    let err = ProtocolError::navigation_became_download(Some("Page.navigate".to_owned()), info);
+
+    let Some(session) = guard.sessions.get_mut(&pending.session_key) else {
+        log::debug!(
+            "downloadCreated resolution: session {} disappeared",
+            pending.session_key
+        );
+        return;
+    };
+
+    // Reject the matching pending request slot. We can't go through
+    // `PendingMap::resolve` (which only takes `Result<Value, ErrorData>`),
+    // so we inject the error directly via reject_one — but PendingMap has no
+    // such method. Instead we remove-and-send via a tiny helper here.
+    session.pending.resolve_with_error(pending.request_id, err);
 }
 
 fn close_all_sessions(inner: &Arc<Mutex<ConnectionInner>>) {
@@ -743,10 +969,13 @@ mod tests {
 
         let received = Arc::new(AtomicUsize::new(0));
         let r = received.clone();
-        h.conn
-            .on_event("", "Browser.attachedToTarget", Box::new(move |_| {
+        h.conn.on_event(
+            "",
+            "Browser.attachedToTarget",
+            Box::new(move |_| {
                 r.fetch_add(1, Ordering::SeqCst);
-            }));
+            }),
+        );
 
         h.in_tx
             .send(event_message("Browser.attachedToTarget", None))
@@ -961,6 +1190,222 @@ mod tests {
         let page = h.conn.create_session("uuid-123".to_owned());
         assert_eq!(page.key(), "uuid-123");
         assert_eq!(page.id(), &Some("uuid-123".to_owned()));
+
+        teardown(h);
+    }
+
+    // -----------------------------------------------------------------------
+    // Download-detection tests (fix/download-detection)
+    // -----------------------------------------------------------------------
+    //
+    // These tests cover the path that fires when a `Page.navigate` is
+    // diverted into a download flow by the renderer. The browser sends
+    // `Browser.downloadCreated` instead of a `Page.navigate` response, and
+    // the reader thread must unblock the waiting send_navigate caller with
+    // a NavigationBecameDownload error.
+
+    fn download_created_event(
+        frame_id: &str,
+        url: &str,
+        uuid: &str,
+        session_id: Option<&str>,
+    ) -> RawMessage {
+        RawMessage {
+            id: None,
+            method: Some("Browser.downloadCreated".into()),
+            params: Some(json!({
+                "uuid": uuid,
+                "frameId": frame_id,
+                "url": url,
+                "suggestedFileName": "file.pdf",
+                "pageTargetId": "target-1",
+            })),
+            result: None,
+            error: None,
+            session_id: session_id.map(String::from),
+        }
+    }
+
+    #[test]
+    fn download_created_resolves_matching_pending_nav() {
+        let h = setup();
+        let page = h.conn.create_session("page-A".to_owned());
+
+        // Spawn the navigate call in a thread; it must block waiting for a
+        // response that will never come (we simulate that by NOT sending a
+        // matching Page.navigate response from the responder).
+        let page2 = page.clone();
+        let handle = thread::spawn(move || {
+            page2.send_navigate(
+                "Page.navigate",
+                json!({"url": "https://example.com/file.pdf", "frameId": "frame-1"}),
+                "frame-1",
+            )
+        });
+
+        // Consume the outgoing Page.navigate so the reader thread can see
+        // an in-flight request id, then inject a downloadCreated event for
+        // the same frame.
+        let sent = recv_out(&h.out_rx);
+        assert_eq!(sent["method"], "Page.navigate");
+
+        h.in_tx
+            .send(download_created_event(
+                "frame-1",
+                "https://example.com/file.pdf",
+                "dl-uuid-1",
+                None,
+            ))
+            .unwrap();
+
+        let result = handle.join().unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, ProtocolErrorKind::NavigationBecameDownload);
+        let info = err
+            .download_info
+            .expect("download_info populated for NavigationBecameDownload");
+        assert_eq!(info.url, "https://example.com/file.pdf");
+        assert_eq!(info.frame_id.as_deref(), Some("frame-1"));
+        assert_eq!(info.download_id.as_deref(), Some("dl-uuid-1"));
+
+        teardown(h);
+    }
+
+    #[test]
+    fn download_created_with_no_pending_nav_is_ignored() {
+        // No pending navigation: the reader thread should log a warning
+        // and otherwise leave the connection untouched. No panics, no
+        // spurious resolution. We just verify the connection stays usable.
+        let h = setup();
+
+        h.in_tx
+            .send(download_created_event(
+                "frame-orphan",
+                "https://example.com/orphan.pdf",
+                "dl-uuid-orphan",
+                None,
+            ))
+            .unwrap();
+
+        // Give the reader a moment to process.
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        // Connection should still be Connected and usable for a normal send.
+        let session = h.conn.root_session();
+        let in_tx = h.in_tx.clone();
+        let responder = thread::spawn(move || {
+            let sent = recv_out(&h.out_rx);
+            let id = sent["id"].as_i64().unwrap();
+            in_tx.send(success_response(id, None)).unwrap();
+        });
+
+        let result = session.send("Browser.enable", json!({}));
+        assert!(result.is_ok());
+
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn download_created_for_other_frame_does_not_resolve_pending_nav() {
+        // Two pending navigations on different frames: a downloadCreated
+        // event for frame A must only resolve frame A's nav, never B's.
+        let h = setup();
+        let page_a = h.conn.create_session("page-A".to_owned());
+        let page_b = h.conn.create_session("page-B".to_owned());
+
+        // Start nav on frame-A
+        let pa = page_a.clone();
+        let handle_a = thread::spawn(move || {
+            pa.send_navigate(
+                "Page.navigate",
+                json!({"url": "https://a.example/", "frameId": "frame-A"}),
+                "frame-A",
+            )
+        });
+        let sent_a = recv_out(&h.out_rx);
+        let id_a = sent_a["id"].as_i64().unwrap();
+        assert_eq!(sent_a["sessionId"], "page-A");
+
+        // Start nav on frame-B
+        let pb = page_b.clone();
+        let handle_b = thread::spawn(move || {
+            pb.send_navigate(
+                "Page.navigate",
+                json!({"url": "https://b.example/", "frameId": "frame-B"}),
+                "frame-B",
+            )
+        });
+        let sent_b = recv_out(&h.out_rx);
+        let id_b = sent_b["id"].as_i64().unwrap();
+        assert_eq!(sent_b["sessionId"], "page-B");
+        assert_ne!(id_a, id_b);
+
+        // Fire downloadCreated for frame-A only.
+        h.in_tx
+            .send(download_created_event(
+                "frame-A",
+                "https://a.example/file",
+                "dl-A",
+                Some("page-A"),
+            ))
+            .unwrap();
+
+        // Frame-A's navigate must finish with NavigationBecameDownload.
+        let result_a = handle_a.join().unwrap();
+        let err_a = result_a.expect_err("frame-A nav must error");
+        assert_eq!(err_a.kind, ProtocolErrorKind::NavigationBecameDownload);
+        assert_eq!(
+            err_a.download_info.as_ref().unwrap().frame_id.as_deref(),
+            Some("frame-A")
+        );
+
+        // Frame-B's navigate must still be in flight. Resolve it normally
+        // and confirm it succeeded — that proves the downloadCreated did
+        // not leak into it.
+        h.in_tx
+            .send(success_response(id_b, Some("page-B")))
+            .unwrap();
+        let result_b = handle_b.join().unwrap();
+        assert!(
+            result_b.is_ok(),
+            "frame-B nav must succeed, got {result_b:?}"
+        );
+
+        teardown(h);
+    }
+
+    #[test]
+    fn successful_navigate_clears_pending_nav_entry() {
+        // After a normal navigate response, the pending-nav entry should be
+        // cleared so a later downloadCreated for the same frame is treated
+        // as an orphan (logged, ignored) rather than poisoning a future
+        // nav.
+        let h = setup();
+        let page = h.conn.create_session("page-1".to_owned());
+
+        let p = page.clone();
+        let handle = thread::spawn(move || {
+            p.send_navigate(
+                "Page.navigate",
+                json!({"url": "https://ok.example/", "frameId": "frame-1"}),
+                "frame-1",
+            )
+        });
+        let sent = recv_out(&h.out_rx);
+        let id = sent["id"].as_i64().unwrap();
+        h.in_tx.send(success_response(id, Some("page-1"))).unwrap();
+        let result = handle.join().unwrap();
+        assert!(result.is_ok());
+
+        // pending_navs should now be empty.
+        {
+            let guard = h.conn.inner.lock().unwrap();
+            assert!(
+                guard.pending_navs.is_empty(),
+                "pending_navs should be empty after success"
+            );
+        }
 
         teardown(h);
     }

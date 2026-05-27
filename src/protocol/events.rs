@@ -77,7 +77,10 @@ impl EventRouter {
         let session_key = session_key_from_event(event);
 
         // 1. Exact match: (session_key, method)
-        if let Some(handlers) = self.handlers.get(&(session_key.clone(), event.method.clone())) {
+        if let Some(handlers) = self
+            .handlers
+            .get(&(session_key.clone(), event.method.clone()))
+        {
             for handler in handlers {
                 handler(event);
             }
@@ -154,9 +157,13 @@ mod tests {
         let mut router = EventRouter::new();
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        router.on("", "Browser.attachedToTarget", Box::new(move |_| {
-            c.fetch_add(1, Ordering::SeqCst);
-        }));
+        router.on(
+            "",
+            "Browser.attachedToTarget",
+            Box::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
 
         router.dispatch(&make_event("Browser.attachedToTarget", None));
         assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -171,9 +178,12 @@ mod tests {
         let mut router = EventRouter::new();
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        router.on_any("session-1", Box::new(move |_| {
-            c.fetch_add(1, Ordering::SeqCst);
-        }));
+        router.on_any(
+            "session-1",
+            Box::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
 
         router.dispatch(&make_event("Page.navigationStarted", Some("session-1")));
         router.dispatch(&make_event("Page.dialogOpened", Some("session-1")));
@@ -205,14 +215,21 @@ mod tests {
         let order = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let o1 = order.clone();
-        router.on("", "Browser.attachedToTarget", Box::new(move |_| {
-            o1.lock().unwrap().push("exact");
-        }));
+        router.on(
+            "",
+            "Browser.attachedToTarget",
+            Box::new(move |_| {
+                o1.lock().unwrap().push("exact");
+            }),
+        );
 
         let o2 = order.clone();
-        router.on_any("", Box::new(move |_| {
-            o2.lock().unwrap().push("wildcard");
-        }));
+        router.on_any(
+            "",
+            Box::new(move |_| {
+                o2.lock().unwrap().push("wildcard");
+            }),
+        );
 
         let o3 = order.clone();
         router.on_global(Box::new(move |_| {
@@ -231,12 +248,19 @@ mod tests {
         let c1 = count.clone();
         let c2 = count.clone();
 
-        router.on("s1", "Page.navigationStarted", Box::new(move |_| {
-            c1.fetch_add(1, Ordering::SeqCst);
-        }));
-        router.on_any("s1", Box::new(move |_| {
-            c2.fetch_add(1, Ordering::SeqCst);
-        }));
+        router.on(
+            "s1",
+            "Page.navigationStarted",
+            Box::new(move |_| {
+                c1.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        router.on_any(
+            "s1",
+            Box::new(move |_| {
+                c2.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
 
         // Should have 2 handler entries for s1
         assert_eq!(router.handler_count(), 2);
@@ -257,12 +281,20 @@ mod tests {
         let c1 = count_s1.clone();
         let c2 = count_s2.clone();
 
-        router.on("s1", "Page.load", Box::new(move |_| {
-            c1.fetch_add(1, Ordering::SeqCst);
-        }));
-        router.on("s2", "Page.load", Box::new(move |_| {
-            c2.fetch_add(1, Ordering::SeqCst);
-        }));
+        router.on(
+            "s1",
+            "Page.load",
+            Box::new(move |_| {
+                c1.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        router.on(
+            "s2",
+            "Page.load",
+            Box::new(move |_| {
+                c2.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
 
         router.remove_session("s1");
 
@@ -295,12 +327,20 @@ mod tests {
         let c1 = count.clone();
         let c2 = count.clone();
 
-        router.on("", "Browser.attachedToTarget", Box::new(move |_| {
-            c1.fetch_add(1, Ordering::SeqCst);
-        }));
-        router.on("", "Browser.attachedToTarget", Box::new(move |_| {
-            c2.fetch_add(10, Ordering::SeqCst);
-        }));
+        router.on(
+            "",
+            "Browser.attachedToTarget",
+            Box::new(move |_| {
+                c1.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        router.on(
+            "",
+            "Browser.attachedToTarget",
+            Box::new(move |_| {
+                c2.fetch_add(10, Ordering::SeqCst);
+            }),
+        );
 
         router.dispatch(&make_event("Browser.attachedToTarget", None));
         assert_eq!(count.load(Ordering::SeqCst), 11);
@@ -311,9 +351,13 @@ mod tests {
         let mut router = EventRouter::new();
         let received = Arc::new(std::sync::Mutex::new(None));
         let r = received.clone();
-        router.on("", "Browser.attachedToTarget", Box::new(move |event| {
-            *r.lock().unwrap() = Some(event.params.clone());
-        }));
+        router.on(
+            "",
+            "Browser.attachedToTarget",
+            Box::new(move |event| {
+                *r.lock().unwrap() = Some(event.params.clone());
+            }),
+        );
 
         let event = EventMessage {
             method: "Browser.attachedToTarget".to_owned(),

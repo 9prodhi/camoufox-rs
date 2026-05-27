@@ -56,10 +56,7 @@ pub fn print_response(response: &DaemonResponse, json_mode: bool) {
                     .and_then(|v| v.as_u64())
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "?".into());
-                let version = inst
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
+                let version = inst.get("version").and_then(|v| v.as_str()).unwrap_or("?");
                 let pages = inst
                     .get("pages")
                     .and_then(|v| v.as_array())

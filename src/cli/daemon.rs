@@ -87,8 +87,8 @@ fn handle_connection(
         return Ok(());
     }
 
-    let request: DaemonRequest = serde_json::from_str(&line)
-        .map_err(|e| format!("invalid request: {e}"))?;
+    let request: DaemonRequest =
+        serde_json::from_str(&line).map_err(|e| format!("invalid request: {e}"))?;
 
     let response = dispatch(request, manager);
 
@@ -111,10 +111,7 @@ fn handle_connection(
     Ok(())
 }
 
-fn dispatch(
-    request: DaemonRequest,
-    manager: &Arc<Mutex<InstanceManager>>,
-) -> DaemonResponse {
+fn dispatch(request: DaemonRequest, manager: &Arc<Mutex<InstanceManager>>) -> DaemonResponse {
     match request {
         DaemonRequest::Ping => {
             let mgr = manager.lock().unwrap();

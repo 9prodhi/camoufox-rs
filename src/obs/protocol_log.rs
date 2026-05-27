@@ -73,10 +73,7 @@ impl ProtocolLogger {
     /// ```text
     /// RECV id=2 ERR "Unknown method"
     /// ```
-    pub fn log_receive_response(
-        id: i64,
-        result: &Result<serde_json::Value, ErrorData>,
-    ) {
+    pub fn log_receive_response(id: i64, result: &Result<serde_json::Value, ErrorData>) {
         if log::log_enabled!(log::Level::Trace) {
             match result {
                 Ok(value) => {
@@ -240,20 +237,10 @@ mod tests {
                 data: None,
             }),
         );
-        ProtocolLogger::log_receive_event(
-            "Browser.attachedToTarget",
-            &None,
-        );
-        ProtocolLogger::log_receive_event(
-            "Page.navigationStarted",
-            &Some("session-123".into()),
-        );
+        ProtocolLogger::log_receive_event("Browser.attachedToTarget", &None);
+        ProtocolLogger::log_receive_event("Page.navigationStarted", &Some("session-123".into()));
         ProtocolLogger::log_send_raw(1, "Browser.enable", &None);
-        ProtocolLogger::log_send_raw(
-            2,
-            "Page.navigate",
-            &Some("session-abc".into()),
-        );
+        ProtocolLogger::log_send_raw(2, "Page.navigate", &Some("session-abc".into()));
         ProtocolLogger::log_lifecycle("connected");
         ProtocolLogger::log_anomaly("unknown session ID");
     }

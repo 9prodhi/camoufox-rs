@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::api::{Browser, BrowserOptions, ContextOptions, MainFrame};
 use crate::api::main_frame::{Rect, ScreenshotOptions};
+use crate::api::{Browser, BrowserOptions, ContextOptions, MainFrame};
 use crate::config::LaunchConfig;
 use crate::protocol::client::Connection;
 use crate::transport::pipe::PipeTransport;
@@ -52,10 +52,7 @@ pub struct Instance {
 impl Instance {
     /// Create a new page in this instance's context, fully wired with
     /// session, top frame id, and execution context tracking.
-    pub fn create_page(
-        &mut self,
-        context: &crate::api::BrowserContext,
-    ) -> Result<String, String> {
+    pub fn create_page(&mut self, context: &crate::api::BrowserContext) -> Result<String, String> {
         let main_frame = context
             .new_main_frame()
             .map_err(|e| format!("failed to create page: {e}"))?;
@@ -193,9 +190,7 @@ impl Instance {
     /// Shut down this instance.
     pub fn stop(self) -> Result<(), String> {
         let Instance {
-            browser,
-            mut child,
-            ..
+            browser, mut child, ..
         } = self;
         let _ = browser.close();
 
@@ -251,7 +246,9 @@ impl InstanceManager {
 
         let config = LaunchConfig {
             executable: PathBuf::from(
-                executable.map(|s| s.to_owned()).unwrap_or_else(default_executable),
+                executable
+                    .map(|s| s.to_owned())
+                    .unwrap_or_else(default_executable),
             ),
             profile_dir: Some(profile_dir.path().to_owned()),
             headless: headless.unwrap_or(true),

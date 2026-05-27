@@ -44,10 +44,7 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// * `Ok(())` - The process exited (either gracefully or after kill).
 /// * `Err(ProcessError::KillFailed)` - The `kill()` call failed.
 /// * `Err(ProcessError::Io)` - `try_wait()` or `wait()` returned an I/O error.
-pub fn graceful_shutdown(
-    child: &mut Child,
-    timeout: Duration,
-) -> Result<(), ProcessError> {
+pub fn graceful_shutdown(child: &mut Child, timeout: Duration) -> Result<(), ProcessError> {
     let deadline = Instant::now() + timeout;
     let mut poll_interval = MIN_POLL_INTERVAL;
 

@@ -13,6 +13,23 @@ pub enum ProtocolErrorKind {
     Crashed,
     /// Transport-level failure.
     Transport,
+    /// The navigation was diverted into a download flow by the renderer;
+    /// no DOM was loaded and the page state is unchanged from pre-navigation.
+    ///
+    /// Structured details live in [`ProtocolError::download_info`] when this
+    /// kind is set.
+    NavigationBecameDownload,
+}
+
+/// Structured details for a [`ProtocolErrorKind::NavigationBecameDownload`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadInfo {
+    /// The URL the renderer fetched (from the `Browser.downloadCreated` event).
+    pub url: String,
+    /// The frame that was navigating, when known.
+    pub frame_id: Option<String>,
+    /// The UUID assigned to the download by the browser.
+    pub download_id: Option<String>,
 }
 
 /// A protocol-level error.
@@ -23,6 +40,13 @@ pub struct ProtocolError {
     pub message: String,
     pub data: Option<String>,
     pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    /// Populated only when [`kind`](Self::kind) is
+    /// [`ProtocolErrorKind::NavigationBecameDownload`].
+    ///
+    /// Boxed so the rare-but-large download metadata doesn't inflate
+    /// `ProtocolError` for the common error paths (which would trigger
+    /// clippy's `result_large_err`).
+    pub download_info: Option<Box<DownloadInfo>>,
 }
 
 impl ProtocolError {
@@ -33,6 +57,7 @@ impl ProtocolError {
             message: error.message,
             data: error.data,
             source: None,
+            download_info: None,
         }
     }
 
@@ -43,6 +68,7 @@ impl ProtocolError {
             message: "Session closed".into(),
             data: None,
             source: None,
+            download_info: None,
         }
     }
 
@@ -53,6 +79,7 @@ impl ProtocolError {
             message: "Page crashed".into(),
             data: None,
             source: None,
+            download_info: None,
         }
     }
 
@@ -63,6 +90,30 @@ impl ProtocolError {
             message: err.to_string(),
             data: None,
             source: Some(Box::new(err)),
+            download_info: None,
+        }
+    }
+
+    /// Construct a [`ProtocolErrorKind::NavigationBecameDownload`] error.
+    ///
+    /// Use when a `Browser.downloadCreated` event arrives while a
+    /// `Page.navigate` was in flight for the same frame — the browser
+    /// diverted the response into a download flow rather than creating
+    /// a document, so the navigate caller will never get a response.
+    pub fn navigation_became_download(method: Option<String>, info: DownloadInfo) -> Self {
+        let message = match (&info.url, &info.frame_id) {
+            (url, Some(frame)) => {
+                format!("navigation diverted into download flow (frame {frame}, url {url})")
+            }
+            (url, None) => format!("navigation diverted into download flow (url {url})"),
+        };
+        Self {
+            kind: ProtocolErrorKind::NavigationBecameDownload,
+            method,
+            message,
+            data: None,
+            source: None,
+            download_info: Some(Box::new(info)),
         }
     }
 }

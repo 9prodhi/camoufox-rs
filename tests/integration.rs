@@ -133,7 +133,7 @@ fn create_context_and_page() {
     assert!(!main_frame.frame_id().is_empty());
 
     let nav_result =
-        main_frame.navigate("https://example.com", Default::default());
+        main_frame.navigate("https://example.com", Default::default(), Duration::from_secs(30));
     assert!(
         nav_result.is_ok(),
         "navigate failed: {:?}",
@@ -158,7 +158,7 @@ fn navigate_and_evaluate() {
         .expect("failed to create main frame");
 
     main_frame
-        .navigate("https://example.com", Default::default())
+        .navigate("https://example.com", Default::default(), Duration::from_secs(30))
         .expect("navigate failed");
 
     let title = main_frame
@@ -216,7 +216,7 @@ fn navigate_main_frame_with_cross_origin_iframe() {
         .expect("failed to create main frame");
 
     main_frame
-        .navigate(&server.main_url, Default::default())
+        .navigate(&server.main_url, Default::default(), Duration::from_secs(30))
         .expect("navigate failed");
 
     let body = main_frame

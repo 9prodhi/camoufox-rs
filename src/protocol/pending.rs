@@ -52,13 +52,9 @@ impl PendingMap {
         method: String,
     ) -> mpsc::Receiver<Result<serde_json::Value, ProtocolError>> {
         let (tx, rx) = mpsc::channel();
-        let prev = self.requests.insert(
-            id,
-            PendingRequest {
-                method,
-                sender: tx,
-            },
-        );
+        let prev = self
+            .requests
+            .insert(id, PendingRequest { method, sender: tx });
         debug_assert!(prev.is_none(), "duplicate pending request ID: {id}");
         rx
     }
@@ -72,11 +68,7 @@ impl PendingMap {
     /// Returns `true` if the ID was found and resolved, `false` if the ID
     /// was unknown. Per the protocol spec (Section 14, item 7), unknown
     /// response IDs are silently ignored.
-    pub fn resolve(
-        &mut self,
-        id: MessageId,
-        result: Result<serde_json::Value, ErrorData>,
-    ) -> bool {
+    pub fn resolve(&mut self, id: MessageId, result: Result<serde_json::Value, ErrorData>) -> bool {
         let Some(pending) = self.requests.remove(&id) else {
             return false;
         };
@@ -90,6 +82,18 @@ impl PendingMap {
         // discard. This is not an error condition.
         let _ = pending.sender.send(outcome);
         true
+    }
+
+    /// Remove a pending entry without sending anything to the receiver.
+    ///
+    /// Used by the timeout path: when `Session::send_with_timeout` gives up,
+    /// it removes the slot so a late-arriving response with this id is
+    /// silently dropped (the reader thread calls `resolve` which simply
+    /// returns `false` for unknown ids).
+    ///
+    /// Returns `true` if the id was present, `false` otherwise.
+    pub fn remove(&mut self, id: MessageId) -> bool {
+        self.requests.remove(&id).is_some()
     }
 
     /// Reject ALL pending requests in this session.
@@ -286,7 +290,10 @@ mod tests {
         // Resolve middle one first (out of order — protocol allows this)
         assert!(map.resolve(20, Ok(json!({"navigationId": "nav1"}))));
         assert_eq!(map.len(), 2);
-        assert_eq!(rx2.recv().unwrap().unwrap(), json!({"navigationId": "nav1"}));
+        assert_eq!(
+            rx2.recv().unwrap().unwrap(),
+            json!({"navigationId": "nav1"})
+        );
 
         // Resolve first
         assert!(map.resolve(10, Ok(json!({}))));
@@ -312,6 +319,27 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert!(map.resolve(2, Ok(json!("result"))));
         assert_eq!(rx2.recv().unwrap().unwrap(), json!("result"));
+    }
+
+    #[test]
+    fn remove_drops_entry_without_sending() {
+        let mut map = PendingMap::new();
+        let rx = map.insert(42, "Page.navigate".into());
+
+        assert!(map.remove(42));
+        assert!(map.is_empty());
+
+        // A subsequent resolve for the same id is a no-op (returns false).
+        // The receiver does not get any message; it disconnects when the
+        // sender is dropped along with the PendingRequest above.
+        assert!(!map.resolve(42, Ok(json!({}))));
+        assert!(rx.recv().is_err());
+    }
+
+    #[test]
+    fn remove_unknown_id_returns_false() {
+        let mut map = PendingMap::new();
+        assert!(!map.remove(999));
     }
 
     #[test]

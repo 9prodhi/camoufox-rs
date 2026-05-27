@@ -99,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Navigate.
     println!("[*] Navigating to {url}...");
-    let nav_id = main_frame.navigate(&url, Default::default())?;
+    let nav_id = main_frame.navigate(&url, Default::default(), PAGE_LOAD_TIMEOUT)?;
     println!("[*] Navigation started (id: {nav_id:?})");
 
     // 5. Wait for the page to settle on the target URL and reach readyState=complete.

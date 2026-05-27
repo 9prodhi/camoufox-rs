@@ -231,6 +231,12 @@ impl MainFrame {
     /// Always navigates the top frame (no `frame_id` override). Returns the
     /// navigation ID for cross-document navigations, `None` for same-document.
     ///
+    /// `timeout` bounds the wait for the renderer's response to `Page.navigate`.
+    /// If the renderer never responds (e.g. the response was a download and
+    /// no DOM was created), the call returns
+    /// [`ProtocolErrorKind::Timeout`](crate::protocol::errors::ProtocolErrorKind::Timeout)
+    /// rather than hanging.
+    ///
     /// Invalidates the cached execution context on cross-document navigation
     /// so a subsequent [`evaluate`](Self::evaluate) call waits for the new
     /// document's main-world context rather than racing against the stale
@@ -240,6 +246,7 @@ impl MainFrame {
         &self,
         url: &str,
         options: NavigateOptions,
+        timeout: Duration,
     ) -> Result<Option<String>, ProtocolError> {
         let mut params = json!({
             "url": url,
@@ -249,7 +256,9 @@ impl MainFrame {
             params["referer"] = json!(referer);
         }
 
-        let result = self.session().send("Page.navigate", params)?;
+        let result = self
+            .session()
+            .send_with_timeout("Page.navigate", params, timeout)?;
         let nav_id = result
             .get("navigationId")
             .and_then(|v| v.as_str())
@@ -1270,5 +1279,116 @@ mod tests {
     #[test]
     fn test_decode_base64_invalid_char() {
         assert!(decode_base64("SGVs!G8=").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: `navigate` must honor its `timeout: Duration` parameter.
+    //
+    // Before the fix, `MainFrame::navigate` accepted no timeout and called
+    // `Session::send`, which blocked on `rx.recv()` indefinitely. This test
+    // builds a MainFrame around a MockTransport that never responds, then
+    // confirms that `navigate(url, opts, deadline)` returns a Timeout error
+    // within the deadline.
+    // -----------------------------------------------------------------------
+
+    use crate::protocol::client::Connection;
+    use crate::protocol::errors::ProtocolErrorKind;
+    use crate::protocol::types::RawMessage;
+    use crate::transport::errors::TransportError;
+    use crate::transport::Transport;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc as StdArc;
+
+    /// Silent mock transport: send drops messages, receive blocks until
+    /// the transport is closed (then returns Closed).
+    struct SilentMockTransport {
+        closed: StdArc<AtomicBool>,
+        // Capture outgoing messages so tests can inspect them.
+        outgoing: mpsc::Sender<serde_json::Value>,
+    }
+
+    impl Transport for SilentMockTransport {
+        fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(TransportError::Closed);
+            }
+            let _ = self.outgoing.send(message.clone());
+            Ok(())
+        }
+
+        fn receive(&mut self) -> Result<RawMessage, TransportError> {
+            loop {
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(TransportError::Closed);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn navigate_honors_timeout_argument() {
+        let closed = StdArc::new(AtomicBool::new(false));
+        let (out_tx, out_rx) = mpsc::channel();
+        let transport = SilentMockTransport {
+            closed: StdArc::clone(&closed),
+            outgoing: out_tx,
+        };
+        let conn = Connection::new(Box::new(transport));
+        let session = conn.root_session(); // root session is fine for this test
+        let exec_ctx = StdArc::new(Mutex::new(None));
+        let main_frame = MainFrame::new(
+            session,
+            "target-test".to_owned(),
+            "frame-test".to_owned(),
+            exec_ctx,
+        );
+
+        let start = Instant::now();
+        let result = main_frame.navigate(
+            "https://example.com/never-responds",
+            Default::default(),
+            Duration::from_millis(150),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "expected timeout, got {:?}", result.ok());
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind,
+            ProtocolErrorKind::Timeout,
+            "expected Timeout kind, got {:?}",
+            err.kind
+        );
+        assert_eq!(err.method.as_deref(), Some("Page.navigate"));
+        assert!(
+            elapsed >= Duration::from_millis(140),
+            "returned too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "returned too late: {elapsed:?}"
+        );
+
+        // Confirm the outgoing wire request was a Page.navigate.
+        let sent = out_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Page.navigate was not actually sent");
+        assert_eq!(sent["method"], "Page.navigate");
+        assert_eq!(sent["params"]["url"], "https://example.com/never-responds");
+        assert_eq!(sent["params"]["frameId"], "frame-test");
+
+        // Force the connection to shut down so the reader thread exits.
+        closed.store(true, Ordering::SeqCst);
     }
 }

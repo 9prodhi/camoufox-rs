@@ -16,7 +16,7 @@
 //! // let browser = Browser::connect(connection, BrowserOptions::default())?;
 //! // let context = browser.new_context(Default::default())?;
 //! // let main_frame = context.new_main_frame()?;
-//! // main_frame.navigate("https://example.com", Default::default())?;
+//! // main_frame.navigate("https://example.com", Default::default(), std::time::Duration::from_secs(30))?;
 //! ```
 
 pub mod browser;

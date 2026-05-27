@@ -1,6 +1,7 @@
 use crate::protocol::types::ErrorData;
 use crate::transport::errors::TransportError;
 use std::fmt;
+use std::time::Duration;
 
 /// The type of protocol error, matching Playwright's ProtocolError.type values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +14,8 @@ pub enum ProtocolErrorKind {
     Crashed,
     /// Transport-level failure.
     Transport,
+    /// The request was not answered before its deadline.
+    Timeout,
 }
 
 /// A protocol-level error.
@@ -63,6 +66,22 @@ impl ProtocolError {
             message: err.to_string(),
             data: None,
             source: Some(Box::new(err)),
+        }
+    }
+
+    /// Build a `Timeout` error for a request that exceeded its deadline.
+    ///
+    /// The pending slot on the sending side is the caller's responsibility
+    /// to free before constructing this — see
+    /// [`Session::send_with_timeout`](crate::protocol::client::Session::send_with_timeout).
+    pub fn timeout(method: impl Into<String>, deadline: Duration) -> Self {
+        let method = method.into();
+        Self {
+            kind: ProtocolErrorKind::Timeout,
+            message: format!("Request '{method}' timed out after {:?}", deadline,),
+            method: Some(method),
+            data: None,
+            source: None,
         }
     }
 }

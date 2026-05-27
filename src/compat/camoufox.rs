@@ -40,8 +40,7 @@ impl CamoufoxInfo {
         let ua_lower = user_agent.to_ascii_lowercase();
         let ver_lower = version.to_ascii_lowercase();
 
-        let is_camoufox =
-            ua_lower.contains("camoufox") || ver_lower.contains("camoufox");
+        let is_camoufox = ua_lower.contains("camoufox") || ver_lower.contains("camoufox");
 
         // Parse major version from "Firefox/128.0" or similar.
         let major_version = version
@@ -98,7 +97,6 @@ impl CamoufoxInfo {
         }
     }
 }
-
 
 /// Check whether a method is part of the standard Juggler protocol.
 ///

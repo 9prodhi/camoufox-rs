@@ -96,6 +96,24 @@ impl PendingMap {
         self.requests.remove(&id).is_some()
     }
 
+    /// Resolve a specific pending request with a fully-formed `ProtocolError`.
+    ///
+    /// Used when the reader needs to surface an out-of-band error to a
+    /// blocked caller — e.g. a `Browser.downloadCreated` event indicating
+    /// the navigation was diverted into a download flow. Unlike
+    /// [`resolve`](Self::resolve) (which only knows how to map server
+    /// `ErrorData` to a `Response`-kind error), this lets the caller supply
+    /// any error variant.
+    ///
+    /// Returns `true` if the ID was found and resolved, `false` if unknown.
+    pub fn resolve_with_error(&mut self, id: MessageId, error: ProtocolError) -> bool {
+        let Some(pending) = self.requests.remove(&id) else {
+            return false;
+        };
+        let _ = pending.sender.send(Err(error));
+        true
+    }
+
     /// Reject ALL pending requests in this session.
     ///
     /// Called when:
@@ -117,6 +135,7 @@ impl PendingMap {
                     message: format!("{kind:?}"),
                     data: None,
                     source: None,
+                    download_info: None,
                 },
             };
             let _ = pending.sender.send(Err(error));
@@ -347,5 +366,44 @@ mod tests {
         let map = PendingMap::default();
         assert!(map.is_empty());
         assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn resolve_with_error_delivers_full_protocol_error() {
+        use crate::protocol::errors::DownloadInfo;
+
+        let mut map = PendingMap::new();
+        let rx = map.insert(1, "Page.navigate".into());
+
+        let info = DownloadInfo {
+            url: "https://example.com/file.pdf".into(),
+            frame_id: Some("frame-1".into()),
+            download_id: Some("dl-uuid-1".into()),
+        };
+        let err =
+            ProtocolError::navigation_became_download(Some("Page.navigate".into()), info.clone());
+
+        assert!(map.resolve_with_error(1, err));
+        assert!(map.is_empty());
+
+        let result = rx.recv().unwrap();
+        let received_err = result.unwrap_err();
+        assert_eq!(
+            received_err.kind,
+            ProtocolErrorKind::NavigationBecameDownload
+        );
+        assert_eq!(received_err.method.as_deref(), Some("Page.navigate"));
+        assert_eq!(
+            received_err.download_info.as_deref(),
+            Some(&info),
+            "boxed download_info should deref-equal the original"
+        );
+    }
+
+    #[test]
+    fn resolve_with_error_unknown_id_returns_false() {
+        let mut map = PendingMap::new();
+        let err = ProtocolError::closed(Some("Page.navigate".into()));
+        assert!(!map.resolve_with_error(999, err));
     }
 }

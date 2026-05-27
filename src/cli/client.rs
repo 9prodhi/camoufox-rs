@@ -7,10 +7,7 @@ use std::path::Path;
 use crate::cli::ipc::{DaemonRequest, DaemonResponse};
 
 /// Send a request to the daemon and return the response.
-pub fn send_request(
-    socket_path: &Path,
-    request: &DaemonRequest,
-) -> Result<DaemonResponse, String> {
+pub fn send_request(socket_path: &Path, request: &DaemonRequest) -> Result<DaemonResponse, String> {
     let stream = UnixStream::connect(socket_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound
             || e.kind() == std::io::ErrorKind::ConnectionRefused

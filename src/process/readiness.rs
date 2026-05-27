@@ -56,10 +56,7 @@ enum ReadResult {
 ///   is still running; the caller should kill it.
 /// * `Err(ProcessError::Io)` - An I/O error occurred reading stderr, or
 ///   stderr was not piped.
-pub fn wait_for_ready(
-    child: &mut Child,
-    timeout: Duration,
-) -> Result<String, ProcessError> {
+pub fn wait_for_ready(child: &mut Child, timeout: Duration) -> Result<String, ProcessError> {
     // Take ownership of stderr. If it was not piped, return an error.
     let stderr: ChildStderr = child.stderr.take().ok_or_else(|| {
         ProcessError::Io(std::io::Error::new(

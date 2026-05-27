@@ -38,11 +38,7 @@ fn main() {
         }
 
         Command::NewPage { instance_id } => {
-            run_client(
-                &sock,
-                &DaemonRequest::NewPage { instance_id },
-                cli.json,
-            );
+            run_client(&sock, &DaemonRequest::NewPage { instance_id }, cli.json);
         }
 
         Command::Navigate {

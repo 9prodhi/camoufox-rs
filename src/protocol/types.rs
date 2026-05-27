@@ -105,7 +105,9 @@ impl RawMessage {
         let method = self.method?;
         Some(IncomingMessage::Event(EventMessage {
             method,
-            params: self.params.unwrap_or(serde_json::Value::Object(Default::default())),
+            params: self
+                .params
+                .unwrap_or(serde_json::Value::Object(Default::default())),
             session_id: self.session_id,
         }))
     }

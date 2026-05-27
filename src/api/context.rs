@@ -275,11 +275,7 @@ impl BrowserContext {
     ///
     /// This is an internal constructor. External users should use
     /// [`Browser::new_context`](crate::api::browser::Browser::new_context).
-    pub(crate) fn new(
-        context_id: String,
-        session: &Session,
-        connection: Arc<Connection>,
-    ) -> Self {
+    pub(crate) fn new(context_id: String, session: &Session, connection: Arc<Connection>) -> Self {
         BrowserContext {
             context_id,
             session: session.clone(),
@@ -304,11 +300,7 @@ impl BrowserContext {
 
     /// Helper: build a JSON object with `browserContextId` included.
     fn ctx_params(&self, extra: serde_json::Value) -> serde_json::Value {
-        let mut obj = if extra.is_object() {
-            extra
-        } else {
-            json!({})
-        };
+        let mut obj = if extra.is_object() { extra } else { json!({}) };
         obj["browserContextId"] = json!(self.context_id);
         obj
     }
@@ -651,11 +643,7 @@ impl BrowserContext {
             if !parent.is_empty() {
                 return; // sub-frame; skip
             }
-            let sid = event
-                .session_id
-                .as_deref()
-                .unwrap_or("")
-                .to_owned();
+            let sid = event.session_id.as_deref().unwrap_or("").to_owned();
             let fid = event
                 .params
                 .get("frameId")
@@ -825,6 +813,7 @@ impl BrowserContext {
                     message: msg,
                     data: None,
                     source: None,
+                    download_info: None,
                 });
             }
             match attach_rx.recv_timeout(remaining) {
@@ -843,6 +832,7 @@ impl BrowserContext {
                         message: "attach channel disconnected".into(),
                         data: None,
                         source: None,
+                        download_info: None,
                     });
                 }
             }
@@ -875,6 +865,7 @@ impl BrowserContext {
                     ),
                     data: None,
                     source: None,
+                    download_info: None,
                 });
             }
             match frame_rx.recv_timeout(remaining) {
@@ -888,6 +879,7 @@ impl BrowserContext {
                         message: "frame channel disconnected".into(),
                         data: None,
                         source: None,
+                        download_info: None,
                     });
                 }
             }

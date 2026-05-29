@@ -107,12 +107,17 @@ pub fn print_response(response: &DaemonResponse, json_mode: bool) {
 
         // Navigation response
         if let Some(nav_id) = data.get("navigation_id") {
+            let status_str = data
+                .get("status_code")
+                .and_then(|v| v.as_u64())
+                .map(|s| format!(" status={s}"))
+                .unwrap_or_default();
             if nav_id.is_null() {
-                println!("ok (same-document navigation)");
+                println!("ok (same-document navigation){status_str}");
             } else if let Some(id) = nav_id.as_str() {
-                println!("ok (navigation_id: {id})");
+                println!("ok (navigation_id: {id}){status_str}");
             } else {
-                println!("ok");
+                println!("ok{status_str}");
             }
             return;
         }

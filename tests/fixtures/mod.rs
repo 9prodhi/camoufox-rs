@@ -315,3 +315,74 @@ document.body.appendChild(d);
 impl Drop for LifecycleServer {
     fn drop(&mut self) {}
 }
+
+/// A single-port HTTP server with two routes for testing status-code capture:
+///
+/// - `GET /200` → HTTP 200 with a minimal HTML body.
+/// - `GET /404` → HTTP 404 with a minimal HTML body.
+/// - Any other path → HTTP 200 (treated as the "base" URL).
+///
+/// Used by the G4 integration test
+/// (`navigate_reports_main_document_status_code`).
+pub struct StatusServer {
+    /// Base URL: `http://127.0.0.1:<port>/`
+    #[allow(dead_code)]
+    pub base_url: String,
+    /// URL that returns 200.
+    pub url_200: String,
+    /// URL that returns 404.
+    pub url_404: String,
+    _server: Arc<Server>,
+}
+
+impl StatusServer {
+    /// Start on an ephemeral port.
+    #[allow(dead_code)]
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").expect("bind status server"));
+        let port = server.server_addr().to_ip().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}/");
+        let url_200 = format!("http://127.0.0.1:{port}/200");
+        let url_404 = format!("http://127.0.0.1:{port}/404");
+
+        const HTML_200: &[u8] = b"<html><body>200 OK</body></html>";
+        const HTML_404: &[u8] = b"<html><body>404 Not Found</body></html>";
+
+        let server_clone = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in server_clone.incoming_requests() {
+                let path = req.url().to_owned();
+                if path.contains("/404") {
+                    let resp = Response::new(
+                        404.into(),
+                        vec![Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap()],
+                        Cursor::new(HTML_404.to_vec()),
+                        Some(HTML_404.len()),
+                        None,
+                    );
+                    let _ = req.respond(resp);
+                } else {
+                    let resp = Response::new(
+                        200.into(),
+                        vec![Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap()],
+                        Cursor::new(HTML_200.to_vec()),
+                        Some(HTML_200.len()),
+                        None,
+                    );
+                    let _ = req.respond(resp);
+                }
+            }
+        });
+
+        StatusServer {
+            base_url,
+            url_200,
+            url_404,
+            _server: server,
+        }
+    }
+}
+
+impl Drop for StatusServer {
+    fn drop(&mut self) {}
+}

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::api::main_frame::{NavigateOptions, Rect, ScreenshotOptions};
+use crate::api::main_frame::{NavigateOptions, NavigateOutcome, Rect, ScreenshotOptions};
 use crate::api::{Browser, BrowserOptions, ContextOptions, MainFrame};
 use crate::config::LaunchConfig;
 use crate::protocol::client::Connection;
@@ -77,13 +77,15 @@ impl Instance {
     ///
     /// Clears the cached execution context so the next `evaluate` waits for
     /// the post-navigation context; the wait happens inside `MainFrame::evaluate`.
+    ///
+    /// Returns a `NavigateOutcome` containing `nav_id` and `status_code` (G4).
     pub fn navigate(
         &self,
         page_id: &str,
         url: &str,
         timeout: Duration,
         wait_until: Option<&str>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<NavigateOutcome, String> {
         let mp = self
             .pages
             .get(page_id)
@@ -356,6 +358,8 @@ impl InstanceManager {
     }
 
     /// Navigate a page.
+    ///
+    /// Returns a `NavigateOutcome` with `nav_id` and `status_code` (G4).
     pub fn navigate(
         &self,
         instance_id: &str,
@@ -363,7 +367,7 @@ impl InstanceManager {
         url: &str,
         timeout: Duration,
         wait_until: Option<&str>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<NavigateOutcome, String> {
         let inst = self
             .instances
             .get(instance_id)

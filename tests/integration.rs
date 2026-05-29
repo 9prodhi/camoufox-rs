@@ -449,3 +449,56 @@ fn navigate_wait_until_load_blocks_until_dom_marker_present() {
 
     tb.teardown();
 }
+
+#[test]
+#[ignore]
+fn navigate_reports_main_document_status_code() {
+    // G4 integration test: `navigate` must surface the main-document HTTP
+    // status in `outcome.status_code` additively, WITHOUT failing on 4xx.
+    //
+    // Setup:
+    //   1. Start a StatusServer with /200 (200 OK) and /404 (404 Not Found).
+    //   2. Navigate to /404 → assert status_code == Some(404) AND navigate Ok.
+    //   3. Navigate to /200 → assert status_code == Some(200).
+    //
+    // Run with:
+    //   cargo test --test integration -- --ignored \
+    //       navigate_reports_main_document_status_code --test-threads=1
+
+    let server = fixtures::StatusServer::start();
+    let tb = setup();
+
+    let context = tb
+        .browser
+        .new_context(ContextOptions::default())
+        .expect("failed to create context");
+    let main_frame = context
+        .new_main_frame()
+        .expect("failed to create main frame");
+
+    // --- 404 path ---
+    let outcome_404 = main_frame
+        .navigate(&server.url_404, Default::default(), Duration::from_secs(30))
+        .expect("navigate to /404 must return Ok (not error on 4xx)");
+
+    assert_eq!(
+        outcome_404.status_code,
+        Some(404),
+        "status_code must be Some(404) for a 404 response; got {:?}",
+        outcome_404.status_code
+    );
+
+    // --- 200 path ---
+    let outcome_200 = main_frame
+        .navigate(&server.url_200, Default::default(), Duration::from_secs(30))
+        .expect("navigate to /200 must return Ok");
+
+    assert_eq!(
+        outcome_200.status_code,
+        Some(200),
+        "status_code must be Some(200) for a 200 response; got {:?}",
+        outcome_200.status_code
+    );
+
+    tb.teardown();
+}

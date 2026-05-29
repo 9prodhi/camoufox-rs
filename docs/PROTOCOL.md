@@ -1503,6 +1503,11 @@ params: {
 
 **Internal cause:** `TYPE_INTERNAL_EVENTSOURCE` → `"eventsource"`
 
+> **Runtime observation (camoufox 135):** The live browser emits the raw Firefox
+> type names (e.g. `"TYPE_DOCUMENT"`, `"TYPE_IMAGE"`) rather than the mapped
+> values shown above (e.g. `"document"`, `"image"`). Consumers should accept both
+> forms. This was confirmed during G4 (HTTP-status capture) integration testing.
+
 #### `Network.responseReceived`
 ```
 params: {

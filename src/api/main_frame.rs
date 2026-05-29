@@ -41,6 +41,24 @@ pub struct NavigateOptions {
     pub wait_until: Option<String>,
 }
 
+/// The outcome of a `MainFrame::navigate` call.
+///
+/// `navigation_id` carries the server-assigned navigation id (same semantics
+/// as before: `None` for same-document navigations). `status_code` carries
+/// the HTTP status of the **main-document** response (`None` when the status
+/// could not be captured — e.g. for `file://` URLs or network errors before
+/// a response arrived). `navigate` **never** fails because of a non-2xx
+/// status; callers inspect `status_code` themselves.
+#[derive(Debug, Clone)]
+pub struct NavigateOutcome {
+    /// Server-assigned navigation id, or `None` for same-document navigations.
+    pub nav_id: Option<String>,
+    /// HTTP status code of the main-document response, or `None` if not
+    /// captured (e.g. `file://` URL, connection error, or the browser did not
+    /// emit the network events).
+    pub status_code: Option<u16>,
+}
+
 /// Options for taking a screenshot.
 #[derive(Debug, Clone)]
 pub struct ScreenshotOptions {
@@ -395,8 +413,15 @@ impl MainFrame {
 
     /// Navigate to a URL.
     ///
-    /// Always navigates the top frame (no `frame_id` override). Returns the
-    /// navigation ID for cross-document navigations, `None` for same-document.
+    /// Always navigates the top frame (no `frame_id` override). Returns a
+    /// [`NavigateOutcome`] that includes:
+    /// - `nav_id`: the navigation ID for cross-document navigations, `None`
+    ///   for same-document (unchanged semantics).
+    /// - `status_code`: the HTTP status of the **main-document** response
+    ///   (e.g. 200, 404). `None` when the status cannot be captured (e.g.
+    ///   `file://` URLs, `about:blank`, or when `Network.responseReceived`
+    ///   did not arrive within the deadline). **`navigate` never fails because
+    ///   of a non-2xx status** — callers inspect `status_code` themselves.
     ///
     /// `timeout` bounds the **whole** operation — both the wait for the
     /// renderer's response to `Page.navigate` AND (when `wait_until` is set)
@@ -418,7 +443,7 @@ impl MainFrame {
         url: &str,
         options: NavigateOptions,
         timeout: Duration,
-    ) -> Result<Option<String>, ProtocolError> {
+    ) -> Result<NavigateOutcome, ProtocolError> {
         // Validate wait_until before issuing any network I/O.
         let lifecycle_event: Option<&'static str> = match options.wait_until.as_deref() {
             None | Some("") => None,
@@ -428,6 +453,128 @@ impl MainFrame {
         // Single deadline bounds the navigate RPC AND the lifecycle wait, so
         // the combined operation never exceeds `timeout` (no double-counting).
         let deadline = Instant::now() + timeout;
+
+        let session_key = self.session.key().to_owned();
+        let frame_id = self.frame_id.clone();
+
+        // -----------------------------------------------------------------------
+        // G4: Subscribe Network event handlers BEFORE issuing Page.navigate.
+        //
+        // Correlation approach:
+        // 1. `Network.requestWillBeSent { requestId, navigationId, cause }`:
+        //    when `cause == "document"`, record the `requestId`. We accept the
+        //    first `document` request speculatively (expected_nav_id is None
+        //    until the navigate ack returns the nav_id). After the ack, the
+        //    nav_id is stored so the handler can gate on it for subsequent
+        //    events.
+        // 2. `Network.responseReceived { requestId, status }`:
+        //    when `requestId` matches the one recorded in step 1, capture the
+        //    HTTP status.
+        //
+        // Both handlers are RAII-guarded — they deregister on all exit paths.
+        // -----------------------------------------------------------------------
+
+        /// Shared state written by the two handlers.
+        #[derive(Default)]
+        struct NetState {
+            main_request_id: Option<String>,
+            status: Option<u16>,
+        }
+        let net_state: Arc<Mutex<NetState>> = Arc::new(Mutex::new(NetState::default()));
+        // Populated after Page.navigate returns; handlers read it under the same Mutex.
+        let expected_nav_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        // Handler 1: Network.requestWillBeSent
+        let state_rws = Arc::clone(&net_state);
+        let nav_id_rws = Arc::clone(&expected_nav_id);
+        let frame_id_rws = frame_id.clone();
+        let rws_id = self.connection.on_event(
+            &session_key,
+            "Network.requestWillBeSent",
+            Box::new(move |event| {
+                let cause = event
+                    .params
+                    .get("cause")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                // Accept both the spec-mapped value ("document") and the raw Firefox
+                // type names emitted in practice ("TYPE_DOCUMENT", "TYPE_SUBDOCUMENT",
+                // "TYPE_REFRESH"). PROTOCOL.md says they map to "document" but the
+                // live browser emits the unmapped Firefox values.
+                let is_document_cause = matches!(
+                    cause,
+                    "document" | "TYPE_DOCUMENT" | "TYPE_SUBDOCUMENT" | "TYPE_REFRESH"
+                );
+                if !is_document_cause {
+                    return;
+                }
+                // Frame filter: skip requests for other frames if frameId present.
+                if let Some(ev_frame) = event.params.get("frameId").and_then(|v| v.as_str()) {
+                    if !ev_frame.is_empty() && ev_frame != frame_id_rws {
+                        return;
+                    }
+                }
+                let req_id = match event.params.get("requestId").and_then(|v| v.as_str()) {
+                    Some(id) => id.to_owned(),
+                    None => return,
+                };
+                let ev_nav_id = event
+                    .params
+                    .get("navigationId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned());
+                let expected = nav_id_rws.lock().unwrap().clone();
+                // Accept if: nav_id not yet known (speculative), OR nav_ids match,
+                // OR event carries no nav_id (some same-doc navigations).
+                let accept = match (&expected, &ev_nav_id) {
+                    (None, _) => true,
+                    (Some(exp), Some(ev)) => exp == ev,
+                    (Some(_), None) => true,
+                };
+                if accept {
+                    let mut st = state_rws.lock().unwrap();
+                    if st.main_request_id.is_none() {
+                        st.main_request_id = Some(req_id);
+                    }
+                }
+            }),
+        );
+        let _guard_rws = SubscriptionGuard {
+            connection: &self.connection,
+            session_key: &session_key,
+            method: "Network.requestWillBeSent",
+            id: rws_id,
+        };
+
+        // Handler 2: Network.responseReceived
+        let state_rr = Arc::clone(&net_state);
+        let rr_id = self.connection.on_event(
+            &session_key,
+            "Network.responseReceived",
+            Box::new(move |event| {
+                let req_id = match event.params.get("requestId").and_then(|v| v.as_str()) {
+                    Some(id) => id,
+                    None => return,
+                };
+                let mut st = state_rr.lock().unwrap();
+                if st.status.is_some() {
+                    return; // Already captured.
+                }
+                if st.main_request_id.as_deref() == Some(req_id) {
+                    if let Some(s) = event.params.get("status").and_then(|v| v.as_u64()) {
+                        st.status = u16::try_from(s).ok();
+                    }
+                }
+            }),
+        );
+        let _guard_rr = SubscriptionGuard {
+            connection: &self.connection,
+            session_key: &session_key,
+            method: "Network.responseReceived",
+            id: rr_id,
+        };
+
+        // -----------------------------------------------------------------------
 
         let mut params = json!({
             "url": url,
@@ -449,6 +596,10 @@ impl MainFrame {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_owned());
 
+        // Publish the nav_id so the requestWillBeSent handler can validate
+        // any speculatively accepted request.
+        *expected_nav_id.lock().unwrap() = nav_id.clone();
+
         // Cross-document navigation invalidates the pre-nav exec context.
         // Clear the cache so subsequent evaluate() calls wait for the new
         // document's main-world context.
@@ -463,7 +614,32 @@ impl MainFrame {
             self.wait_for_lifecycle(event_name, remaining)?;
         }
 
-        Ok(nav_id)
+        // Poll briefly for the status code. The response typically arrives
+        // near-instantly after the navigate ack (or during the lifecycle wait).
+        // Cap at 500 ms so we don't meaningfully delay callers without
+        // --wait-until when Network events don't flow.
+        const MAX_STATUS_WAIT: Duration = Duration::from_millis(500);
+        let status_cap = Instant::now() + MAX_STATUS_WAIT;
+        let effective_deadline = status_cap.min(deadline);
+        let status_code = loop {
+            {
+                let st = net_state.lock().unwrap();
+                if st.status.is_some() {
+                    break st.status;
+                }
+            }
+            if Instant::now() >= effective_deadline {
+                break net_state.lock().unwrap().status;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        // _guard_rws and _guard_rr drop here — both handlers are deregistered
+        // on every exit path (success, error, timeout, panic).
+        Ok(NavigateOutcome {
+            nav_id,
+            status_code,
+        })
     }
 
     /// Reload the page.
@@ -2093,5 +2269,304 @@ mod tests {
 
         responder.join().unwrap();
         h.closed.store(true, Ordering::SeqCst);
+    }
+
+    // -----------------------------------------------------------------------
+    // G4: HTTP status capture unit tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a `Network.requestWillBeSent` event with `cause="document"`.
+    fn request_will_be_sent_msg(
+        request_id: &str,
+        nav_id: Option<&str>,
+        frame_id: &str,
+        session_key: &str,
+    ) -> RawMessage {
+        let mut params = serde_json::json!({
+            "requestId": request_id,
+            "cause": "document",
+            "frameId": frame_id,
+            "url": "https://example.com/",
+            "method": "GET",
+            "headers": [],
+            "isIntercepted": false,
+        });
+        if let Some(nid) = nav_id {
+            params["navigationId"] = serde_json::json!(nid);
+        }
+        RawMessage {
+            id: None,
+            method: Some("Network.requestWillBeSent".to_owned()),
+            params: Some(params),
+            result: None,
+            error: None,
+            session_id: Some(session_key.to_owned()),
+        }
+    }
+
+    /// Helper: build a `Network.responseReceived` event.
+    fn response_received_msg(request_id: &str, status: u16, session_key: &str) -> RawMessage {
+        RawMessage {
+            id: None,
+            method: Some("Network.responseReceived".to_owned()),
+            params: Some(serde_json::json!({
+                "requestId": request_id,
+                "status": status,
+                "statusText": "OK",
+                "headers": [],
+                "fromServiceWorker": false,
+            })),
+            result: None,
+            error: None,
+            session_id: Some(session_key.to_owned()),
+        }
+    }
+
+    /// G4 TDD case 1: `Network.requestWillBeSent{cause:"document",
+    /// navigationId:"nav-1"}` then `Network.responseReceived{status:404}`
+    /// around `Page.navigate` returning `navigationId:"nav-1"`.
+    ///
+    /// - `navigate` returns `Ok` (not an error for 4xx).
+    /// - `outcome.status_code == Some(404)`.
+    /// - `outcome.nav_id == Some("nav-1")`.
+    #[test]
+    fn navigate_captures_404_status_and_returns_ok() {
+        let h = build_mock_frame("page-g4a", "frame-g4a");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        // Responder: ack Page.navigate, inject Network events.
+        let responder = std::thread::spawn(move || {
+            // Wait for Page.navigate outgoing request.
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let nav_req_id = sent["id"].as_i64().expect("id");
+            assert_eq!(sent["method"], "Page.navigate");
+
+            // Inject Network.requestWillBeSent BEFORE the navigate ack to
+            // test the speculative path.
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-001",
+                    Some("nav-1"),
+                    "frame-g4a",
+                    "page-g4a",
+                ))
+                .expect("send rws");
+
+            // Now ack the navigate.
+            in_tx
+                .send(navigate_success_response(nav_req_id, "page-g4a"))
+                .expect("send nav response");
+
+            // Inject the response event.
+            std::thread::sleep(Duration::from_millis(10));
+            in_tx
+                .send(response_received_msg("req-001", 404, "page-g4a"))
+                .expect("send responseReceived");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com",
+            Default::default(),
+            Duration::from_secs(10),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must return Ok even for 404");
+        assert_eq!(
+            outcome.nav_id.as_deref(),
+            Some("nav-1"),
+            "nav_id must be preserved"
+        );
+        assert_eq!(
+            outcome.status_code,
+            Some(404),
+            "status_code must be Some(404)"
+        );
+    }
+
+    /// G4 TDD case 2: no `responseReceived` arrives ⇒ `status_code == None`,
+    /// navigate still `Ok`. Also verifies that neither `Network.requestWillBeSent`
+    /// nor `Network.responseReceived` handler leaks.
+    #[test]
+    fn navigate_status_code_is_none_when_no_response_event() {
+        let h = build_mock_frame("page-g4b", "frame-g4b");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+            // Ack navigate but do NOT inject any Network events.
+            in_tx
+                .send(navigate_success_response(id, "page-g4b"))
+                .expect("send nav response");
+            // Deliberately send NO Network.responseReceived.
+        });
+
+        // Use a short timeout so the status-poll drain exits quickly.
+        let result = h.frame.navigate(
+            "https://example.com",
+            Default::default(),
+            Duration::from_secs(10),
+        );
+
+        responder.join().unwrap();
+
+        let outcome = result.expect("navigate must succeed even with no Network events");
+        assert_eq!(
+            outcome.status_code, None,
+            "status_code must be None when no responseReceived event arrives"
+        );
+
+        // Verify handlers were deregistered (no leak).
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-g4b", "Network.requestWillBeSent"),
+            0,
+            "Network.requestWillBeSent handler must not leak"
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-g4b", "Network.responseReceived"),
+            0,
+            "Network.responseReceived handler must not leak"
+        );
+
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// G4 TDD case 3: navigate response IPC serde includes `status_code`.
+    /// Absence is backward-compatible (legacy callers ignore unknown fields).
+    #[test]
+    fn navigate_response_serde_includes_status_code() {
+        use crate::cli::ipc::DaemonResponse;
+
+        // Response WITH status_code.
+        let resp = DaemonResponse::ok(serde_json::json!({
+            "navigation_id": "nav-1",
+            "status_code": 200_u16,
+        }));
+        let serialized = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            serialized.contains("status_code"),
+            "status_code must appear in JSON: {serialized}"
+        );
+        let back: DaemonResponse = serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(
+            back.data
+                .as_ref()
+                .and_then(|d| d.get("status_code"))
+                .and_then(|v| v.as_u64()),
+            Some(200),
+            "status_code round-trips"
+        );
+        assert_eq!(
+            back.data
+                .as_ref()
+                .and_then(|d| d.get("navigation_id"))
+                .and_then(|v| v.as_str()),
+            Some("nav-1"),
+            "navigation_id still present"
+        );
+
+        // Response WITHOUT status_code (legacy / null) must deserialise fine.
+        let legacy = r#"{"ok":true,"data":{"navigation_id":"nav-2"}}"#;
+        let legacy_back: DaemonResponse =
+            serde_json::from_str(legacy).expect("deserialize legacy navigate response");
+        assert!(legacy_back.ok);
+        assert!(
+            legacy_back
+                .data
+                .as_ref()
+                .and_then(|d| d.get("status_code"))
+                .is_none(),
+            "legacy callers without status_code must deserialise fine (field absent is ok)"
+        );
+    }
+
+    /// G4 TDD case 4: `print_response` in human mode prints the status code
+    /// when present.
+    #[test]
+    fn print_response_shows_status_code() {
+        use crate::cli::ipc::DaemonResponse;
+        use crate::cli::output::print_response;
+
+        // This test cannot easily capture stdout, but it exercises the code
+        // path and asserts non-panic. The formatted string is checked by
+        // inspecting the serialised JSON.
+        let resp_with_status = DaemonResponse::ok(serde_json::json!({
+            "navigation_id": "nav-1",
+            "status_code": 404_u16,
+        }));
+        let json_out = serde_json::to_string_pretty(&resp_with_status).expect("serialize");
+        assert!(
+            json_out.contains("404"),
+            "status_code 404 must appear in JSON output: {json_out}"
+        );
+        // print_response must not panic.
+        print_response(&resp_with_status, false);
+        print_response(&resp_with_status, true);
+
+        // Response with null status_code must also not panic.
+        let resp_null_status = DaemonResponse::ok(serde_json::json!({
+            "navigation_id": null,
+            "status_code": null,
+        }));
+        print_response(&resp_null_status, false);
+    }
+
+    /// G4 TDD case 5: `response_received_msg` with 200 status is captured.
+    #[test]
+    fn navigate_captures_200_status() {
+        let h = build_mock_frame("page-g4c", "frame-g4c");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+
+            in_tx
+                .send(navigate_success_response(id, "page-g4c"))
+                .expect("send nav response");
+
+            // Inject Network events after ack (common timing).
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-200",
+                    Some("nav-1"),
+                    "frame-g4c",
+                    "page-g4c",
+                ))
+                .expect("send rws");
+            in_tx
+                .send(response_received_msg("req-200", 200, "page-g4c"))
+                .expect("send responseReceived");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com",
+            Default::default(),
+            Duration::from_secs(10),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed");
+        assert_eq!(
+            outcome.status_code,
+            Some(200),
+            "status_code must be Some(200)"
+        );
     }
 }

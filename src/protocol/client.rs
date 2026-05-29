@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::protocol::errors::{DownloadInfo, ProtocolError, ProtocolErrorKind};
-use crate::protocol::events::{EventHandler, EventRouter};
+use crate::protocol::events::{EventHandler, EventRouter, HandlerId};
 use crate::protocol::pending::PendingMap;
 use crate::protocol::state::{ConnectionState, IdGenerator, SessionState};
 use crate::protocol::types::{
@@ -235,21 +235,44 @@ impl Connection {
     }
 
     /// Subscribe to events on a specific session.
-    pub fn on_event(&self, session_key: &str, method: &str, handler: EventHandler) {
+    ///
+    /// Returns a [`HandlerId`] that can be passed to [`off_event`](Self::off_event)
+    /// to deregister exactly this handler. Callers that subscribe for the
+    /// duration of a single operation MUST call `off_event` when done, or the
+    /// closure leaks in the router (it stays in the handler Vec forever).
+    pub fn on_event(&self, session_key: &str, method: &str, handler: EventHandler) -> HandlerId {
         let mut guard = self.inner.lock().unwrap();
-        guard.events.on(session_key, method, handler);
+        guard.events.on(session_key, method, handler)
+    }
+
+    /// Deregister a handler previously registered with [`on_event`](Self::on_event).
+    ///
+    /// No-op if the handler was already removed (e.g. by session disposal).
+    pub fn off_event(&self, session_key: &str, method: &str, id: HandlerId) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.events.off(session_key, method, id);
     }
 
     /// Subscribe to all events on a specific session.
-    pub fn on_event_any(&self, session_key: &str, handler: EventHandler) {
+    ///
+    /// Returns a [`HandlerId`]; deregister with `off_event(session_key, "*", id)`.
+    pub fn on_event_any(&self, session_key: &str, handler: EventHandler) -> HandlerId {
         let mut guard = self.inner.lock().unwrap();
-        guard.events.on_any(session_key, handler);
+        guard.events.on_any(session_key, handler)
     }
 
     /// Subscribe to all events globally (for logging/debugging).
     pub fn on_event_global(&self, handler: EventHandler) {
         let mut guard = self.inner.lock().unwrap();
         guard.events.on_global(handler);
+    }
+
+    /// Test-only: number of handlers registered for one `(session_key, method)`.
+    /// Used by leak-regression guards (e.g. transient lifecycle waits).
+    #[cfg(test)]
+    pub fn event_handler_count_for(&self, session_key: &str, method: &str) -> usize {
+        let guard = self.inner.lock().unwrap();
+        guard.events.handler_count_for(session_key, method)
     }
 
     /// Close the connection gracefully.

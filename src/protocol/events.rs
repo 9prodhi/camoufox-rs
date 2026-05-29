@@ -9,6 +9,14 @@ use crate::protocol::types::EventMessage;
 /// processing, handlers should forward the event to a channel.
 pub type EventHandler = Box<dyn Fn(&EventMessage) + Send>;
 
+/// A stable identifier for a registered handler, returned by
+/// [`EventRouter::on`] and accepted by [`EventRouter::off`].
+///
+/// IDs are unique across the whole router (monotonic from a single counter),
+/// so an `(session_key, method, id)` triple unambiguously identifies one
+/// registration even if the same callback shape is registered repeatedly.
+pub type HandlerId = u64;
+
 /// Manages event subscriptions per session.
 ///
 /// Events are keyed by `(session_key, method)`. The `session_key` is `""` for
@@ -19,12 +27,15 @@ pub type EventHandler = Box<dyn Fn(&EventMessage) + Send>;
 /// - **Session-wide**: `(session_key, "*")` — matches all events on one session.
 /// - **Global**: catches every event regardless of session or method.
 pub struct EventRouter {
-    /// Map from `(session_key, method)` to a list of handlers.
+    /// Map from `(session_key, method)` to a list of `(id, handler)` pairs.
     /// The wildcard method `"*"` matches all events on that session.
-    handlers: HashMap<(String, String), Vec<EventHandler>>,
+    handlers: HashMap<(String, String), Vec<(HandlerId, EventHandler)>>,
 
     /// Global catch-all handlers (for logging/debugging).
     global_handlers: Vec<EventHandler>,
+
+    /// Monotonic counter for assigning [`HandlerId`]s.
+    next_id: HandlerId,
 }
 
 impl EventRouter {
@@ -33,6 +44,7 @@ impl EventRouter {
         Self {
             handlers: HashMap::new(),
             global_handlers: Vec::new(),
+            next_id: 0,
         }
     }
 
@@ -41,19 +53,44 @@ impl EventRouter {
     /// - `session_key`: `""` for root session, UUID string for page sessions.
     /// - `method`: the event method name, e.g. `"Page.navigationStarted"`.
     /// - `handler`: callback invoked when a matching event is dispatched.
-    pub fn on(&mut self, session_key: &str, method: &str, handler: EventHandler) {
+    ///
+    /// Returns a [`HandlerId`] that can be passed to [`off`](Self::off) to
+    /// deregister exactly this handler. Callers that subscribe for the
+    /// duration of a single operation (e.g. waiting for one lifecycle event)
+    /// MUST call `off` when done to avoid leaking the closure.
+    pub fn on(&mut self, session_key: &str, method: &str, handler: EventHandler) -> HandlerId {
+        let id = self.next_id;
+        self.next_id += 1;
         self.handlers
             .entry((session_key.to_owned(), method.to_owned()))
             .or_default()
-            .push(handler);
+            .push((id, handler));
+        id
+    }
+
+    /// Deregister a handler previously registered via [`on`](Self::on).
+    ///
+    /// Removes the `(session_key, method)` handler whose id matches `id`. If no
+    /// such handler exists (already removed, or the session was disposed), this
+    /// is a no-op. The `(session_key, method)` map entry is pruned when its last
+    /// handler is removed so empty Vecs do not accumulate.
+    pub fn off(&mut self, session_key: &str, method: &str, id: HandlerId) {
+        let key = (session_key.to_owned(), method.to_owned());
+        if let Some(handlers) = self.handlers.get_mut(&key) {
+            handlers.retain(|(hid, _)| *hid != id);
+            if handlers.is_empty() {
+                self.handlers.remove(&key);
+            }
+        }
     }
 
     /// Subscribe to ALL events on a session (wildcard).
     ///
     /// The handler fires for every event whose `session_id` matches, regardless
-    /// of the event's `method` name.
-    pub fn on_any(&mut self, session_key: &str, handler: EventHandler) {
-        self.on(session_key, "*", handler);
+    /// of the event's `method` name. Returns the [`HandlerId`]; deregister with
+    /// `off(session_key, "*", id)`.
+    pub fn on_any(&mut self, session_key: &str, handler: EventHandler) -> HandlerId {
+        self.on(session_key, "*", handler)
     }
 
     /// Add a global event listener that fires for every single event.
@@ -81,14 +118,14 @@ impl EventRouter {
             .handlers
             .get(&(session_key.clone(), event.method.clone()))
         {
-            for handler in handlers {
+            for (_id, handler) in handlers {
                 handler(event);
             }
         }
 
         // 2. Session wildcard: (session_key, "*")
         if let Some(handlers) = self.handlers.get(&(session_key, "*".to_owned())) {
-            for handler in handlers {
+            for (_id, handler) in handlers {
                 handler(event);
             }
         }
@@ -113,6 +150,16 @@ impl EventRouter {
     fn handler_count(&self) -> usize {
         let specific: usize = self.handlers.values().map(|v| v.len()).sum();
         specific + self.global_handlers.len()
+    }
+
+    /// Returns the number of handlers registered for one `(session_key, method)`
+    /// key. Test-only; used by leak-regression guards.
+    #[cfg(test)]
+    pub fn handler_count_for(&self, session_key: &str, method: &str) -> usize {
+        self.handlers
+            .get(&(session_key.to_owned(), method.to_owned()))
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 }
 
@@ -380,6 +427,93 @@ mod tests {
     #[test]
     fn default_impl() {
         let router = EventRouter::default();
+        assert_eq!(router.handler_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deregistration (off) tests — leak-prevention foundation for wait_for_*.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn on_returns_unique_ids() {
+        let mut router = EventRouter::new();
+        let id1 = router.on("s1", "Page.eventFired", Box::new(|_| {}));
+        let id2 = router.on("s1", "Page.eventFired", Box::new(|_| {}));
+        let id3 = router.on("s2", "Page.eventFired", Box::new(|_| {}));
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn off_removes_only_the_matching_handler() {
+        let mut router = EventRouter::new();
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+        let ca = count_a.clone();
+        let cb = count_b.clone();
+
+        let id_a = router.on(
+            "s1",
+            "Page.eventFired",
+            Box::new(move |_| {
+                ca.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let _id_b = router.on(
+            "s1",
+            "Page.eventFired",
+            Box::new(move |_| {
+                cb.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert_eq!(router.handler_count_for("s1", "Page.eventFired"), 2);
+
+        // Remove only handler A.
+        router.off("s1", "Page.eventFired", id_a);
+        assert_eq!(router.handler_count_for("s1", "Page.eventFired"), 1);
+
+        router.dispatch(&make_event("Page.eventFired", Some("s1")));
+        assert_eq!(count_a.load(Ordering::SeqCst), 0, "A must not fire");
+        assert_eq!(count_b.load(Ordering::SeqCst), 1, "B must still fire");
+    }
+
+    #[test]
+    fn off_prunes_empty_key_entry() {
+        let mut router = EventRouter::new();
+        let id = router.on("s1", "Page.eventFired", Box::new(|_| {}));
+        assert_eq!(router.handler_count_for("s1", "Page.eventFired"), 1);
+
+        router.off("s1", "Page.eventFired", id);
+        assert_eq!(router.handler_count_for("s1", "Page.eventFired"), 0);
+        // The whole map entry should be gone (handler_count counts all Vecs).
+        assert_eq!(router.handler_count(), 0);
+    }
+
+    #[test]
+    fn off_unknown_id_is_noop() {
+        let mut router = EventRouter::new();
+        let _id = router.on("s1", "Page.eventFired", Box::new(|_| {}));
+        // Removing an id that was never issued does nothing.
+        router.off("s1", "Page.eventFired", 99999);
+        assert_eq!(router.handler_count_for("s1", "Page.eventFired"), 1);
+        // Removing on an unknown key is also a no-op.
+        router.off("nonexistent", "Page.eventFired", 0);
+        assert_eq!(router.handler_count_for("s1", "Page.eventFired"), 1);
+    }
+
+    #[test]
+    fn repeated_on_off_does_not_grow_handler_count() {
+        // Leak-regression guard: register + deregister N times on the same
+        // (session_key, method) must leave the count at 0 — proving the
+        // wait_for_lifecycle pattern does not accumulate dead closures.
+        let mut router = EventRouter::new();
+        for _ in 0..5 {
+            let id = router.on("page-A", "Page.eventFired", Box::new(|_| {}));
+            assert_eq!(router.handler_count_for("page-A", "Page.eventFired"), 1);
+            router.off("page-A", "Page.eventFired", id);
+            assert_eq!(router.handler_count_for("page-A", "Page.eventFired"), 0);
+        }
         assert_eq!(router.handler_count(), 0);
     }
 }

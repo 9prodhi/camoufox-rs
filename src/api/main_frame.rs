@@ -15,6 +15,7 @@ use serde_json::json;
 use crate::api::browser::Session;
 use crate::protocol::client::Connection;
 use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
+use crate::protocol::events::HandlerId;
 
 // ---------------------------------------------------------------------------
 // Supporting types
@@ -174,6 +175,31 @@ pub struct Point {
 }
 
 // ---------------------------------------------------------------------------
+// SubscriptionGuard
+// ---------------------------------------------------------------------------
+
+/// RAII guard that deregisters an event handler when dropped.
+///
+/// Holding one of these guarantees the `(session_key, method, id)` handler is
+/// removed from the connection's [`EventRouter`](crate::protocol::events::EventRouter)
+/// on every exit path of the enclosing scope — normal return, early return,
+/// or panic — so transient subscriptions (e.g. a single-shot lifecycle wait)
+/// can never leak a dead closure.
+struct SubscriptionGuard<'a> {
+    connection: &'a Connection,
+    session_key: &'a str,
+    method: &'static str,
+    id: HandlerId,
+}
+
+impl Drop for SubscriptionGuard<'_> {
+    fn drop(&mut self) {
+        self.connection
+            .off_event(self.session_key, self.method, self.id);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MainFrame
 // ---------------------------------------------------------------------------
 
@@ -276,11 +302,13 @@ impl MainFrame {
     /// key, filters to the matching `frameId` and `name`, forwards the match
     /// to an `mpsc` channel, then `recv_timeout`s on the channel.
     ///
-    /// The event handler is registered ONCE and lives until this call returns
-    /// (it holds a `Sender` that is dropped at the end of this fn, causing
-    /// the reader thread's `send` to fail silently from that point — no handler
-    /// leak in the `EventRouter` map, but note that `on_event` currently has no
-    /// deregister API; the handler becomes a no-op after the `Sender` drop).
+    /// # Handler cleanup (no leak)
+    ///
+    /// The handler is registered via [`Connection::on_event`], which returns a
+    /// `HandlerId`. An RAII guard ([`SubscriptionGuard`]) deregisters the
+    /// handler via [`Connection::off_event`] on **every** exit path — success,
+    /// timeout, error, or panic — so a `--wait-until` navigate never leaks a
+    /// closure into the `EventRouter`.
     ///
     /// # Arguments
     ///
@@ -303,7 +331,7 @@ impl MainFrame {
         let expected_name = event_name.to_owned();
         let session_key = self.session.key().to_owned();
 
-        self.connection.on_event(
+        let handler_id = self.connection.on_event(
             &session_key,
             "Page.eventFired",
             Box::new(move |event| {
@@ -324,6 +352,15 @@ impl MainFrame {
                 }
             }),
         );
+
+        // RAII: deregister the handler on every exit path (success, timeout,
+        // error, panic) so the closure cannot leak in the router.
+        let _guard = SubscriptionGuard {
+            connection: &self.connection,
+            session_key: &session_key,
+            method: "Page.eventFired",
+            id: handler_id,
+        };
 
         match rx.recv_timeout(timeout) {
             Ok(()) => Ok(()),
@@ -361,9 +398,13 @@ impl MainFrame {
     /// Always navigates the top frame (no `frame_id` override). Returns the
     /// navigation ID for cross-document navigations, `None` for same-document.
     ///
-    /// `timeout` bounds the wait for the renderer's response to `Page.navigate`.
-    /// If the renderer never responds (e.g. the response was a download and
-    /// no DOM was created), the call returns
+    /// `timeout` bounds the **whole** operation — both the wait for the
+    /// renderer's response to `Page.navigate` AND (when `wait_until` is set)
+    /// the subsequent wait for the lifecycle event. A single deadline is
+    /// captured before the RPC and the lifecycle wait gets only the time that
+    /// remains, so navigate+wait can never exceed `timeout`. If the renderer
+    /// never responds (e.g. the response was a download and no DOM was
+    /// created), the call returns
     /// [`ProtocolErrorKind::Timeout`](crate::protocol::errors::ProtocolErrorKind::Timeout)
     /// rather than hanging.
     ///
@@ -383,6 +424,10 @@ impl MainFrame {
             None | Some("") => None,
             Some(v) => Some(Self::map_wait_until(v)?),
         };
+
+        // Single deadline bounds the navigate RPC AND the lifecycle wait, so
+        // the combined operation never exceeds `timeout` (no double-counting).
+        let deadline = Instant::now() + timeout;
 
         let mut params = json!({
             "url": url,
@@ -411,9 +456,11 @@ impl MainFrame {
             *self.execution_context_id.lock().unwrap() = None;
         }
 
-        // If a lifecycle event was requested, block until it fires (or timeout).
+        // If a lifecycle event was requested, block until it fires — but only
+        // for the time remaining against the single navigate deadline.
         if let Some(event_name) = lifecycle_event {
-            self.wait_for_lifecycle(event_name, timeout)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            self.wait_for_lifecycle(event_name, remaining)?;
         }
 
         Ok(nav_id)
@@ -1545,7 +1592,6 @@ mod tests {
     /// - `out_rx`: receive outgoing JSON messages the frame sends.
     /// - the frame is on a page session with key `session_key`.
     struct MockFrameHarness {
-        #[allow(dead_code)]
         conn: StdArc<Connection>,
         frame: MainFrame,
         in_tx: mpsc::Sender<RawMessage>,
@@ -1913,6 +1959,136 @@ mod tests {
         assert!(
             result.is_ok(),
             "domcontentloaded wait should succeed: {result:?}"
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// MUST-FIX regression guard: `wait_for_lifecycle` must NOT leak a handler.
+    ///
+    /// After N successful waits AND N timed-out waits, the handler count for
+    /// `(session_key, "Page.eventFired")` must be back to 0 — proving the RAII
+    /// guard deregisters on both the success and the timeout exit paths.
+    #[test]
+    fn wait_for_lifecycle_does_not_leak_handlers() {
+        let h = build_mock_frame("page-leak", "frame-leak");
+        let in_tx = h.in_tx.clone();
+
+        // Baseline: no handler registered yet.
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-leak", "Page.eventFired"),
+            0,
+            "no Page.eventFired handler should exist before any wait"
+        );
+
+        // N successful waits. Each fires the event on a background thread so
+        // wait_for_lifecycle returns Ok, then its guard deregisters.
+        for i in 0..3 {
+            let tx = in_tx.clone();
+            let responder = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                tx.send(event_fired_message("load", "frame-leak", "page-leak"))
+                    .unwrap();
+                let _ = i;
+            });
+            h.frame
+                .wait_for_lifecycle("load", Duration::from_secs(5))
+                .expect("wait should succeed");
+            responder.join().unwrap();
+
+            // Handler must be gone after each successful wait.
+            assert_eq!(
+                h.conn
+                    .event_handler_count_for("page-leak", "Page.eventFired"),
+                0,
+                "handler leaked after successful wait #{i}"
+            );
+        }
+
+        // N timed-out waits. No event is emitted; each must time out and the
+        // guard must still deregister.
+        for i in 0..3 {
+            let err = h
+                .frame
+                .wait_for_lifecycle("load", Duration::from_millis(50))
+                .expect_err("wait should time out");
+            assert_eq!(err.kind, ProtocolErrorKind::Timeout);
+
+            assert_eq!(
+                h.conn
+                    .event_handler_count_for("page-leak", "Page.eventFired"),
+                0,
+                "handler leaked after timed-out wait #{i}"
+            );
+        }
+
+        // Final guard: the count never grew.
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-leak", "Page.eventFired"),
+            0,
+            "handler count must be 0 after all waits"
+        );
+
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// MUST-FIX regression guard: navigate + wait_until is bounded by a SINGLE
+    /// `timeout`, not 2× it.
+    ///
+    /// The responder acks the navigate after a delay, then never emits the
+    /// lifecycle event. With the double-counting bug, total elapsed could reach
+    /// ~2× timeout (timeout for the ack wait that succeeds + a fresh full
+    /// timeout for the lifecycle wait). With the fix, the lifecycle wait only
+    /// gets the time remaining after the ack, so total ≈ timeout.
+    #[test]
+    fn navigate_wait_until_combined_timeout_is_single_bounded() {
+        let h = build_mock_frame("page-bound", "frame-bound");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        // Ack the navigate ~100 ms in; never emit the lifecycle event.
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            in_tx
+                .send(navigate_success_response(id, "page-bound"))
+                .unwrap();
+            // Deliberately never send Page.eventFired.
+        });
+
+        let timeout = Duration::from_millis(400);
+        let start = Instant::now();
+        let result = h.frame.navigate(
+            "https://example.com",
+            NavigateOptions {
+                wait_until: Some("load".into()),
+                ..Default::default()
+            },
+            timeout,
+        );
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("should time out waiting for lifecycle event");
+        assert_eq!(err.kind, ProtocolErrorKind::Timeout);
+
+        // The whole operation must be bounded by ~1× timeout (plus slack), not
+        // 2× (which would be ~100ms ack + 400ms lifecycle = ~500ms, exceeding
+        // a 1.5× ceiling). We allow generous slack for CI scheduling.
+        assert!(
+            elapsed < timeout + Duration::from_millis(150),
+            "navigate+wait exceeded a single timeout bound: {elapsed:?} (timeout {timeout:?}); \
+             double-counting likely regressed"
+        );
+        // And it must not return early before the deadline either.
+        assert!(
+            elapsed >= Duration::from_millis(380),
+            "returned too early: {elapsed:?}"
         );
 
         responder.join().unwrap();

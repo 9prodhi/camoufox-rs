@@ -7,7 +7,7 @@ All notable changes to camoufox-rs are documented here.
 ### Added
 
 - **G1 — `cookies <instance_id>` command**: exports the full in-session cookie jar via the
-  Juggler `Network.getCookies` call. Includes `HttpOnly` cookies (which are inaccessible from
+  Juggler `Browser.getCookies` call. Includes `HttpOnly` cookies (which are inaccessible from
   JavaScript). `--json` returns full cookie objects (name, value, domain, path, httpOnly,
   secure, sameSite, expires, session, size). The exported jar can be passed directly to
   host-side HTTP clients (e.g. `curl --cookie`) to fetch session-gated content without

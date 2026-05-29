@@ -195,7 +195,7 @@ pub struct CookieOptions {
 }
 
 /// A cookie returned by `Browser.getCookies`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cookie {
     /// Cookie name.
     pub name: String,

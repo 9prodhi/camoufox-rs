@@ -103,4 +103,10 @@ pub enum Command {
 
     /// Ping the daemon.
     Ping,
+
+    /// Export all cookies for a browser instance (including HttpOnly).
+    Cookies {
+        /// Instance ID (e.g., 00000001).
+        instance_id: String,
+    },
 }

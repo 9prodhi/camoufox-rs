@@ -71,6 +71,9 @@ pub enum DaemonRequest {
 
     /// Shut down the daemon and all instances.
     Shutdown,
+
+    /// Export all cookies for a browser instance (including HttpOnly).
+    Cookies { instance_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -113,5 +116,77 @@ impl DaemonResponse {
             error: Some(message.into()),
             data: None,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `DaemonRequest::Cookies` serialises to the expected JSON shape and
+    /// deserialises back to the same variant (round-trip).
+    #[test]
+    fn cookies_request_serde_round_trip() {
+        let req = DaemonRequest::Cookies {
+            instance_id: "00000001".into(),
+        };
+        let serialized = serde_json::to_string(&req).expect("serialize");
+        let deserialized: DaemonRequest = serde_json::from_str(&serialized).expect("deserialize");
+        match deserialized {
+            DaemonRequest::Cookies { instance_id } => {
+                assert_eq!(instance_id, "00000001");
+            }
+            other => panic!("expected Cookies, got {other:?}"),
+        }
+    }
+
+    /// A cookies response carrying an HttpOnly cookie round-trips through
+    /// `DaemonResponse` without losing the `httpOnly` flag.
+    #[test]
+    fn cookies_response_preserves_http_only_flag() {
+        let cookie_json = json!([{
+            "name": "PHPSESSID",
+            "value": "secret",
+            "domain": "example.com",
+            "path": "/",
+            "expires": -1.0,
+            "size": 13,
+            "httpOnly": true,
+            "secure": true,
+            "session": true,
+            "sameSite": "Strict"
+        }]);
+        let resp = DaemonResponse::ok(json!({ "cookies": cookie_json }));
+        let serialized = serde_json::to_string(&resp).expect("serialize");
+        let back: DaemonResponse = serde_json::from_str(&serialized).expect("deserialize");
+
+        assert!(back.ok);
+        let cookies = back
+            .data
+            .as_ref()
+            .and_then(|d| d.get("cookies"))
+            .and_then(|v| v.as_array())
+            .expect("cookies array present");
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(
+            cookies[0]["httpOnly"], true,
+            "httpOnly flag must survive round-trip"
+        );
+    }
+
+    /// `DaemonResponse::err` round-trips correctly.
+    #[test]
+    fn error_response_round_trip() {
+        let resp = DaemonResponse::err("instance not found");
+        let serialized = serde_json::to_string(&resp).expect("serialize");
+        let back: DaemonResponse = serde_json::from_str(&serialized).expect("deserialize");
+        assert!(!back.ok);
+        assert_eq!(back.error.as_deref(), Some("instance not found"));
+        assert!(back.data.is_none());
     }
 }

@@ -216,5 +216,13 @@ fn dispatch(request: DaemonRequest, manager: &Arc<Mutex<InstanceManager>>) -> Da
             // Respond OK; the caller (handle_connection) handles the actual shutdown.
             DaemonResponse::ok_empty()
         }
+
+        DaemonRequest::Cookies { instance_id } => {
+            let mgr = manager.lock().unwrap();
+            match mgr.cookies(&instance_id) {
+                Ok(cookies) => DaemonResponse::ok(json!({ "cookies": cookies })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
     }
 }

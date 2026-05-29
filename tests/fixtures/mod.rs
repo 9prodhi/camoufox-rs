@@ -153,3 +153,63 @@ impl AttachmentServer {
 impl Drop for AttachmentServer {
     fn drop(&mut self) {}
 }
+
+/// A single-port HTTP server that sets one normal cookie and one `HttpOnly`
+/// cookie via `Set-Cookie` response headers, then returns a minimal HTML page.
+///
+/// This fixture is used by the `cookies_command_returns_http_only_cookies`
+/// integration test to verify that `Browser.getCookies` surfaces HttpOnly
+/// cookies alongside ordinary cookies.
+pub struct CookieServer {
+    /// URL of the page that sets the cookies.
+    pub url: String,
+    _server: Arc<Server>,
+}
+
+impl CookieServer {
+    /// Start the server on an ephemeral port. Every request receives a 200
+    /// response with two `Set-Cookie` headers: one plain cookie and one
+    /// `HttpOnly` cookie.
+    #[allow(dead_code)]
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").expect("bind cookie server"));
+        let port = server.server_addr().to_ip().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/");
+
+        const HTML: &[u8] = b"<html><body>cookie-setter</body></html>";
+
+        let server_clone = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in server_clone.incoming_requests() {
+                let resp = Response::new(
+                    200.into(),
+                    vec![
+                        Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap(),
+                        // Normal cookie (readable by JS).
+                        Header::from_bytes(&b"Set-Cookie"[..], &b"normal_cookie=hello; Path=/"[..])
+                            .unwrap(),
+                        // HttpOnly cookie (not readable by JS, but returned by getCookies).
+                        Header::from_bytes(
+                            &b"Set-Cookie"[..],
+                            &b"http_only_cookie=secret; Path=/; HttpOnly"[..],
+                        )
+                        .unwrap(),
+                    ],
+                    Cursor::new(HTML.to_vec()),
+                    Some(HTML.len()),
+                    None,
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        CookieServer {
+            url,
+            _server: server,
+        }
+    }
+}
+
+impl Drop for CookieServer {
+    fn drop(&mut self) {}
+}

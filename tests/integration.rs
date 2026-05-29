@@ -241,6 +241,71 @@ fn navigate_to_attachment_returns_navigation_became_download() {
 
 #[test]
 #[ignore]
+fn cookies_command_returns_http_only_cookies() {
+    // Regression test for G1: `Browser.getCookies` must return HttpOnly cookies
+    // alongside ordinary cookies, with the httpOnly flag preserved.
+    //
+    // Setup:
+    //  1. Start a CookieServer that sets one plain cookie + one HttpOnly cookie.
+    //  2. Launch a browser, create a context, create a page, navigate to the
+    //     cookie-setter URL.
+    //  3. Call `BrowserContext::get_cookies()`.
+    //  4. Assert both cookies are present, the HttpOnly one has httpOnly == true.
+    //
+    // Run with:
+    //   cargo test --test integration -- --ignored \
+    //       cookies_command_returns_http_only_cookies --test-threads=1
+    use camoufox::api::context::Cookie;
+
+    let server = fixtures::CookieServer::start();
+    let tb = setup();
+
+    let context = tb
+        .browser
+        .new_context(ContextOptions::default())
+        .expect("failed to create context");
+    let main_frame = context
+        .new_main_frame()
+        .expect("failed to create main frame");
+
+    main_frame
+        .navigate(&server.url, Default::default(), Duration::from_secs(30))
+        .expect("navigate to cookie-setter failed");
+
+    // Give the browser a moment to process Set-Cookie headers after navigation.
+    // `Page.navigate` acks before the HTTP response is fully committed to the
+    // cookie jar; a brief settle avoids a race on slow CI.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let cookies: Vec<Cookie> = context.get_cookies().expect("get_cookies failed");
+
+    // Categorise the cookies by name.
+    let normal = cookies
+        .iter()
+        .find(|c| c.name == "normal_cookie")
+        .expect("normal_cookie not found in jar");
+    let http_only = cookies
+        .iter()
+        .find(|c| c.name == "http_only_cookie")
+        .expect("http_only_cookie not found in jar — HttpOnly cookies must be returned");
+
+    assert_eq!(normal.value, "hello", "normal_cookie value mismatch");
+    assert!(
+        !normal.http_only,
+        "normal_cookie must have httpOnly == false"
+    );
+
+    assert_eq!(http_only.value, "secret", "http_only_cookie value mismatch");
+    assert!(
+        http_only.http_only,
+        "http_only_cookie must have httpOnly == true"
+    );
+
+    tb.teardown();
+}
+
+#[test]
+#[ignore]
 fn navigate_main_frame_with_cross_origin_iframe() {
     // REGRESSION TEST for the cross-origin-iframe attach bug.
     //

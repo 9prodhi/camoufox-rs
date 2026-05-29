@@ -1678,4 +1678,140 @@ mod tests {
         assert!(DEFAULT_SEND_TIMEOUT < std::time::Duration::from_secs(600));
         assert!(DEFAULT_SEND_TIMEOUT >= std::time::Duration::from_secs(10));
     }
+
+    // -----------------------------------------------------------------------
+    // Browser.getCookies mock-transport tests (G1: cookie export)
+    // -----------------------------------------------------------------------
+
+    /// Build a `Browser.getCookies` response RawMessage containing one
+    /// regular cookie and one HttpOnly cookie.
+    fn get_cookies_response(id: i64) -> RawMessage {
+        RawMessage {
+            id: Some(id),
+            method: None,
+            params: None,
+            result: Some(json!({
+                "cookies": [
+                    {
+                        "name": "session",
+                        "value": "abc123",
+                        "domain": "example.com",
+                        "path": "/",
+                        "expires": -1.0,
+                        "size": 13,
+                        "httpOnly": false,
+                        "secure": false,
+                        "session": true,
+                        "sameSite": "None"
+                    },
+                    {
+                        "name": "PHPSESSID",
+                        "value": "secret",
+                        "domain": "example.com",
+                        "path": "/",
+                        "expires": -1.0,
+                        "size": 13,
+                        "httpOnly": true,
+                        "secure": true,
+                        "session": true,
+                        "sameSite": "Strict"
+                    }
+                ]
+            })),
+            error: None,
+            session_id: None,
+        }
+    }
+
+    /// `Browser.getCookies` round-trip via mock transport: both cookies are
+    /// returned; the HttpOnly flag is preserved on the HttpOnly cookie.
+    #[test]
+    fn get_cookies_round_trip_includes_http_only_flag() {
+        let h = setup();
+        let session = h.conn.root_session();
+
+        let in_tx = h.in_tx.clone();
+        let responder = thread::spawn(move || {
+            // Wait for the getCookies request, echo back a two-cookie payload.
+            let sent = recv_out(&h.out_rx);
+            let id = sent["id"].as_i64().unwrap();
+            assert_eq!(sent["method"], "Browser.getCookies");
+            assert!(sent.get("sessionId").is_none(), "must use root session");
+            in_tx.send(get_cookies_response(id)).unwrap();
+        });
+
+        let result = session
+            .send(
+                "Browser.getCookies",
+                json!({ "browserContextId": "ctx-test-1" }),
+            )
+            .expect("Browser.getCookies should succeed");
+
+        responder.join().unwrap();
+
+        let cookies = result
+            .get("cookies")
+            .and_then(|v| v.as_array())
+            .expect("result must have 'cookies' array");
+
+        assert_eq!(
+            cookies.len(),
+            2,
+            "expected 2 cookies, got {}",
+            cookies.len()
+        );
+
+        // First cookie: non-HttpOnly.
+        let c0 = &cookies[0];
+        assert_eq!(c0["name"], "session");
+        assert_eq!(c0["httpOnly"], false);
+
+        // Second cookie: HttpOnly flag must be preserved as `true`.
+        let c1 = &cookies[1];
+        assert_eq!(c1["name"], "PHPSESSID");
+        assert_eq!(
+            c1["httpOnly"], true,
+            "HttpOnly flag must be true on the HttpOnly cookie"
+        );
+        assert_eq!(c1["secure"], true);
+    }
+
+    /// `Browser.getCookies` with an empty cookies array returns an empty vec
+    /// without errors.
+    #[test]
+    fn get_cookies_empty_response_ok() {
+        let h = setup();
+        let session = h.conn.root_session();
+
+        let in_tx = h.in_tx.clone();
+        let responder = thread::spawn(move || {
+            let sent = recv_out(&h.out_rx);
+            let id = sent["id"].as_i64().unwrap();
+            in_tx
+                .send(RawMessage {
+                    id: Some(id),
+                    method: None,
+                    params: None,
+                    result: Some(json!({ "cookies": [] })),
+                    error: None,
+                    session_id: None,
+                })
+                .unwrap();
+        });
+
+        let result = session
+            .send(
+                "Browser.getCookies",
+                json!({ "browserContextId": "ctx-empty" }),
+            )
+            .expect("Browser.getCookies empty should succeed");
+
+        responder.join().unwrap();
+
+        let cookies = result
+            .get("cookies")
+            .and_then(|v| v.as_array())
+            .expect("result must have 'cookies' array");
+        assert!(cookies.is_empty(), "expected empty cookie array");
+    }
 }

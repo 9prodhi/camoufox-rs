@@ -106,6 +106,10 @@ fn main() {
         Command::Ping => {
             run_client(&sock, &DaemonRequest::Ping, cli.json);
         }
+
+        Command::Cookies { instance_id } => {
+            run_client(&sock, &DaemonRequest::Cookies { instance_id }, cli.json);
+        }
     }
 }
 

@@ -392,6 +392,26 @@ impl InstanceManager {
         inst.screenshot(page_id, format, quality, path, timeout)
     }
 
+    /// Export all cookies for an instance's browser context (including HttpOnly).
+    ///
+    /// Calls `Browser.getCookies` on the root session with the instance's
+    /// `browserContextId`. HttpOnly cookies are included — the Juggler protocol
+    /// returns them in the same array as ordinary cookies.
+    pub fn cookies(&self, instance_id: &str) -> Result<Vec<serde_json::Value>, String> {
+        let ctx = self
+            .contexts
+            .get(instance_id)
+            .ok_or_else(|| format!("instance {instance_id} not found"))?;
+        let cookies = ctx
+            .get_cookies()
+            .map_err(|e| format!("get_cookies failed: {e}"))?;
+        let values: Vec<serde_json::Value> = cookies
+            .iter()
+            .map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null))
+            .collect();
+        Ok(values)
+    }
+
     /// Number of running instances.
     pub fn instance_count(&self) -> usize {
         self.instances.len()

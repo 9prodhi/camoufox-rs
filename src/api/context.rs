@@ -915,6 +915,7 @@ impl BrowserContext {
             expected_target_id,
             frame_id,
             exec_ctx,
+            Arc::clone(&self.connection),
         ))
     }
 

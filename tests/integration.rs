@@ -384,3 +384,68 @@ fn navigate_main_frame_with_cross_origin_iframe() {
         "location.href should be the main page, not the iframe"
     );
 }
+
+#[test]
+#[ignore]
+fn navigate_wait_until_load_blocks_until_dom_marker_present() {
+    // G3 integration test: `navigate ... --wait-until load` must block until
+    // the `load` event fires. The fixture page loads a /slow.js (delayed
+    // 200 ms) which inserts `div#load-marker` into the DOM. We assert that
+    // `div#load-marker` is non-null immediately after navigate returns,
+    // proving the wait was genuine rather than just acking the navigate RPC.
+    //
+    // Run with:
+    //   cargo test --test integration -- --ignored \
+    //       navigate_wait_until_load_blocks_until_dom_marker_present \
+    //       --test-threads=1
+
+    use camoufox::api::main_frame::NavigateOptions;
+
+    let server = fixtures::LifecycleServer::start();
+    let tb = setup();
+
+    let context = tb
+        .browser
+        .new_context(ContextOptions::default())
+        .expect("failed to create context");
+    let main_frame = context
+        .new_main_frame()
+        .expect("failed to create main frame");
+
+    // Navigate with wait_until=load; this must block until slow.js is
+    // delivered and the DOM marker is present.
+    main_frame
+        .navigate(
+            &server.url,
+            NavigateOptions {
+                wait_until: Some("load".to_owned()),
+                ..Default::default()
+            },
+            Duration::from_secs(30),
+        )
+        .expect("navigate with wait_until=load failed");
+
+    // Immediately after navigate returns, the DOM marker must exist.
+    // If navigate returned before load, slow.js would not yet have run
+    // and this evaluate would return null.
+    let result = main_frame
+        .evaluate(
+            "document.getElementById('load-marker') ? 'present' : 'absent'",
+            Duration::from_secs(10),
+        )
+        .expect("evaluate failed");
+
+    let marker = result
+        .pointer("/result/value")
+        .or_else(|| result.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("absent");
+
+    assert_eq!(
+        marker, "present",
+        "div#load-marker must be present immediately after navigate (wait_until=load) returns. \
+         Got: {marker:?}. If 'absent', navigate returned before the load event fired."
+    );
+
+    tb.teardown();
+}

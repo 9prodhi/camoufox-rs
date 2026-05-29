@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::api::main_frame::{Rect, ScreenshotOptions};
+use crate::api::main_frame::{NavigateOptions, Rect, ScreenshotOptions};
 use crate::api::{Browser, BrowserOptions, ContextOptions, MainFrame};
 use crate::config::LaunchConfig;
 use crate::protocol::client::Connection;
@@ -71,6 +71,10 @@ impl Instance {
     /// call returns a `navigate failed` error containing a `Timeout` kind
     /// rather than hanging the daemon.
     ///
+    /// If `wait_until` is `Some("load")` or `Some("domcontentloaded")`, blocks
+    /// until the matching `Page.eventFired` lifecycle event fires (bounded by
+    /// `timeout`). If absent, returns immediately after the navigate ack.
+    ///
     /// Clears the cached execution context so the next `evaluate` waits for
     /// the post-navigation context; the wait happens inside `MainFrame::evaluate`.
     pub fn navigate(
@@ -78,6 +82,7 @@ impl Instance {
         page_id: &str,
         url: &str,
         timeout: Duration,
+        wait_until: Option<&str>,
     ) -> Result<Option<String>, String> {
         let mp = self
             .pages
@@ -87,8 +92,13 @@ impl Instance {
         // Force `evaluate` to wait for a fresh post-navigation context.
         *mp.main_frame.execution_context_handle().lock().unwrap() = None;
 
+        let options = NavigateOptions {
+            wait_until: wait_until.map(|s| s.to_owned()),
+            ..Default::default()
+        };
+
         mp.main_frame
-            .navigate(url, Default::default(), timeout)
+            .navigate(url, options, timeout)
             .map_err(|e| format!("navigate failed: {e}"))
     }
 
@@ -352,12 +362,13 @@ impl InstanceManager {
         page_id: &str,
         url: &str,
         timeout: Duration,
+        wait_until: Option<&str>,
     ) -> Result<Option<String>, String> {
         let inst = self
             .instances
             .get(instance_id)
             .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.navigate(page_id, url, timeout)
+        inst.navigate(page_id, url, timeout, wait_until)
     }
 
     /// Evaluate JavaScript.

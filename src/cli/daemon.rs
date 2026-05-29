@@ -163,10 +163,11 @@ fn dispatch(request: DaemonRequest, manager: &Arc<Mutex<InstanceManager>>) -> Da
             page_id,
             url,
             timeout_secs,
+            wait_until,
         } => {
             let mgr = manager.lock().unwrap();
             let timeout = std::time::Duration::from_secs(timeout_secs);
-            match mgr.navigate(&instance_id, &page_id, &url, timeout) {
+            match mgr.navigate(&instance_id, &page_id, &url, timeout, wait_until.as_deref()) {
                 Ok(nav_id) => DaemonResponse::ok(json!({ "navigation_id": nav_id })),
                 Err(e) => DaemonResponse::err(e),
             }

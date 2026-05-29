@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::api::browser::Session;
+use crate::protocol::client::Connection;
 use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 
 // ---------------------------------------------------------------------------
@@ -27,6 +28,16 @@ use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 pub struct NavigateOptions {
     /// HTTP referer header to send with the navigation request.
     pub referer: Option<String>,
+    /// If set, block after the `Page.navigate` ack until the named lifecycle
+    /// event fires on the page session.
+    ///
+    /// Supported values: `"load"` and `"domcontentloaded"`.
+    /// - `"load"` waits for the `Page.eventFired { name: "load" }` event.
+    /// - `"domcontentloaded"` waits for `Page.eventFired { name: "DOMContentLoaded" }`.
+    ///
+    /// Any other value (including `"networkidle"`) is rejected with a clear error
+    /// before the navigate is issued.
+    pub wait_until: Option<String>,
 }
 
 /// Options for taking a screenshot.
@@ -184,6 +195,8 @@ pub struct MainFrame {
     /// Updated by a `Runtime.executionContextCreated` listener registered
     /// in `BrowserContext::new_main_frame`, filtered on `auxData.frameId`.
     execution_context_id: Arc<Mutex<Option<String>>>,
+    /// Shared connection — used for `on_event` subscriptions (e.g. lifecycle wait).
+    connection: Arc<Connection>,
 }
 
 impl MainFrame {
@@ -193,12 +206,14 @@ impl MainFrame {
         target_id: String,
         frame_id: String,
         execution_context_id: Arc<Mutex<Option<String>>>,
+        connection: Arc<Connection>,
     ) -> Self {
         MainFrame {
             session,
             target_id,
             frame_id,
             execution_context_id,
+            connection,
         }
     }
 
@@ -221,6 +236,120 @@ impl MainFrame {
 
     fn session(&self) -> &Session {
         &self.session
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle-event helpers
+    // -----------------------------------------------------------------------
+
+    /// Map a CLI `wait_until` value to the Juggler `Page.eventFired` name.
+    ///
+    /// - `"load"` → `"load"`
+    /// - `"domcontentloaded"` → `"DOMContentLoaded"`
+    /// - anything else → `Err` with a clear message naming the supported set.
+    ///
+    /// This is the canonical validation point; call it before issuing
+    /// `Page.navigate` so unsupported values error before any network I/O.
+    pub fn map_wait_until(value: &str) -> Result<&'static str, ProtocolError> {
+        match value {
+            "load" => Ok("load"),
+            "domcontentloaded" => Ok("DOMContentLoaded"),
+            other => Err(ProtocolError {
+                kind: ProtocolErrorKind::Response,
+                method: Some("Page.navigate".into()),
+                message: format!(
+                    "unsupported --wait-until value {:?}; supported values are: load, domcontentloaded",
+                    other
+                ),
+                data: None,
+                source: None,
+                download_info: None,
+            }),
+        }
+    }
+
+    /// Block until a `Page.eventFired` event with the given `name` fires on
+    /// this page's session and frame, or until `timeout` elapses.
+    ///
+    /// The Juggler protocol emits `Page.eventFired { frameId, name }` on the
+    /// page session. This helper subscribes to that event on the page session
+    /// key, filters to the matching `frameId` and `name`, forwards the match
+    /// to an `mpsc` channel, then `recv_timeout`s on the channel.
+    ///
+    /// The event handler is registered ONCE and lives until this call returns
+    /// (it holds a `Sender` that is dropped at the end of this fn, causing
+    /// the reader thread's `send` to fail silently from that point — no handler
+    /// leak in the `EventRouter` map, but note that `on_event` currently has no
+    /// deregister API; the handler becomes a no-op after the `Sender` drop).
+    ///
+    /// # Arguments
+    ///
+    /// - `event_name` — the Juggler event name, e.g. `"load"` or `"DOMContentLoaded"`.
+    /// - `timeout` — maximum time to wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Timeout` error if the event does not arrive within `timeout`,
+    /// leaving the session in a usable state.
+    pub fn wait_for_lifecycle(
+        &self,
+        event_name: &str,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
+        use std::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel::<()>();
+        let frame_id = self.frame_id.clone();
+        let expected_name = event_name.to_owned();
+        let session_key = self.session.key().to_owned();
+
+        self.connection.on_event(
+            &session_key,
+            "Page.eventFired",
+            Box::new(move |event| {
+                let ev_name = event
+                    .params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let ev_frame = event
+                    .params
+                    .get("frameId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if ev_name == expected_name && ev_frame == frame_id {
+                    // Ignore send error: the receiver may have already dropped
+                    // (e.g. timeout path ran first). This is benign.
+                    let _ = tx.send(());
+                }
+            }),
+        );
+
+        match rx.recv_timeout(timeout) {
+            Ok(()) => Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ProtocolError {
+                kind: ProtocolErrorKind::Timeout,
+                method: Some("Page.navigate".into()),
+                message: format!(
+                    "timed out waiting for lifecycle event {:?} after {:?}",
+                    event_name, timeout
+                ),
+                data: None,
+                source: None,
+                download_info: None,
+            }),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProtocolError {
+                kind: ProtocolErrorKind::Closed,
+                method: Some("Page.navigate".into()),
+                message: format!(
+                    "channel disconnected while waiting for lifecycle event {:?}",
+                    event_name
+                ),
+                data: None,
+                source: None,
+                download_info: None,
+            }),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -249,6 +378,12 @@ impl MainFrame {
         options: NavigateOptions,
         timeout: Duration,
     ) -> Result<Option<String>, ProtocolError> {
+        // Validate wait_until before issuing any network I/O.
+        let lifecycle_event: Option<&'static str> = match options.wait_until.as_deref() {
+            None | Some("") => None,
+            Some(v) => Some(Self::map_wait_until(v)?),
+        };
+
         let mut params = json!({
             "url": url,
             "frameId": self.frame_id,
@@ -275,6 +410,12 @@ impl MainFrame {
         if nav_id.is_some() {
             *self.execution_context_id.lock().unwrap() = None;
         }
+
+        // If a lifecycle event was requested, block until it fires (or timeout).
+        if let Some(event_name) = lifecycle_event {
+            self.wait_for_lifecycle(event_name, timeout)?;
+        }
+
         Ok(nav_id)
     }
 
@@ -1301,13 +1442,15 @@ mod tests {
             outgoing: out_tx,
         };
         let conn = Connection::new(Box::new(transport));
-        let session = conn.root_session(); // root session is fine for this test
+        let conn_arc = StdArc::new(conn);
+        let session = conn_arc.root_session(); // root session is fine for this test
         let exec_ctx = StdArc::new(Mutex::new(None));
         let main_frame = MainFrame::new(
             session,
             "target-test".to_owned(),
             "frame-test".to_owned(),
             exec_ctx,
+            StdArc::clone(&conn_arc),
         );
 
         let start = Instant::now();
@@ -1346,5 +1489,433 @@ mod tests {
 
         // Force the connection to shut down so the reader thread exits.
         closed.store(true, Ordering::SeqCst);
+    }
+
+    // -----------------------------------------------------------------------
+    // G3: navigate --wait-until unit tests
+    //
+    // Uses a `MockTransport` that supports both outgoing capture AND incoming
+    // message injection, mirroring the pattern in protocol::client::tests.
+    // -----------------------------------------------------------------------
+
+    /// A full mock transport: `receive()` blocks on a channel of injected
+    /// `RawMessage`s; `send()` forwards to an outgoing channel.
+    struct MockTransport {
+        incoming_rx: mpsc::Receiver<RawMessage>,
+        outgoing_tx: mpsc::Sender<serde_json::Value>,
+        closed: StdArc<AtomicBool>,
+    }
+
+    impl Transport for MockTransport {
+        fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(TransportError::Closed);
+            }
+            let _ = self.outgoing_tx.send(message.clone());
+            Ok(())
+        }
+
+        fn receive(&mut self) -> Result<RawMessage, TransportError> {
+            loop {
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(TransportError::Closed);
+                }
+                match self.incoming_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(msg) => return Ok(msg),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(TransportError::Closed)
+                    }
+                }
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Build a `MainFrame` backed by a `MockTransport` where:
+    /// - `in_tx`: inject `RawMessage`s for the reader thread to process.
+    /// - `out_rx`: receive outgoing JSON messages the frame sends.
+    /// - the frame is on a page session with key `session_key`.
+    struct MockFrameHarness {
+        #[allow(dead_code)]
+        conn: StdArc<Connection>,
+        frame: MainFrame,
+        in_tx: mpsc::Sender<RawMessage>,
+        out_rx: mpsc::Receiver<serde_json::Value>,
+        closed: StdArc<AtomicBool>,
+    }
+
+    fn build_mock_frame(session_key: &str, frame_id: &str) -> MockFrameHarness {
+        let (in_tx, in_rx) = mpsc::channel::<RawMessage>();
+        let (out_tx, out_rx) = mpsc::channel::<serde_json::Value>();
+        let closed = StdArc::new(AtomicBool::new(false));
+
+        let transport = MockTransport {
+            incoming_rx: in_rx,
+            outgoing_tx: out_tx,
+            closed: StdArc::clone(&closed),
+        };
+
+        let conn = Connection::new(Box::new(transport));
+        // Create the page session.
+        let page_session = conn.create_session(session_key.to_owned());
+        let conn_arc = StdArc::new(conn);
+
+        let exec_ctx = StdArc::new(Mutex::new(None::<String>));
+        let frame = MainFrame::new(
+            page_session,
+            "target-test".to_owned(),
+            frame_id.to_owned(),
+            StdArc::clone(&exec_ctx),
+            StdArc::clone(&conn_arc),
+        );
+
+        MockFrameHarness {
+            conn: conn_arc,
+            frame,
+            in_tx,
+            out_rx,
+            closed,
+        }
+    }
+
+    /// Helper: build a `Page.navigate` success response for a given request id.
+    fn navigate_success_response(id: i64, session_key: &str) -> RawMessage {
+        RawMessage {
+            id: Some(id),
+            method: None,
+            params: None,
+            result: Some(serde_json::json!({ "navigationId": "nav-1" })),
+            error: None,
+            session_id: Some(session_key.to_owned()),
+        }
+    }
+
+    /// Helper: build a `Page.eventFired` event message.
+    fn event_fired_message(name: &str, frame_id: &str, session_key: &str) -> RawMessage {
+        RawMessage {
+            id: None,
+            method: Some("Page.eventFired".to_owned()),
+            params: Some(serde_json::json!({
+                "name": name,
+                "frameId": frame_id,
+            })),
+            result: None,
+            error: None,
+            session_id: Some(session_key.to_owned()),
+        }
+    }
+
+    /// G3 TDD case 1: navigate with `wait_until=Some("load")` blocks until
+    /// the `Page.eventFired { name: "load" }` event fires on the page session.
+    ///
+    /// Script: ack `Page.navigate` → emit `Page.eventFired{name:"load"}` after
+    /// a short delay; assert that `navigate()` returns only after the event.
+    #[test]
+    fn navigate_wait_until_load_returns_after_event_fires() {
+        let h = build_mock_frame("page-A", "frame-1");
+
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        // Responder thread: wait for the outgoing Page.navigate, ack it,
+        // then emit the Page.eventFired{load} event after a small delay.
+        let responder = std::thread::spawn(move || {
+            // Drain the Page.navigate request.
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate was not sent");
+            let id = sent["id"].as_i64().expect("id present");
+            assert_eq!(sent["method"], "Page.navigate");
+
+            // Ack the navigate.
+            in_tx
+                .send(navigate_success_response(id, "page-A"))
+                .expect("send nav response");
+
+            // Small delay to prove the caller is *actually* blocking.
+            std::thread::sleep(Duration::from_millis(50));
+
+            // Emit the lifecycle event.
+            in_tx
+                .send(event_fired_message("load", "frame-1", "page-A"))
+                .expect("send eventFired");
+        });
+
+        let start = Instant::now();
+        let result = h.frame.navigate(
+            "https://example.com",
+            NavigateOptions {
+                wait_until: Some("load".into()),
+                ..Default::default()
+            },
+            Duration::from_secs(10),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "navigate should succeed: {result:?}");
+        // Must have waited for the event (≥ 50ms delay).
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "returned too early ({elapsed:?}); should have waited for event"
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// G3 TDD case 2: lifecycle event never arrives → Timeout error within
+    /// the bound; session remains usable (no panic, no leak).
+    #[test]
+    fn navigate_wait_until_timeout_returns_timeout_error() {
+        let h = build_mock_frame("page-B", "frame-2");
+
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        // Responder: ack the navigate but never send the lifecycle event.
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate was not sent");
+            let id = sent["id"].as_i64().expect("id present");
+            in_tx
+                .send(navigate_success_response(id, "page-B"))
+                .expect("send nav response");
+            // Deliberately do NOT send Page.eventFired.
+        });
+
+        let start = Instant::now();
+        let result = h.frame.navigate(
+            "https://example.com",
+            NavigateOptions {
+                wait_until: Some("load".into()),
+                ..Default::default()
+            },
+            Duration::from_millis(200),
+        );
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("should time out waiting for lifecycle event");
+        assert_eq!(
+            err.kind,
+            ProtocolErrorKind::Timeout,
+            "expected Timeout, got {err:?}"
+        );
+        assert!(
+            err.message.contains("load"),
+            "error message should mention the event name: {}",
+            err.message
+        );
+        assert!(
+            elapsed >= Duration::from_millis(190),
+            "returned too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "returned too late: {elapsed:?}"
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// G3 TDD case 3a: `--wait-until=networkidle` returns a clear error naming
+    /// the supported values BEFORE any network I/O (no Page.navigate is sent).
+    #[test]
+    fn navigate_wait_until_networkidle_returns_error() {
+        let h = build_mock_frame("page-C", "frame-3");
+
+        let result = h.frame.navigate(
+            "https://example.com",
+            NavigateOptions {
+                wait_until: Some("networkidle".into()),
+                ..Default::default()
+            },
+            Duration::from_secs(10),
+        );
+
+        let err = result.expect_err("networkidle must error");
+        assert_eq!(err.kind, ProtocolErrorKind::Response);
+        assert!(
+            err.message.contains("load"),
+            "error must mention 'load': {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("domcontentloaded"),
+            "error must mention 'domcontentloaded': {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("networkidle"),
+            "error must echo the bad value: {}",
+            err.message
+        );
+
+        // No Page.navigate should have been sent.
+        assert!(
+            h.out_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "Page.navigate must NOT be sent for unsupported wait_until"
+        );
+
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// G3 TDD case 3b: `map_wait_until` validates values correctly.
+    #[test]
+    fn map_wait_until_validates_values() {
+        assert_eq!(MainFrame::map_wait_until("load").unwrap(), "load");
+        assert_eq!(
+            MainFrame::map_wait_until("domcontentloaded").unwrap(),
+            "DOMContentLoaded"
+        );
+        assert!(MainFrame::map_wait_until("networkidle").is_err());
+        assert!(MainFrame::map_wait_until("").is_err());
+        assert!(MainFrame::map_wait_until("LOAD").is_err());
+    }
+
+    /// G3 TDD case 3c: absent `wait_until` (None) returns after ack — no event
+    /// wait, so no timeout from missing event.
+    #[test]
+    fn navigate_without_wait_until_returns_after_ack() {
+        let h = build_mock_frame("page-D", "frame-4");
+
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate was not sent");
+            let id = sent["id"].as_i64().expect("id present");
+            in_tx
+                .send(navigate_success_response(id, "page-D"))
+                .expect("send nav response");
+            // No eventFired emitted — if wait_until is absent, navigate must
+            // return without needing one.
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com",
+            NavigateOptions {
+                wait_until: None,
+                ..Default::default()
+            },
+            Duration::from_secs(10),
+        );
+        assert!(
+            result.is_ok(),
+            "navigate (no wait_until) should succeed: {result:?}"
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// G3 TDD case 3d: IPC serde round-trip — `DaemonRequest::Navigate` with
+    /// `wait_until` field serialises and deserialises correctly.
+    #[test]
+    fn navigate_ipc_wait_until_serde_round_trip() {
+        use crate::cli::ipc::DaemonRequest;
+
+        // With wait_until present.
+        let req = DaemonRequest::Navigate {
+            instance_id: "00000001".into(),
+            page_id: "p1".into(),
+            url: "https://example.com".into(),
+            timeout_secs: 30,
+            wait_until: Some("load".into()),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: DaemonRequest = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            DaemonRequest::Navigate { wait_until, .. } => {
+                assert_eq!(wait_until.as_deref(), Some("load"));
+            }
+            other => panic!("expected Navigate, got {other:?}"),
+        }
+
+        // With wait_until absent — must not appear in serialised JSON.
+        let req_no_wait = DaemonRequest::Navigate {
+            instance_id: "00000001".into(),
+            page_id: "p1".into(),
+            url: "https://example.com".into(),
+            timeout_secs: 30,
+            wait_until: None,
+        };
+        let json_no_wait = serde_json::to_string(&req_no_wait).expect("serialize");
+        assert!(
+            !json_no_wait.contains("wait_until"),
+            "wait_until must be absent from serialised JSON when None: {json_no_wait}"
+        );
+        let back_no_wait: DaemonRequest = serde_json::from_str(&json_no_wait).expect("deserialize");
+        match back_no_wait {
+            DaemonRequest::Navigate { wait_until, .. } => {
+                assert!(wait_until.is_none(), "wait_until must deserialise to None");
+            }
+            other => panic!("expected Navigate, got {other:?}"),
+        }
+
+        // Legacy wire (no wait_until field at all) must deserialise to None.
+        let legacy = r#"{"method":"Navigate","params":{"instance_id":"00000001","page_id":"p1","url":"https://example.com","timeout_secs":30}}"#;
+        let back_legacy: DaemonRequest = serde_json::from_str(legacy).expect("deserialize legacy");
+        match back_legacy {
+            DaemonRequest::Navigate { wait_until, .. } => {
+                assert!(
+                    wait_until.is_none(),
+                    "legacy wire (no wait_until) must deserialise to None"
+                );
+            }
+            other => panic!("expected Navigate, got {other:?}"),
+        }
+    }
+
+    /// G3 TDD case: `wait_until=domcontentloaded` maps to DOMContentLoaded event.
+    #[test]
+    fn navigate_wait_until_domcontentloaded_fires_on_dce_event() {
+        let h = build_mock_frame("page-E", "frame-5");
+
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().unwrap();
+            in_tx.send(navigate_success_response(id, "page-E")).unwrap();
+
+            std::thread::sleep(Duration::from_millis(30));
+
+            // Emit DOMContentLoaded (the Juggler name).
+            in_tx
+                .send(event_fired_message("DOMContentLoaded", "frame-5", "page-E"))
+                .unwrap();
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com",
+            NavigateOptions {
+                wait_until: Some("domcontentloaded".into()),
+                ..Default::default()
+            },
+            Duration::from_secs(10),
+        );
+        assert!(
+            result.is_ok(),
+            "domcontentloaded wait should succeed: {result:?}"
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
     }
 }

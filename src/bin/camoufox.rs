@@ -46,6 +46,7 @@ fn main() {
             page_id,
             url,
             timeout,
+            wait_until,
         } => {
             run_client(
                 &sock,
@@ -54,6 +55,7 @@ fn main() {
                     page_id,
                     url,
                     timeout_secs: timeout,
+                    wait_until,
                 },
                 cli.json,
             );

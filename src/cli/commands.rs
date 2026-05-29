@@ -63,6 +63,11 @@ pub enum Command {
         /// Timeout in seconds for waiting for execution context.
         #[arg(long, default_value = "30")]
         timeout: u64,
+        /// If set, block until the named lifecycle event fires after navigation.
+        /// Supported values: load, domcontentloaded.
+        /// Absent: return after the Page.navigate ack (existing behavior).
+        #[arg(long)]
+        wait_until: Option<String>,
     },
 
     /// Evaluate JavaScript on a page.

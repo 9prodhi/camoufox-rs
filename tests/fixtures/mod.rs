@@ -213,3 +213,105 @@ impl CookieServer {
 impl Drop for CookieServer {
     fn drop(&mut self) {}
 }
+
+/// A single-port HTTP server that serves a page with a **deferred resource**.
+///
+/// The page HTML contains a `<script src="/slow.js" defer></script>` where
+/// `/slow.js` is served after a 200 ms delay. The `load` event therefore fires
+/// only AFTER `slow.js` has been delivered (browsers wait for all deferred
+/// scripts before firing `load`). The slow script inserts a DOM marker element:
+///
+/// ```html
+/// <div id="load-marker">loaded</div>
+/// ```
+///
+/// Integration tests can navigate to `LifecycleServer::url` with
+/// `--wait-until=load` and then assert `document.getElementById('load-marker')`
+/// is non-null — proving the caller did not return until after `load`.
+pub struct LifecycleServer {
+    /// URL of the page that requires a deferred resource before `load`.
+    pub url: String,
+    _server: Arc<Server>,
+}
+
+impl LifecycleServer {
+    /// Start on an ephemeral port.
+    #[allow(dead_code)]
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").expect("bind lifecycle server"));
+        let port = server.server_addr().to_ip().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/");
+
+        // The main page references /slow.js as a defer script.
+        // On load, slow.js creates a div#load-marker.
+        let main_html = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+  <title>Lifecycle Test</title>
+  <script src="http://127.0.0.1:{port}/slow.js" defer></script>
+</head>
+<body>
+  <div id="before-load">before load</div>
+</body>
+</html>"#
+        );
+
+        // slow.js inserts the marker that proves load has fired.
+        const SLOW_JS: &str = r#"
+var d = document.createElement('div');
+d.id = 'load-marker';
+d.textContent = 'loaded';
+document.body.appendChild(d);
+"#;
+
+        let main_html_bytes = main_html.into_bytes();
+        let slow_js_bytes = SLOW_JS.as_bytes().to_vec();
+
+        let server_clone = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in server_clone.incoming_requests() {
+                let path = req.url().to_owned();
+                if path.contains("slow.js") {
+                    // Delay to ensure load fires AFTER navigation ack.
+                    thread::sleep(Duration::from_millis(200));
+                    let resp = Response::new(
+                        200.into(),
+                        vec![Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"application/javascript"[..],
+                        )
+                        .unwrap()],
+                        Cursor::new(slow_js_bytes.clone()),
+                        Some(slow_js_bytes.len()),
+                        None,
+                    );
+                    let _ = req.respond(resp);
+                } else {
+                    // Main page: served immediately.
+                    let resp = Response::new(
+                        200.into(),
+                        vec![Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"text/html; charset=utf-8"[..],
+                        )
+                        .unwrap()],
+                        Cursor::new(main_html_bytes.clone()),
+                        Some(main_html_bytes.len()),
+                        None,
+                    );
+                    let _ = req.respond(resp);
+                }
+            }
+        });
+
+        LifecycleServer {
+            url,
+            _server: server,
+        }
+    }
+}
+
+impl Drop for LifecycleServer {
+    fn drop(&mut self) {}
+}

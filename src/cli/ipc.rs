@@ -44,6 +44,11 @@ pub enum DaemonRequest {
         url: String,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
+        /// Optional lifecycle event to wait for after the Page.navigate ack.
+        /// Supported values: "load", "domcontentloaded".
+        /// Absent (null/missing) means return after ack — existing behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_until: Option<String>,
     },
 
     /// Evaluate JavaScript on a page.

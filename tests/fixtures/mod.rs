@@ -320,10 +320,12 @@ impl Drop for LifecycleServer {
 ///
 /// - `GET /200` → HTTP 200 with a minimal HTML body.
 /// - `GET /404` → HTTP 404 with a minimal HTML body.
+/// - `GET /redirect` → HTTP 302 to `/200` (exercises redirect-chain status).
 /// - Any other path → HTTP 200 (treated as the "base" URL).
 ///
-/// Used by the G4 integration test
-/// (`navigate_reports_main_document_status_code`).
+/// Used by the G4 integration tests
+/// (`navigate_reports_main_document_status_code`,
+/// `navigate_reports_final_status_after_redirect`).
 pub struct StatusServer {
     /// Base URL: `http://127.0.0.1:<port>/`
     #[allow(dead_code)]
@@ -332,6 +334,8 @@ pub struct StatusServer {
     pub url_200: String,
     /// URL that returns 404.
     pub url_404: String,
+    /// URL that returns 302 → `/200` (redirect chain).
+    pub url_redirect: String,
     _server: Arc<Server>,
 }
 
@@ -344,15 +348,32 @@ impl StatusServer {
         let base_url = format!("http://127.0.0.1:{port}/");
         let url_200 = format!("http://127.0.0.1:{port}/200");
         let url_404 = format!("http://127.0.0.1:{port}/404");
+        let url_redirect = format!("http://127.0.0.1:{port}/redirect");
 
         const HTML_200: &[u8] = b"<html><body>200 OK</body></html>";
         const HTML_404: &[u8] = b"<html><body>404 Not Found</body></html>";
 
+        let redirect_target = format!("http://127.0.0.1:{port}/200");
         let server_clone = Arc::clone(&server);
         thread::spawn(move || {
             for req in server_clone.incoming_requests() {
                 let path = req.url().to_owned();
-                if path.contains("/404") {
+                if path.contains("/redirect") {
+                    // 302 Found → /200. The browser follows it, so the final
+                    // main-document status must be 200, not 302.
+                    let resp = Response::new(
+                        302.into(),
+                        vec![
+                            Header::from_bytes(&b"Location"[..], redirect_target.as_bytes())
+                                .unwrap(),
+                            Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap(),
+                        ],
+                        Cursor::new(Vec::new()),
+                        Some(0),
+                        None,
+                    );
+                    let _ = req.respond(resp);
+                } else if path.contains("/404") {
                     let resp = Response::new(
                         404.into(),
                         vec![Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap()],
@@ -378,6 +399,7 @@ impl StatusServer {
             base_url,
             url_200,
             url_404,
+            url_redirect,
             _server: server,
         }
     }

@@ -17,6 +17,16 @@ use crate::protocol::client::Connection;
 use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 use crate::protocol::events::HandlerId;
 
+/// Upper bound (ms) on how long `navigate` spins waiting for the main-document
+/// HTTP status after the navigate ack. Kept short so callers without
+/// `--wait-until` are not meaningfully delayed when Network events don't flow.
+/// Lowered under `cfg(test)` so the no-event unit tests don't pay the full
+/// production budget.
+#[cfg(not(test))]
+const MAX_STATUS_WAIT_MS: u64 = 500;
+#[cfg(test)]
+const MAX_STATUS_WAIT_MS: u64 = 80;
+
 // ---------------------------------------------------------------------------
 // Supporting types
 // ---------------------------------------------------------------------------
@@ -460,16 +470,24 @@ impl MainFrame {
         // -----------------------------------------------------------------------
         // G4: Subscribe Network event handlers BEFORE issuing Page.navigate.
         //
-        // Correlation approach:
-        // 1. `Network.requestWillBeSent { requestId, navigationId, cause }`:
-        //    when `cause == "document"`, record the `requestId`. We accept the
-        //    first `document` request speculatively (expected_nav_id is None
-        //    until the navigate ack returns the nav_id). After the ack, the
-        //    nav_id is stored so the handler can gate on it for subsequent
-        //    events.
+        // Correlation approach (redirect-aware):
+        // 1. `Network.requestWillBeSent { requestId, navigationId, cause,
+        //    redirectedFrom }`:
+        //    - LOCK: when `cause` is a document type, record the first matching
+        //      `requestId` as `main_request_id`. We accept the first document
+        //      request speculatively (expected_nav_id is None until the navigate
+        //      ack returns the nav_id); after the ack the nav_id is stored so the
+        //      handler can gate on it.
+        //    - CHAIN FORWARD: when `redirectedFrom` equals the currently-tracked
+        //      `main_request_id`, the navigation followed a redirect (301/302/
+        //      307/308) and the browser issued a new request for the redirect
+        //      target. Update `main_request_id` to this new `requestId` so the
+        //      FINAL hop's status wins, not the redirect hop's.
         // 2. `Network.responseReceived { requestId, status }`:
-        //    when `requestId` matches the one recorded in step 1, capture the
-        //    HTTP status.
+        //    capture the status for whatever the CURRENT `main_request_id` is,
+        //    and ALLOW OVERWRITE — on a redirect chain `responseReceived` fires
+        //    for each hop (301 then 200/404…); the last one (the final target)
+        //    must win.
         //
         // Both handlers are RAII-guarded — they deregister on all exit paths.
         // -----------------------------------------------------------------------
@@ -477,7 +495,11 @@ impl MainFrame {
         /// Shared state written by the two handlers.
         #[derive(Default)]
         struct NetState {
+            /// The requestId of the main-document request being tracked. Advances
+            /// forward along the redirect chain as `redirectedFrom` links match.
             main_request_id: Option<String>,
+            /// Status of the most recent matching response. Overwritten as the
+            /// redirect chain progresses so the FINAL hop's status is reported.
             status: Option<u16>,
         }
         let net_state: Arc<Mutex<NetState>> = Arc::new(Mutex::new(NetState::default()));
@@ -492,32 +514,18 @@ impl MainFrame {
             &session_key,
             "Network.requestWillBeSent",
             Box::new(move |event| {
-                let cause = event
-                    .params
-                    .get("cause")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                // Accept both the spec-mapped value ("document") and the raw Firefox
-                // type names emitted in practice ("TYPE_DOCUMENT", "TYPE_SUBDOCUMENT",
-                // "TYPE_REFRESH"). PROTOCOL.md says they map to "document" but the
-                // live browser emits the unmapped Firefox values.
-                let is_document_cause = matches!(
-                    cause,
-                    "document" | "TYPE_DOCUMENT" | "TYPE_SUBDOCUMENT" | "TYPE_REFRESH"
-                );
-                if !is_document_cause {
-                    return;
-                }
+                let req_id = match event.params.get("requestId").and_then(|v| v.as_str()) {
+                    Some(id) => id.to_owned(),
+                    None => return,
+                };
+
                 // Frame filter: skip requests for other frames if frameId present.
                 if let Some(ev_frame) = event.params.get("frameId").and_then(|v| v.as_str()) {
                     if !ev_frame.is_empty() && ev_frame != frame_id_rws {
                         return;
                     }
                 }
-                let req_id = match event.params.get("requestId").and_then(|v| v.as_str()) {
-                    Some(id) => id.to_owned(),
-                    None => return,
-                };
+
                 let ev_nav_id = event
                     .params
                     .get("navigationId")
@@ -526,16 +534,49 @@ impl MainFrame {
                 let expected = nav_id_rws.lock().unwrap().clone();
                 // Accept if: nav_id not yet known (speculative), OR nav_ids match,
                 // OR event carries no nav_id (some same-doc navigations).
-                let accept = match (&expected, &ev_nav_id) {
+                let nav_id_ok = match (&expected, &ev_nav_id) {
                     (None, _) => true,
                     (Some(exp), Some(ev)) => exp == ev,
                     (Some(_), None) => true,
                 };
-                if accept {
-                    let mut st = state_rws.lock().unwrap();
-                    if st.main_request_id.is_none() {
+                if !nav_id_ok {
+                    return;
+                }
+
+                let redirected_from = event.params.get("redirectedFrom").and_then(|v| v.as_str());
+
+                let mut st = state_rws.lock().unwrap();
+
+                // CHAIN FORWARD: a redirect hop's continuation request whose
+                // `redirectedFrom` is the request we're tracking. Advance the
+                // tracked id to this hop so the final response's status wins.
+                // Checked before the document-cause gate because redirect
+                // continuations are tied to the chain, not re-discovered.
+                if let Some(from) = redirected_from {
+                    if st.main_request_id.as_deref() == Some(from) {
                         st.main_request_id = Some(req_id);
+                        return;
                     }
+                    // A `redirectedFrom` that does not match our chain belongs to
+                    // some other request; ignore it (cannot hijack the chain).
+                    return;
+                }
+
+                // LOCK: only the FIRST document-type request (no redirectedFrom)
+                // establishes the chain head. Accept both the spec-mapped value
+                // ("document") and the raw Firefox type names emitted in practice
+                // ("TYPE_DOCUMENT", "TYPE_SUBDOCUMENT", "TYPE_REFRESH").
+                let cause = event
+                    .params
+                    .get("cause")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let is_document_cause = matches!(
+                    cause,
+                    "document" | "TYPE_DOCUMENT" | "TYPE_SUBDOCUMENT" | "TYPE_REFRESH"
+                );
+                if is_document_cause && st.main_request_id.is_none() {
+                    st.main_request_id = Some(req_id);
                 }
             }),
         );
@@ -557,9 +598,10 @@ impl MainFrame {
                     None => return,
                 };
                 let mut st = state_rr.lock().unwrap();
-                if st.status.is_some() {
-                    return; // Already captured.
-                }
+                // Capture for the CURRENT tracked request and ALLOW OVERWRITE so
+                // that on a redirect chain (A→B), the final hop's status wins:
+                // respReceived A sets 301, then after the chain advances to B,
+                // respReceived B overwrites to the final 200/404.
                 if st.main_request_id.as_deref() == Some(req_id) {
                     if let Some(s) = event.params.get("status").and_then(|v| v.as_u64()) {
                         st.status = u16::try_from(s).ok();
@@ -618,17 +660,26 @@ impl MainFrame {
         // near-instantly after the navigate ack (or during the lifecycle wait).
         // Cap at 500 ms so we don't meaningfully delay callers without
         // --wait-until when Network events don't flow.
-        const MAX_STATUS_WAIT: Duration = Duration::from_millis(500);
+        //
+        // Redirect-aware: a 3xx status means the chain is still in flight (the
+        // browser will issue the redirect-target request next), so we keep
+        // polling until a FINAL (non-3xx) status arrives or the cap elapses —
+        // otherwise we'd return the redirect hop's status (e.g. 301) instead of
+        // the final 200/404.
+        const MAX_STATUS_WAIT: Duration = Duration::from_millis(MAX_STATUS_WAIT_MS);
         let status_cap = Instant::now() + MAX_STATUS_WAIT;
         let effective_deadline = status_cap.min(deadline);
+        let is_final = |s: Option<u16>| matches!(s, Some(code) if !(300..400).contains(&code));
         let status_code = loop {
             {
                 let st = net_state.lock().unwrap();
-                if st.status.is_some() {
+                if is_final(st.status) {
                     break st.status;
                 }
             }
             if Instant::now() >= effective_deadline {
+                // Return whatever we have (could be a 3xx if a redirect never
+                // resolved within the budget, or None if nothing arrived).
                 break net_state.lock().unwrap().status;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -2304,6 +2355,39 @@ mod tests {
         }
     }
 
+    /// Helper: build a `Network.requestWillBeSent` event for a redirect-target
+    /// request — i.e. one whose `redirectedFrom` points at a prior requestId.
+    /// Redirect continuations carry document cause and the same navigationId.
+    fn redirect_request_msg(
+        request_id: &str,
+        redirected_from: &str,
+        nav_id: Option<&str>,
+        frame_id: &str,
+        session_key: &str,
+    ) -> RawMessage {
+        let mut params = serde_json::json!({
+            "requestId": request_id,
+            "redirectedFrom": redirected_from,
+            "cause": "TYPE_DOCUMENT",
+            "frameId": frame_id,
+            "url": "https://example.com/redirected",
+            "method": "GET",
+            "headers": [],
+            "isIntercepted": false,
+        });
+        if let Some(nid) = nav_id {
+            params["navigationId"] = serde_json::json!(nid);
+        }
+        RawMessage {
+            id: None,
+            method: Some("Network.requestWillBeSent".to_owned()),
+            params: Some(params),
+            result: None,
+            error: None,
+            session_id: Some(session_key.to_owned()),
+        }
+    }
+
     /// Helper: build a `Network.responseReceived` event.
     fn response_received_msg(request_id: &str, status: u16, session_key: &str) -> RawMessage {
         RawMessage {
@@ -2568,5 +2652,208 @@ mod tests {
             Some(200),
             "status_code must be Some(200)"
         );
+    }
+
+    /// G4 redirect TDD: a 4-event redirect sequence must report the FINAL
+    /// response status, not the redirect hop's.
+    ///
+    /// Sequence (mirrors Bombay HC `nic.in → gov.in`, 301 → 200):
+    ///   1. requestWillBeSent A (document, navId)        → locks main = A
+    ///   2. responseReceived  A (status 301)             → status = 301
+    ///   3. requestWillBeSent B (redirectedFrom = A)     → chain forward main = B
+    ///   4. responseReceived  B (status 200)             → status overwritten = 200
+    ///
+    /// Asserts `status_code == Some(200)` (the final hop), NOT `Some(301)`.
+    #[test]
+    fn navigate_follows_redirect_chain_reports_final_status() {
+        let h = build_mock_frame("page-g4r", "frame-g4r");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+
+            // Ack the navigate (nav id "nav-1", per navigate_success_response).
+            in_tx
+                .send(navigate_success_response(id, "page-g4r"))
+                .expect("send nav response");
+
+            // 1. Initial document request A.
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-A",
+                    Some("nav-1"),
+                    "frame-g4r",
+                    "page-g4r",
+                ))
+                .expect("send rws A");
+            // 2. Redirect response for A (301).
+            in_tx
+                .send(response_received_msg("req-A", 301, "page-g4r"))
+                .expect("send respReceived A");
+            // 3. Redirect-target request B (redirectedFrom = A).
+            in_tx
+                .send(redirect_request_msg(
+                    "req-B",
+                    "req-A",
+                    Some("nav-1"),
+                    "frame-g4r",
+                    "page-g4r",
+                ))
+                .expect("send rws B");
+            // 4. Final response for B (200).
+            in_tx
+                .send(response_received_msg("req-B", 200, "page-g4r"))
+                .expect("send respReceived B");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com",
+            Default::default(),
+            Duration::from_secs(10),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed on redirect");
+        assert_eq!(
+            outcome.status_code,
+            Some(200),
+            "redirect chain must report the FINAL status (200), not the redirect hop (301)"
+        );
+    }
+
+    /// G4 redirect TDD: a sub-resource (e.g. an image whose redirectedFrom does
+    /// NOT match the tracked main request) must NOT hijack the chain. The
+    /// main-document final status must still be reported.
+    #[test]
+    fn navigate_subresource_redirect_does_not_hijack_chain() {
+        let h = build_mock_frame("page-g4h", "frame-g4h");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+            in_tx
+                .send(navigate_success_response(id, "page-g4h"))
+                .expect("send nav response");
+
+            // Main document request A → 200 final.
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-A",
+                    Some("nav-1"),
+                    "frame-g4h",
+                    "page-g4h",
+                ))
+                .expect("send rws A");
+            in_tx
+                .send(response_received_msg("req-A", 200, "page-g4h"))
+                .expect("send respReceived A");
+
+            // A sub-resource redirect whose redirectedFrom is some OTHER request
+            // ("img-1", which we never tracked). It must not advance the chain
+            // nor overwrite the main-document status.
+            in_tx
+                .send(redirect_request_msg(
+                    "req-img-2",
+                    "img-1",
+                    Some("nav-1"),
+                    "frame-g4h",
+                    "page-g4h",
+                ))
+                .expect("send rws sub-resource");
+            in_tx
+                .send(response_received_msg("req-img-2", 500, "page-g4h"))
+                .expect("send respReceived sub-resource");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com",
+            Default::default(),
+            Duration::from_secs(10),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed");
+        assert_eq!(
+            outcome.status_code,
+            Some(200),
+            "sub-resource redirect must not hijack the main-document status (expected 200)"
+        );
+    }
+
+    /// G4 redirect leak guard: after a redirect navigate, BOTH Network handlers
+    /// must be deregistered (the added chain logic must not leak).
+    #[test]
+    fn navigate_redirect_does_not_leak_handlers() {
+        let h = build_mock_frame("page-g4l", "frame-g4l");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+            in_tx
+                .send(navigate_success_response(id, "page-g4l"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-A",
+                    Some("nav-1"),
+                    "frame-g4l",
+                    "page-g4l",
+                ))
+                .expect("send rws A");
+            in_tx
+                .send(response_received_msg("req-A", 301, "page-g4l"))
+                .expect("send respReceived A");
+            in_tx
+                .send(redirect_request_msg(
+                    "req-B",
+                    "req-A",
+                    Some("nav-1"),
+                    "frame-g4l",
+                    "page-g4l",
+                ))
+                .expect("send rws B");
+            in_tx
+                .send(response_received_msg("req-B", 200, "page-g4l"))
+                .expect("send respReceived B");
+        });
+
+        let _ = h.frame.navigate(
+            "https://example.com",
+            Default::default(),
+            Duration::from_secs(10),
+        );
+
+        responder.join().unwrap();
+
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-g4l", "Network.requestWillBeSent"),
+            0,
+            "Network.requestWillBeSent handler must not leak after a redirect navigate"
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-g4l", "Network.responseReceived"),
+            0,
+            "Network.responseReceived handler must not leak after a redirect navigate"
+        );
+
+        h.closed.store(true, Ordering::SeqCst);
     }
 }

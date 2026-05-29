@@ -502,3 +502,43 @@ fn navigate_reports_main_document_status_code() {
 
     tb.teardown();
 }
+
+#[test]
+#[ignore]
+fn navigate_reports_final_status_after_redirect() {
+    // G4 redirect integration test: navigating to a URL that 302-redirects to
+    // a 200 page must report the FINAL status (200), NOT the redirect hop
+    // (302). This is the Bombay HC `nic.in → gov.in` (301 → 200) case.
+    //
+    // Run with:
+    //   cargo test --test integration -- --ignored \
+    //       navigate_reports_final_status_after_redirect --test-threads=1
+
+    let server = fixtures::StatusServer::start();
+    let tb = setup();
+
+    let context = tb
+        .browser
+        .new_context(ContextOptions::default())
+        .expect("failed to create context");
+    let main_frame = context
+        .new_main_frame()
+        .expect("failed to create main frame");
+
+    let outcome = main_frame
+        .navigate(
+            &server.url_redirect,
+            Default::default(),
+            Duration::from_secs(30),
+        )
+        .expect("navigate through redirect must return Ok");
+
+    assert_eq!(
+        outcome.status_code,
+        Some(200),
+        "status_code must be the FINAL hop (200), not the redirect (302); got {:?}",
+        outcome.status_code
+    );
+
+    tb.teardown();
+}

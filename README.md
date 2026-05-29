@@ -68,6 +68,37 @@ cargo run --features cli --bin camoufox -- navigate <instance_id> <page_id> http
 cargo run --features cli --bin camoufox -- evaluate <instance_id> <page_id> "document.title"
 ```
 
+Navigate with wait-until and status_code:
+
+```bash
+# Block until the load event fires (bounded by --timeout seconds):
+cargo run --features cli --bin camoufox -- navigate <instance_id> <page_id> https://example.com \
+    --wait-until load --timeout 30
+
+# Or wait only until DOMContentLoaded:
+cargo run --features cli --bin camoufox -- navigate <instance_id> <page_id> https://example.com \
+    --wait-until domcontentloaded --timeout 15
+
+# --wait-until accepts: load, domcontentloaded. Any other value is an error.
+# navigate always succeeds even on 4xx/5xx responses.
+# --json output includes status_code (final main-document HTTP status after following
+# all redirects; null if uncapturable, e.g. about: pages or navigation errors):
+#   { "ok": true, "data": { "navigation_id": "...", "status_code": 200 } }
+```
+
+Export the session cookie jar:
+
+```bash
+# Export all cookies for all instances (includes HttpOnly cookies):
+cargo run --features cli --bin camoufox -- cookies <instance_id>
+
+# --json returns full cookie objects (name, value, domain, path, httpOnly, secure, ...):
+cargo run --features cli --bin camoufox -- --json cookies <instance_id>
+
+# The exported jar can drive host-side fetches without in-session XHR:
+#   curl --cookie "name=value" https://example.com/gated-endpoint
+```
+
 Take a screenshot:
 
 ```bash

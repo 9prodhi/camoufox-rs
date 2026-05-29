@@ -138,12 +138,11 @@ mod tests {
     use serde_json::json;
 
     fn capture_stdout<F: FnOnce()>(f: F) -> String {
-        // We cannot easily capture stdout in a unit test without a crate, so
-        // instead we call `print_response` and inspect that it does not panic,
-        // then validate the JSON mode path via `serde_json::to_string_pretty`.
-        // The human-mode path is validated by calling `print_response` and
-        // ensuring the call completes without panicking.
-        let _ = f; // suppress unused warning
+        // We don't capture stdout here (would need an extra crate); the
+        // invariant under test is that `print_response` runs to completion
+        // without panicking. Actually invoke the closure so the real
+        // `print_response` code path is exercised.
+        f();
         String::new()
     }
 

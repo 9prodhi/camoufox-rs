@@ -407,7 +407,7 @@ impl InstanceManager {
             .map_err(|e| format!("get_cookies failed: {e}"))?;
         let values: Vec<serde_json::Value> = cookies
             .iter()
-            .map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null))
+            .map(|c| serde_json::to_value(c).expect("Cookie is always serializable"))
             .collect();
         Ok(values)
     }

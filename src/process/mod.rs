@@ -4,8 +4,9 @@
 //!
 //! 1. **Spawning** ([`unix::spawn`]): Launch the browser with fd 3/4 pipe
 //!    transport configured via `pre_exec` + `dup2`.
-//! 2. **Readiness** ([`readiness::wait_for_ready`]): Watch stderr for the
-//!    `"Juggler listening to the pipe"` sentinel string.
+//! 2. **Readiness** ([`readiness::wait_for_ready`]): Watch both stdout and
+//!    stderr for a Juggler readiness banner (the stream and exact wording
+//!    vary across Camoufox builds).
 //! 3. **Lifecycle** ([`lifecycle::graceful_shutdown`]): Gracefully shut down
 //!    the browser, falling back to `kill` on timeout.
 //!

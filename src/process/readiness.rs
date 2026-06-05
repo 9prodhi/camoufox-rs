@@ -1,26 +1,44 @@
 //! Readiness detection for the Camoufox browser process.
 //!
-//! After spawning, Camoufox writes `"Juggler pipe initialized\n"` to stderr
-//! once the Juggler engine is initialized and the pipe transport is ready to
-//! accept commands (see PROTOCOL.md section 2 & 12).
+//! After spawning, Camoufox prints a readiness banner once the Juggler engine
+//! is initialized and the fd 3/4 pipe transport is ready to accept commands
+//! (see PROTOCOL.md section 2 & 12).
 //!
-//! This module watches stderr for that sentinel string, with a configurable
-//! timeout. If the process exits or the timeout expires before the sentinel
-//! appears, an appropriate error is returned.
+//! The exact banner — and the stream it lands on — varies across builds:
+//!
+//! - Some Camoufox builds emit `"Juggler pipe initialized"` (patched message).
+//! - Stock Playwright Firefox / recent Camoufox builds (e.g. 150.0.2-beta.25)
+//!   emit `"Juggler listening to the pipe"` **on stdout**, not stderr.
+//!
+//! To be robust across builds, this module watches **both** stdout and stderr
+//! and accepts **either** banner. It keeps draining both streams after the
+//! banner is seen, so that a long-lived browser logging to stdout/stderr can
+//! never fill its pipe buffer and deadlock.
 
 use crate::process::ProcessError;
 
-use std::io::{BufRead, BufReader};
-use std::process::{Child, ChildStderr};
+use std::io::{BufRead, BufReader, Read};
+use std::process::Child;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// The sentinel string that Camoufox writes to stderr when the Juggler pipe
-/// transport is initialized and ready to accept commands.
+/// Readiness banner used by older Camoufox builds (patched Juggler message).
 ///
-/// Camoufox outputs `"Juggler pipe initialized"` (via its patched Juggler),
-/// which differs from vanilla Playwright Firefox's `"Juggler listening to the pipe"`.
+/// Retained as the canonical constant referenced by tests; the full set of
+/// accepted banners is [`READINESS_SENTINELS`].
 const READINESS_SENTINEL: &str = "Juggler pipe initialized";
+
+/// All readiness banners accepted across Camoufox / Playwright-Firefox builds.
+///
+/// `contains` matching is used, so a timestamped or prefixed line still
+/// matches. The vanilla Playwright banner (`"Juggler listening to the pipe"`)
+/// is emitted on **stdout**, which is why readiness watches both streams.
+const READINESS_SENTINELS: &[&str] = &["Juggler listening to the pipe", READINESS_SENTINEL];
+
+/// Returns true if `line` contains any accepted readiness banner.
+fn is_ready_line(line: &str) -> bool {
+    READINESS_SENTINELS.iter().any(|s| line.contains(s))
+}
 
 /// Outcome of the stderr reader thread.
 enum ReadResult {
@@ -34,134 +52,164 @@ enum ReadResult {
     Error(std::io::Error),
 }
 
-/// Wait for the Camoufox process to signal readiness on stderr.
+/// Wait for the Camoufox process to signal readiness on stdout or stderr.
 ///
-/// Spawns a background thread that reads from the child's stderr line by line,
-/// looking for the `READINESS_SENTINEL` substring. Uses a channel with
-/// timeout to enforce the deadline.
+/// Spawns one background reader thread per available output stream (stdout and
+/// stderr). Each thread scans line by line for any banner in
+/// [`READINESS_SENTINELS`]. The first thread to see a banner reports `Ready`;
+/// whichever stream it appeared on no longer matters. Uses a channel with a
+/// deadline to enforce the timeout.
+///
+/// After signalling, the reader threads keep draining their streams to EOF so
+/// a long-lived browser cannot fill a pipe buffer and deadlock.
 ///
 /// # Arguments
 ///
-/// * `child` - The spawned child process. Its `stderr` will be taken
-///   (consumed) by this function. After this call, `child.stderr` is `None`.
-/// * `timeout` - Maximum time to wait for the sentinel string.
+/// * `child` - The spawned child process. Its `stdout` and `stderr` are taken
+///   (consumed) by this function. After this call, both are `None`.
+/// * `timeout` - Maximum time to wait for a readiness banner.
 ///
 /// # Returns
 ///
-/// * `Ok(stderr_output)` - The sentinel was found. Returns all stderr output
-///   collected up to that point (useful for logging/debugging).
-/// * `Err(ProcessError::ExitedBeforeReady)` - The process exited before the
-///   sentinel appeared.
-/// * `Err(ProcessError::Timeout)` - The timeout expired. The child process
-///   is still running; the caller should kill it.
-/// * `Err(ProcessError::Io)` - An I/O error occurred reading stderr, or
-///   stderr was not piped.
+/// * `Ok(output)` - A banner was found. Returns the output collected from the
+///   stream it appeared on, up to and including the banner line.
+/// * `Err(ProcessError::ExitedBeforeReady)` - All watched streams reached EOF
+///   (the process exited) before any banner appeared.
+/// * `Err(ProcessError::Timeout)` - The timeout expired. The child process is
+///   still running; the caller should kill it.
+/// * `Err(ProcessError::Io)` - Neither stdout nor stderr was piped.
 pub fn wait_for_ready(child: &mut Child, timeout: Duration) -> Result<String, ProcessError> {
-    // Take ownership of stderr. If it was not piped, return an error.
-    let stderr: ChildStderr = child.stderr.take().ok_or_else(|| {
-        ProcessError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "child stderr is not piped (was it already taken?)",
-        ))
-    })?;
-
     let (tx, rx) = mpsc::channel::<ReadResult>();
 
-    // Spawn a reader thread. This thread owns the stderr handle and reads
-    // line by line until it finds the sentinel, hits EOF, or encounters an
-    // I/O error.
-    std::thread::Builder::new()
-        .name("camoufox-stderr-reader".into())
-        .spawn(move || {
-            stderr_reader(stderr, tx);
-        })
-        .map_err(ProcessError::Io)?;
+    // Spawn a reader per available stream. At least one must be piped.
+    let mut readers = 0u32;
 
-    // Wait for the reader thread to report, with timeout.
+    if let Some(stdout) = child.stdout.take() {
+        let tx = tx.clone();
+        std::thread::Builder::new()
+            .name("camoufox-stdout-reader".into())
+            .spawn(move || stream_reader("stdout", stdout, tx))
+            .map_err(ProcessError::Io)?;
+        readers += 1;
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        let tx = tx.clone();
+        std::thread::Builder::new()
+            .name("camoufox-stderr-reader".into())
+            .spawn(move || stream_reader("stderr", stderr, tx))
+            .map_err(ProcessError::Io)?;
+        readers += 1;
+    }
+
+    // Drop the original sender so the channel disconnects once every reader
+    // thread (each holding a clone) has finished.
+    drop(tx);
+
+    if readers == 0 {
+        return Err(ProcessError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "neither child stdout nor stderr is piped (were they already taken?)",
+        )));
+    }
+
     let deadline = Instant::now() + timeout;
-    let result = rx.recv_timeout(timeout);
+    // Track outstanding readers; only when ALL of them EOF without a banner do
+    // we conclude the process exited before becoming ready.
+    let mut active = readers;
+    let mut last_output = String::new();
 
-    match result {
-        Ok(ReadResult::Ready(output)) => Ok(output),
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(ReadResult::Ready(output)) => return Ok(output),
 
-        Ok(ReadResult::Eof(output)) => {
-            // Process stderr closed. Check if the process has exited.
-            let code = child.try_wait().ok().flatten().and_then(|s| s.code());
-            Err(ProcessError::ExitedBeforeReady {
-                code,
-                stderr: output,
-            })
-        }
+            Ok(ReadResult::Eof(output)) => {
+                if !output.is_empty() {
+                    last_output = output;
+                }
+                active -= 1;
+                if active == 0 {
+                    let code = child.try_wait().ok().flatten().and_then(|s| s.code());
+                    return Err(ProcessError::ExitedBeforeReady {
+                        code,
+                        stderr: last_output,
+                    });
+                }
+            }
 
-        Ok(ReadResult::Error(e)) => Err(ProcessError::Io(e)),
+            Ok(ReadResult::Error(e)) => {
+                // Treat a read error on one stream as that reader finishing;
+                // keep waiting on the other stream if it is still alive.
+                log::warn!("readiness stream read error: {e}");
+                active -= 1;
+                if active == 0 {
+                    return Err(ProcessError::Io(e));
+                }
+            }
 
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // The reader thread may still be running (blocking on stderr read).
-            // We report timeout; the caller is responsible for killing the
-            // child, which will cause the reader thread to see EOF and exit.
-            //
-            // Try to collect any stderr output that may have been captured.
-            // We cannot get it from the reader thread easily, so we report
-            // what we know.
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let _ = remaining;
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(ProcessError::Timeout {
+                    timeout,
+                    stderr: last_output,
+                });
+            }
 
-            // Give the reader thread a brief moment to send a partial result
-            // in case it finished just after the timeout.
-            let stderr_output = match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(ReadResult::Eof(s)) | Ok(ReadResult::Ready(s)) => s,
-                _ => String::new(),
-            };
-
-            Err(ProcessError::Timeout {
-                timeout,
-                stderr: stderr_output,
-            })
-        }
-
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            // The reader thread panicked or was dropped without sending.
-            // Check if the process exited.
-            let code = child.try_wait().ok().flatten().and_then(|s| s.code());
-            Err(ProcessError::ExitedBeforeReady {
-                code,
-                stderr: String::new(),
-            })
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // All readers dropped their senders without a banner.
+                let code = child.try_wait().ok().flatten().and_then(|s| s.code());
+                return Err(ProcessError::ExitedBeforeReady {
+                    code,
+                    stderr: last_output,
+                });
+            }
         }
     }
 }
 
-/// Background function that reads stderr line by line and looks for the
-/// readiness sentinel.
+/// Background function that reads one stream line by line, looking for any
+/// readiness banner.
 ///
-/// Sends exactly one [`ReadResult`] on the channel before returning.
-fn stderr_reader(stderr: ChildStderr, tx: mpsc::Sender<ReadResult>) {
-    let reader = BufReader::new(stderr);
+/// Sends at most one decisive [`ReadResult`] on the channel: `Ready` when a
+/// banner is seen, otherwise `Eof`/`Error` when the stream ends. After a
+/// `Ready` signal it keeps reading to EOF (discarding the data) so the browser
+/// never blocks on a full pipe buffer.
+fn stream_reader<R: Read>(label: &'static str, stream: R, tx: mpsc::Sender<ReadResult>) {
+    let reader = BufReader::new(stream);
     let mut collected = String::new();
+    let mut signalled = false;
 
     for line_result in reader.lines() {
         match line_result {
             Ok(line) => {
-                log::debug!("browser stderr: {}", line);
-                collected.push_str(&line);
-                collected.push('\n');
-
-                if line.contains(READINESS_SENTINEL) {
-                    let _ = tx.send(ReadResult::Ready(collected));
-                    return;
+                log::debug!("browser {label}: {line}");
+                if !signalled {
+                    if is_ready_line(&line) {
+                        collected.push_str(&line);
+                        collected.push('\n');
+                        let _ = tx.send(ReadResult::Ready(std::mem::take(&mut collected)));
+                        signalled = true;
+                        // Keep draining the stream to EOF below.
+                    } else {
+                        collected.push_str(&line);
+                        collected.push('\n');
+                    }
                 }
             }
             Err(e) => {
-                // I/O error reading stderr (unlikely but possible).
-                log::warn!("stderr read error: {e}");
-                let _ = tx.send(ReadResult::Error(e));
+                log::warn!("{label} read error: {e}");
+                if !signalled {
+                    let _ = tx.send(ReadResult::Error(e));
+                }
                 return;
             }
         }
     }
 
-    // EOF reached — the child closed its stderr (likely exited).
-    let _ = tx.send(ReadResult::Eof(collected));
+    // EOF reached — the child closed this stream (likely exited).
+    if !signalled {
+        let _ = tx.send(ReadResult::Eof(collected));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +380,57 @@ mod tests {
     #[test]
     fn delayed_sentinel_is_detected_within_timeout() {
         let mut child = spawn_delayed_stderr(READINESS_SENTINEL, 0.1);
+        let result = wait_for_ready(&mut child, Duration::from_secs(5));
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn is_ready_line_matches_all_known_banners() {
+        assert!(is_ready_line("Juggler pipe initialized"));
+        assert!(is_ready_line("Juggler listening to the pipe"));
+        assert!(is_ready_line("[ts] Juggler listening to the pipe (extra)"));
+        assert!(!is_ready_line("some unrelated startup noise"));
+    }
+
+    /// Regression: Camoufox 150.0.2-beta.25 prints the vanilla Playwright
+    /// banner `"Juggler listening to the pipe"` on **stdout**, not stderr.
+    /// Readiness must detect it on stdout even when stderr stays silent.
+    #[test]
+    fn detects_vanilla_banner_on_stdout() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            // Banner on stdout; unrelated noise on stderr; then linger briefly.
+            .arg("echo 'noise' >&2; echo 'Juggler listening to the pipe'; sleep 2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+
+        let result = wait_for_ready(&mut child, Duration::from_secs(5));
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        assert!(result.unwrap().contains("Juggler listening to the pipe"));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// With both streams piped, an EOF on one stream must not be mistaken for
+    /// process exit while the other stream is still open and about to emit the
+    /// banner.
+    #[test]
+    fn one_stream_eof_does_not_abort_other() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            // stderr closes immediately (subshell exits); stdout emits the
+            // banner only after a short delay.
+            .arg("( echo 'early' >&2 ) ; sleep 1 ; echo 'Juggler pipe initialized'")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+
         let result = wait_for_ready(&mut child, Duration::from_secs(5));
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
         let _ = child.wait();

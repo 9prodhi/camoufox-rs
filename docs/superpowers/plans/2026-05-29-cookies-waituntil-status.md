@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Fresh subagent per task; spec-then-quality review between tasks. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** Add three capabilities to the camoufox-rs CLI that unblock robust host-side fetching of session-gated content (the G1/G3/G4 gaps from the legal-agent eCourts spike): export the cookie jar incl. HttpOnly cookies; let `navigate` wait for a page lifecycle event; surface the main-document HTTP status in the `navigate` result.
+**Goal:** Add three capabilities to the camoufox-rs CLI that unblock robust host-side fetching of session-gated content (the G1/G3/G4 gaps from a session-gated portal spike): export the cookie jar incl. HttpOnly cookies; let `navigate` wait for a page lifecycle event; surface the main-document HTTP status in the `navigate` result.
 
 **Architecture:** Mirror the existing download-detection fix pattern (commits `b1f5c43`/`fca5698`): thread a new option/result from CLI → daemon IPC → `InstanceManager`/`Instance` → `api` layer → `protocol` layer; subscribe to a Juggler event in the protocol/api layer and resolve it to the blocked caller. All three changes are **purely additive** — a new `cookies` subcommand, an opt-in `--wait-until` flag, and a new `status_code` field on the navigate result — so existing callers keep working.
 
 **Tech Stack:** Rust; clap CLI + Unix-socket daemon (`--features cli`); Juggler protocol over a fd pipe. Unit tests via the in-process `MockTransport`/`SilentMockTransport` pattern; integration tests `#[ignore]`d, run with `cargo test --test integration -- --ignored --test-threads=1` against a live camoufox at `~/.cache/camoufox/camoufox` (or `$CAMOUFOX_BIN`).
 
-**Source of requirements:** `/workspace/legal-agent/docs/superpowers/findings/2026-05-29-ecourts-spike-findings.md` §1 (gaps G1, G3, G4) and the recon report grounding this plan.
+**Source of requirements:** gaps G1, G3, G4 identified during a session-gated portal spike, and the recon report grounding this plan.
 
 **Scope decisions (read before implementing):**
 - **`networkidle` is OUT of scope.** The Juggler protocol exposes no networkidle primitive (`Page.eventFired` gives only `load` and `DOMContentLoaded`). `--wait-until` supports `load` and `domcontentloaded` only; any other value returns a clear error. networkidle (client-side request-tracking) is a documented follow-up.
@@ -49,7 +49,7 @@ Implementers: the download-detection commits `b1f5c43` and `fca5698` are the can
 
 **What:** A new CLI subcommand `camoufox cookies <instance_id>` that returns all cookies for the instance's browser context — including HttpOnly — via the Juggler `Browser.getCookies` root-session RPC. `--json` emits the full cookie objects; human mode prints `name=value` (one per line) plus a count.
 
-**Why:** lets a host-side HTTP client replay a camoufox session to fetch session-gated bodies (the eCourts `PHPSESSID` / Bombay HC cookie cases) — retiring the in-session XHR workaround.
+**Why:** lets a host-side HTTP client replay a camoufox session to fetch session-gated bodies (e.g. `PHPSESSID`-style session-cookie cases) — retiring the in-session XHR workaround.
 
 **Files:** `src/cli/commands.rs`, `src/cli/ipc.rs`, `src/bin/camoufox.rs`, `src/cli/daemon.rs`, `src/cli/instance.rs`, `src/cli/output.rs`; possibly a thin accessor in `src/api/browser.rs`. Tests: unit in the touched modules + `tests/integration.rs` (+ `tests/fixtures/mod.rs` if a cookie-setting fixture is needed).
 
@@ -70,7 +70,7 @@ Implementers: the download-detection commits `b1f5c43` and `fca5698` are the can
 
 **What:** Add an opt-in `--wait-until <state>` flag to `navigate`. When set, after the `Page.navigate` RPC is acked, block until the matching `Page.eventFired` (`name == "load"` or `name == "DOMContentLoaded"`) fires on the page session, bounded by the existing `--timeout`. Absent flag ⇒ current behavior (return after ack). Unsupported value (incl. `networkidle`) ⇒ a clear `Err`/error response naming the supported set.
 
-**Why:** removes the "sleep and pray" pattern; ensures the DOM/scripts/cookies are settled before extracting URLs or exporting cookies (the Bombay SPA cold-load and eCourts jQuery-not-yet-loaded symptoms).
+**Why:** removes the "sleep and pray" pattern; ensures the DOM/scripts/cookies are settled before extracting URLs or exporting cookies (SPA cold-load and jQuery-not-yet-loaded symptoms).
 
 **Files:** `src/cli/commands.rs` (flag), `src/cli/ipc.rs` (`wait_until: Option<String>`), `src/bin/camoufox.rs`, `src/cli/daemon.rs`, `src/cli/instance.rs`, `src/api/main_frame.rs` (the wait logic + a **reusable `wait_for_page_event(name, timeout)` helper** — Task 4 will reuse it). Tests: unit + integration.
 
@@ -90,7 +90,7 @@ Implementers: the download-detection commits `b1f5c43` and `fca5698` are the can
 
 **What:** Additively include the main-document HTTP `status_code` in the `navigate` result (e.g. `{ navigation_id, status_code }`). Capture it from `Network.responseReceived` for the navigation's main-document request. `navigate` still succeeds on 4xx/5xx — it just reports the status. If the status genuinely cannot be captured, return `status_code: null` (never fail navigate for lack of status).
 
-**Why:** today a 403/404 (e.g. an expired Bombay JWT URL) returns `ok`; callers (incl. our corpus harness) need the status to detect failures.
+**Why:** today a 403/404 (e.g. an expired JWT-signed URL) returns `ok`; callers (incl. a corpus harness) need the status to detect failures.
 
 **Files:** `src/api/main_frame.rs` (capture logic; reuse Task 3's event-wait/collect helper), `src/cli/instance.rs` (thread status out), `src/cli/ipc.rs` (`status_code: Option<u16>` in navigate response data), `src/cli/daemon.rs`, `src/cli/output.rs` (print status). Tests: unit + integration.
 
@@ -113,7 +113,7 @@ Implementers: the download-detection commits `b1f5c43` and `fca5698` are the can
 
 - [ ] **G1 unlock proof:** in one camoufox session, navigate to a site that sets an HttpOnly session cookie, `cookies <inst>` to export it, then a **host-side `curl` carrying that cookie** fetches a session-gated resource successfully — demonstrating the in-session-XHR workaround is no longer required. (Use a benign cookie-gated test endpoint, e.g. httpbin `/cookies/set` → `/cookies`.)
 - [ ] **G3/G4 smoke:** `navigate --wait-until load` on a real page returns post-load; `navigate` to a known 404 reports `status_code:404` without erroring.
-- [ ] **Docs:** update `docs/PROTOCOL.md` notes if needed; add the three commands/flags to `README.md`; add a CHANGELOG/commit note. Cross-reference the legal-agent findings doc gaps G1/G3/G4 as the motivation.
+- [ ] **Docs:** update `docs/PROTOCOL.md` notes if needed; add the three commands/flags to `README.md`; add a CHANGELOG/commit note. Cross-reference gaps G1/G3/G4 as the motivation.
 - [ ] Commit.
 
 **Done when:** the cookie-export → host-fetch path is demonstrated working, and the new CLI surface is documented.

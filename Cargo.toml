@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Pure Rust client for Camoufox browser via the Juggler protocol"
 license = "MIT"
+repository = "https://github.com/9prodhi/camoufox-rs"
 rust-version = "1.70"
 
 [dependencies]

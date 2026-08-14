@@ -2657,7 +2657,7 @@ mod tests {
     /// G4 redirect TDD: a 4-event redirect sequence must report the FINAL
     /// response status, not the redirect hop's.
     ///
-    /// Sequence (mirrors Bombay HC `nic.in → gov.in`, 301 → 200):
+    /// Sequence (mirrors a real cross-host redirect `old.example → new.example`, 301 → 200):
     ///   1. requestWillBeSent A (document, navId)        → locks main = A
     ///   2. responseReceived  A (status 301)             → status = 301
     ///   3. requestWillBeSent B (redirectedFrom = A)     → chain forward main = B

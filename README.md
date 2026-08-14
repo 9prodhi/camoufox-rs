@@ -99,10 +99,80 @@ cargo run --features cli --bin camoufox -- --json cookies <instance_id>
 #   curl --cookie "name=value" https://example.com/gated-endpoint
 ```
 
+Set a cookie or an extra request header:
+
+```bash
+# Bind the cookie to the page's current URL (or pass --url / --domain explicitly):
+cargo run --features cli --bin camoufox -- cookie <instance_id> <page_id> 'session=abc123'
+cargo run --features cli --bin camoufox -- cookie <instance_id> <page_id> 'tracker=xyz' \
+    --domain example.com --path / --secure
+
+# Extra request headers accumulate per page across calls:
+cargo run --features cli --bin camoufox -- header <instance_id> <page_id> 'Accept-Language: fr-FR'
+```
+
+Read the page (no hand-written extraction JS required):
+
+```bash
+# Rendered text, whole page or scoped to a selector:
+cargo run --features cli --bin camoufox -- text <instance_id> <page_id>
+cargo run --features cli --bin camoufox -- text <instance_id> <page_id> --selector 'article'
+
+# outerHTML of one element, or the whole document when --selector is omitted:
+cargo run --features cli --bin camoufox -- html <instance_id> <page_id> --selector h1
+
+# Every <a href> as `text → href`, with hrefs resolved to absolute URLs:
+cargo run --features cli --bin camoufox -- links <instance_id> <page_id>
+
+# Structured metadata; no flag returns og + jsonld + meta together:
+cargo run --features cli --bin camoufox -- data <instance_id> <page_id> --og
+
+# Current URL (stdout) and title (stderr):
+cargo run --features cli --bin camoufox -- url <instance_id> <page_id>
+```
+
+Wait for content to appear:
+
+```bash
+# Polls document.querySelector until it matches, or --timeout seconds elapse:
+cargo run --features cli --bin camoufox -- wait <instance_id> <page_id> \
+    --selector '#results' --timeout 15
+```
+
+Interact with the page (all input is trusted browser-level input):
+
+```bash
+# Click by CSS selector — resolves the element, scrolls it into view, clicks its centre:
+cargo run --features cli --bin camoufox -- click <instance_id> <page_id> '#submit'
+
+# Or dispatch a trusted left-click at raw viewport coordinates (x, y). Because the event
+# originates from the browser (not JavaScript), the page sees isTrusted === true, so it
+# can drive widgets like Cloudflare Turnstile that reject synthetic click events:
+cargo run --features cli --bin camoufox -- click <instance_id> <page_id> 200 300
+
+# Fill a field, then submit with a real Enter keypress:
+cargo run --features cli --bin camoufox -- fill <instance_id> <page_id> 'input[name=q]' camoufox
+cargo run --features cli --bin camoufox -- press <instance_id> <page_id> Enter
+
+# Also available: type <text>, hover <selector>, select <selector> <value>, scroll [selector]
+```
+
 Take a screenshot:
 
 ```bash
+# Current viewport:
 cargo run --features cli --bin camoufox -- screenshot <instance_id> <page_id> --format png -o /tmp/example.png
+
+# Cropped to one element (scrolled into view first), or to an explicit region:
+cargo run --features cli --bin camoufox -- screenshot <instance_id> <page_id> --selector 'article' -o /tmp/article.png
+cargo run --features cli --bin camoufox -- screenshot <instance_id> <page_id> --clip 0,0,800,600 -o /tmp/region.png
+```
+
+Manage pages as tabs:
+
+```bash
+cargo run --features cli --bin camoufox -- tabs <instance_id>
+cargo run --features cli --bin camoufox -- close-tab <instance_id> <page_id>
 ```
 
 Inspect and stop:
@@ -278,6 +348,13 @@ RUST_LOG=camoufox=trace cargo test
 - API is synchronous/blocking today (no async runtime integration)
 - `MainFrame` is top-frame only; there is no public API for operating on sub-frames
 - CLI daemon uses in-memory instance state only
+- CLI daemon executes commands **serially** — it holds a single lock for the duration of each
+  request across all instances. A long-polling command (e.g. `wait --timeout 60`) on one page
+  therefore blocks every other instance and page until it returns. Fine for driving a single
+  browser; keep timeouts tight if you drive multiple instances from one daemon.
+- `back` / `forward` are wired to `Page.goBack` / `Page.goForward` but are inert against the
+  Camoufox builds tested here: pages created via `Browser.newPage` expose no session history
+  (`history.length === 0`), so both always report "no history entry". Re-`navigate` instead.
 
 ## License
 

@@ -508,7 +508,7 @@ fn navigate_reports_main_document_status_code() {
 fn navigate_reports_final_status_after_redirect() {
     // G4 redirect integration test: navigating to a URL that 302-redirects to
     // a 200 page must report the FINAL status (200), NOT the redirect hop
-    // (302). This is the Bombay HC `nic.in → gov.in` (301 → 200) case.
+    // (302). This is a real-world cross-host redirect (`old.example → new.example`, 301 → 200).
     //
     // Run with:
     //   cargo test --test integration -- --ignored \
@@ -541,4 +541,445 @@ fn navigate_reports_final_status_after_redirect() {
     );
 
     tb.teardown();
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn click_command_dispatches_trusted_event_at_coordinates() {
+    // Regression test for the trusted-click feature (the daemon `click` command).
+    //
+    // `click` dispatches Page.dispatchMouseEvent (a real mousemove → mousedown
+    // → mouseup) instead of a synthetic JS .click() for one reason: the browser
+    // reports the resulting event as `isTrusted == true`. Untrusted events
+    // cannot drive protected widgets like Cloudflare Turnstile, so if this ever
+    // regresses to an untrusted event the feature is silently gutted while
+    // still appearing to "click".
+    //
+    // This exercises the exact daemon code path added by the click patch:
+    //   InstanceManager::click → Instance::click → three
+    //   MainFrame::dispatch_mouse_event calls (mousemove/mousedown/mouseup).
+    //
+    // The fixture page arms a capture-phase click listener that records the
+    // last click into window.__click_result. We assert the listener fired with
+    // isTrusted == true at the dispatched coordinates.
+    //
+    // Run with (requires the `cli` feature — the `click` command only exists
+    // under it):
+    //   cargo test --test integration --features cli -- --ignored \
+    //       click_command_dispatches_trusted_event_at_coordinates \
+    //       --test-threads=1
+    use camoufox::cli::instance::InstanceManager;
+
+    // Coordinates well inside the default headless viewport.
+    const CLICK_X: i32 = 200;
+    const CLICK_Y: i32 = 300;
+
+    let server = fixtures::ClickServer::start();
+
+    let mut manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch(Some(true), Some(&camoufox_bin()))
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+
+    // Block until `load` so the inline listener is guaranteed armed.
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &server.url,
+            Duration::from_secs(30),
+            Some("load"),
+        )
+        .expect("navigate to click fixture failed");
+
+    // Dispatch the trusted click via the exact daemon path under test.
+    manager
+        .click(&instance_id, &page_id, CLICK_X, CLICK_Y)
+        .expect("click failed");
+
+    // Read back the recorded event field by field, operating on the returned
+    // serde_json::Value via its inherent accessors — matching this file's
+    // evaluate-result convention (no serde_json import needed).
+    let trusted = manager
+        .evaluate(
+            &instance_id,
+            &page_id,
+            "window.__click_result && window.__click_result.trusted",
+            Duration::from_secs(10),
+        )
+        .expect("evaluate trusted failed");
+    let client_x = manager
+        .evaluate(
+            &instance_id,
+            &page_id,
+            "window.__click_result ? window.__click_result.x : -1",
+            Duration::from_secs(10),
+        )
+        .expect("evaluate clientX failed");
+    let client_y = manager
+        .evaluate(
+            &instance_id,
+            &page_id,
+            "window.__click_result ? window.__click_result.y : -1",
+            Duration::from_secs(10),
+        )
+        .expect("evaluate clientY failed");
+
+    // Stop the browser before asserting so a failed assertion can't leak it.
+    let _ = manager.stop(&instance_id);
+
+    // The load-bearing assertion: the event must be TRUSTED. `None` means the
+    // listener never fired (no click registered); `Some(false)` means the event
+    // was synthetic/untrusted and would be rejected by bot-screen widgets.
+    assert_eq!(
+        trusted.as_bool(),
+        Some(true),
+        "click must dispatch a TRUSTED event (isTrusted == true); got {trusted:?}. \
+         null = click never registered; false = untrusted (cannot drive Turnstile)."
+    );
+    assert_eq!(
+        client_x.as_i64(),
+        Some(CLICK_X as i64),
+        "event clientX must equal the dispatched x ({CLICK_X}); got {client_x:?}"
+    );
+    assert_eq!(
+        client_y.as_i64(),
+        Some(CLICK_Y as i64),
+        "event clientY must equal the dispatched y ({CLICK_Y}); got {client_y:?}"
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn reading_commands_extract_text_html_links_and_metadata() {
+    // Covers the Tier-1 reading commands added to the daemon:
+    //   InstanceManager::{text, html, links, data, url}
+    //     → Instance::eval_checked → MainFrame::evaluate
+    //
+    // These exist so an agent never has to hand-write extraction JS. The
+    // load-bearing properties are: `text` returns rendered text (not markup),
+    // `html` returns the element's outerHTML, `links` resolves hrefs to
+    // absolute URLs, and `data` splits metadata into og/jsonld/meta groups.
+    //
+    // Run with:
+    //   cargo test --test integration --features cli -- --ignored \
+    //       reading_commands_extract_text_html_links_and_metadata \
+    //       --test-threads=1
+    use camoufox::cli::instance::InstanceManager;
+
+    let server = fixtures::BrowseServer::start();
+
+    let mut manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch(Some(true), Some(&camoufox_bin()))
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &server.url,
+            Duration::from_secs(30),
+            Some("load"),
+        )
+        .expect("navigate to browse fixture failed");
+
+    let timeout = Duration::from_secs(10);
+    let full_text = manager.text(&instance_id, &page_id, None, timeout);
+    let scoped_text = manager.text(&instance_id, &page_id, Some("#body-copy"), timeout);
+    let missing_text = manager.text(&instance_id, &page_id, Some("#nope"), timeout);
+    let scoped_html = manager.html(&instance_id, &page_id, Some("#heading"), timeout);
+    let links = manager.links(&instance_id, &page_id, None, timeout);
+    let og = manager.data(&instance_id, &page_id, true, false, false, timeout);
+    let all = manager.data(&instance_id, &page_id, false, false, false, timeout);
+    let url = manager.url(&instance_id, &page_id, timeout);
+
+    // Stop the browser before asserting so a failed assertion can't leak it.
+    let _ = manager.stop(&instance_id);
+
+    let full_text = full_text.expect("text failed");
+    assert!(
+        full_text.contains("Browse Fixture") && full_text.contains("Readable body copy."),
+        "text must return rendered page text; got {full_text:?}"
+    );
+    assert!(
+        !full_text.contains('<'),
+        "text must not contain markup; got {full_text:?}"
+    );
+
+    assert_eq!(
+        scoped_text.expect("scoped text failed"),
+        "Readable body copy.",
+        "--selector scopes extraction to that element"
+    );
+    let err = missing_text.expect_err("a missing selector must be an error, not empty output");
+    assert!(err.contains("selector not found"), "got: {err}");
+
+    assert_eq!(
+        scoped_html.expect("scoped html failed"),
+        "<h1 id=\"heading\">Browse Fixture</h1>",
+        "html --selector returns outerHTML"
+    );
+
+    let links = links.expect("links failed");
+    let links = links.as_array().expect("links is an array");
+    assert_eq!(links.len(), 2, "both anchors collected: {links:?}");
+    assert_eq!(links[0]["text"], "One");
+    assert_eq!(
+        links[0]["href"], "https://example.invalid/one",
+        "hrefs are resolved to absolute URLs"
+    );
+
+    let og = og.expect("data --og failed");
+    assert_eq!(og["og"]["og:title"], "Fixture OG Title");
+    assert_eq!(og["og"]["og:image"], "https://example.invalid/og.png");
+    assert!(
+        og.get("jsonld").is_none() && og.get("meta").is_none(),
+        "--og returns only the og group; got {og:?}"
+    );
+
+    let all = all.expect("data (no flags) failed");
+    assert_eq!(
+        all["jsonld"][0]["@type"], "WebPage",
+        "JSON-LD blocks are parsed, not returned as raw strings"
+    );
+    assert_eq!(all["meta"]["description"], "fixture description");
+    assert!(all.get("og").is_some(), "no flags means all three groups");
+
+    let (page_url, title) = url.expect("url failed");
+    assert_eq!(page_url, server.url);
+    assert_eq!(title, "Browse Fixture");
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn interaction_commands_fill_press_and_click_by_selector() {
+    // Covers the Tier-4 interaction commands:
+    //   InstanceManager::{fill, press, click_selector, select_option, hover}
+    //
+    // REGRESSION GUARD for the `press` keydown path: Juggler routes a keydown
+    // through `commitCompositionWith` whenever `text` is present and differs
+    // from `key`, so sending Enter with text "\r" arrives at the page as
+    // `key === "Process"` and never submits a form. `key_descriptor` therefore
+    // omits `text` entirely. If that regresses, the submit assertion below
+    // fails while every other key still appears to "work".
+    //
+    // Run with:
+    //   cargo test --test integration --features cli -- --ignored \
+    //       interaction_commands_fill_press_and_click_by_selector \
+    //       --test-threads=1
+    use camoufox::cli::instance::InstanceManager;
+
+    let server = fixtures::BrowseServer::start();
+
+    let mut manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch(Some(true), Some(&camoufox_bin()))
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &server.url,
+            Duration::from_secs(30),
+            Some("load"),
+        )
+        .expect("navigate to browse fixture failed");
+
+    let timeout = Duration::from_secs(10);
+
+    let filled = manager.fill(&instance_id, &page_id, "#q", "hello world", timeout);
+    let input_value = manager.evaluate(
+        &instance_id,
+        &page_id,
+        "document.getElementById('q').value",
+        timeout,
+    );
+    // Enter must submit the form — the composition-commit regression guard.
+    let pressed = manager.press(&instance_id, &page_id, "Enter");
+    let clicked = manager.click_selector(&instance_id, &page_id, "#go", timeout);
+    let selected = manager.select_option(&instance_id, &page_id, "#sel", "Beta", timeout);
+    let hovered = manager.hover(&instance_id, &page_id, "#heading", timeout);
+    let missing = manager.click_selector(&instance_id, &page_id, "#nope", timeout);
+    let log = manager.text(&instance_id, &page_id, Some("#log"), timeout);
+
+    let _ = manager.stop(&instance_id);
+
+    assert_eq!(
+        filled.expect("fill failed"),
+        "input",
+        "fill reports the tag"
+    );
+    assert_eq!(
+        input_value.expect("evaluate failed").as_str(),
+        Some("hello world"),
+        "fill types the value into the element"
+    );
+    pressed.expect("press Enter failed");
+    let (x, y) = clicked.expect("click by selector failed");
+    assert!(x > 0 && y > 0, "click resolved a real box, got ({x}, {y})");
+    let selected = selected.expect("select failed");
+    assert_eq!(selected["value"], "b", "select matches by visible text too");
+    hovered.expect("hover failed");
+    let err = missing.expect_err("clicking a missing selector must error");
+    assert!(err.contains("selector not found"), "got: {err}");
+
+    let log = log.expect("reading the log failed");
+    assert!(
+        log.contains("submit:hello world"),
+        "press Enter must submit the form — if this line is missing, the keydown \
+         was delivered as an IME composition commit (key === \"Process\"). Log was: {log:?}"
+    );
+    assert!(
+        log.contains("click:go"),
+        "click by selector must fire the button's handler. Log was: {log:?}"
+    );
+    assert!(
+        log.contains("change:b"),
+        "select must dispatch a change event. Log was: {log:?}"
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn screenshot_default_clip_uses_scroll_offset() {
+    // REGRESSION GUARD for the screenshot default-clip behavior change.
+    //
+    // `screenshot` with no --selector/--clip previously always clipped to
+    // (0, 0, innerWidth, innerHeight) in *document* coordinates, so a scrolled
+    // page was captured from the top of the document rather than what was on
+    // screen. The default clip origin is now (window.scrollX, window.scrollY).
+    //
+    // This drives the exact path: InstanceManager::screenshot →
+    // Instance::screenshot → the (None, None) viewport branch. We make the page
+    // tall, scroll to a known offset, take a default screenshot, and assert the
+    // RESOLVED clip rect's origin equals the scroll offset (not 0). No pixel
+    // inspection needed — the returned Rect is the load-bearing evidence.
+    //
+    // Run with:
+    //   cargo test --test integration --features cli -- --ignored \
+    //       screenshot_default_clip_uses_scroll_offset --test-threads=1
+    use camoufox::cli::instance::InstanceManager;
+
+    let server = fixtures::BrowseServer::start();
+
+    let mut manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch(Some(true), Some(&camoufox_bin()))
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &server.url,
+            Duration::from_secs(30),
+            Some("load"),
+        )
+        .expect("navigate to browse fixture failed");
+
+    let timeout = Duration::from_secs(10);
+
+    // Make the document scrollable and scroll to a known offset.
+    let scroll_y = manager
+        .evaluate(
+            &instance_id,
+            &page_id,
+            "document.body.style.height = '5000px'; window.scrollTo(0, 600); window.scrollY",
+            timeout,
+        )
+        .expect("scroll setup failed");
+
+    let mut out_path = std::env::temp_dir();
+    out_path.push("camoufox-scroll-clip-test.png");
+    let shot = manager.screenshot(
+        &instance_id,
+        &page_id,
+        Some("png"),
+        None,
+        Some(out_path.to_str().unwrap()),
+        None, // no selector
+        None, // no explicit clip → viewport default
+        timeout,
+    );
+
+    let _ = manager.stop(&instance_id);
+    let _ = std::fs::remove_file(&out_path);
+
+    assert_eq!(
+        scroll_y.as_f64(),
+        Some(600.0),
+        "precondition: page scrolled to y=600; got {scroll_y:?}"
+    );
+    let (_bytes, _path, rect) = shot.expect("screenshot failed");
+    assert!(
+        (rect.y - 600.0).abs() < 1.0,
+        "default screenshot clip origin must follow the scroll offset (y≈600), \
+         NOT the document top (y=0). Got clip.y={}. A y of 0 means the pre-fix \
+         behavior regressed.",
+        rect.y
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn wait_fails_fast_on_invalid_selector() {
+    // REGRESSION GUARD for wait_for_selector's permanent-vs-transient error
+    // handling. An invalid CSS selector makes document.querySelector throw a
+    // SyntaxError (a page-script error) — permanent. wait must fail fast with
+    // the real error instead of retrying until the whole --timeout elapses
+    // (which also holds the global daemon lock the entire time).
+    //
+    // Run with:
+    //   cargo test --test integration --features cli -- --ignored \
+    //       wait_fails_fast_on_invalid_selector --test-threads=1
+    use camoufox::cli::instance::InstanceManager;
+
+    let server = fixtures::BrowseServer::start();
+
+    let mut manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch(Some(true), Some(&camoufox_bin()))
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &server.url,
+            Duration::from_secs(30),
+            Some("load"),
+        )
+        .expect("navigate to browse fixture failed");
+
+    // A generous timeout: if wait erroneously retries a permanent error, it
+    // burns all 30s. Fail-fast must return in well under a second.
+    let started = std::time::Instant::now();
+    let result = manager.wait_for_selector(
+        &instance_id,
+        &page_id,
+        ":::not-a-selector",
+        Duration::from_secs(30),
+    );
+    let elapsed = started.elapsed();
+
+    let _ = manager.stop(&instance_id);
+
+    let err = result.expect_err("an invalid selector must be an error, not a match");
+    assert!(
+        err.contains("invalid selector"),
+        "error must name the bad selector, not report a generic timeout; got: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "wait must fail fast on a permanent (invalid-selector) error, not burn the \
+         full 30s timeout. Took {elapsed:?}."
+    );
 }

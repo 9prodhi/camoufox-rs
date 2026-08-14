@@ -408,3 +408,173 @@ impl StatusServer {
 impl Drop for StatusServer {
     fn drop(&mut self) {}
 }
+
+/// A single-port HTTP server that serves a page with a full-viewport
+/// `#target` div and a capture-phase click listener pre-armed in the page.
+/// The listener records the most recent click into `window.__click_result`
+/// as `{ trusted, x, y, tag, id }`.
+///
+/// Used by the trusted-click integration test
+/// (`click_command_dispatches_trusted_event_at_coordinates`) to prove the
+/// `click` command dispatches a genuinely trusted event (`isTrusted == true`)
+/// at the requested viewport coordinates — the property that lets it drive
+/// bot-screen widgets like Cloudflare Turnstile, which reject synthetic
+/// (untrusted) events. Gated on `cli` because its only consumer is the
+/// cli-feature test.
+#[cfg(feature = "cli")]
+pub struct ClickServer {
+    /// URL of the click-target page.
+    pub url: String,
+    _server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl ClickServer {
+    /// Start on an ephemeral port.
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").expect("bind click server"));
+        let port = server.server_addr().to_ip().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/");
+
+        const PAGE_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Click Test</title>
+<style>
+  html, body { margin: 0; padding: 0; }
+  /* Full-viewport target so a click anywhere inside the viewport lands here. */
+  #target { position: fixed; inset: 0; }
+</style>
+</head>
+<body>
+<div id="target">click target</div>
+<script>
+  // Record the most recent click so the test can assert isTrusted + coords.
+  window.__click_result = null;
+  document.addEventListener('click', function (e) {
+    window.__click_result = {
+      trusted: e.isTrusted,
+      x: e.clientX,
+      y: e.clientY,
+      tag: e.target.tagName,
+      id: e.target.id
+    };
+  }, true);
+</script>
+</body>
+</html>"#;
+
+        let body = PAGE_HTML.as_bytes().to_vec();
+        let server_clone = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in server_clone.incoming_requests() {
+                let resp = Response::new(
+                    200.into(),
+                    vec![Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    )
+                    .unwrap()],
+                    Cursor::new(body.clone()),
+                    Some(body.len()),
+                    None,
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        ClickServer {
+            url,
+            _server: server,
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+impl Drop for ClickServer {
+    fn drop(&mut self) {}
+}
+
+// ---------------------------------------------------------------------------
+// BrowseServer — fixture for the reading + interaction CLI commands
+// ---------------------------------------------------------------------------
+
+/// Serves one page carrying everything the reading and interaction commands
+/// need to assert against: Open Graph tags, a JSON-LD block, named meta tags,
+/// links, a form with an input/button/select, and a JS log the test reads back.
+#[cfg(feature = "cli")]
+pub struct BrowseServer {
+    /// URL of the browse fixture page.
+    pub url: String,
+    _server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl BrowseServer {
+    /// Start on an ephemeral port.
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").expect("bind browse server"));
+        let port = server.server_addr().to_ip().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/");
+
+        const PAGE_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Browse Fixture</title>
+<meta name="description" content="fixture description">
+<meta property="og:title" content="Fixture OG Title">
+<meta property="og:image" content="https://example.invalid/og.png">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"Fixture"}</script>
+</head>
+<body>
+<h1 id="heading">Browse Fixture</h1>
+<p id="body-copy">Readable body copy.</p>
+<a href="https://example.invalid/one">One</a>
+<a href="https://example.invalid/two">Two</a>
+<form id="f" onsubmit="log('submit:' + document.getElementById('q').value); return false;">
+  <input id="q" name="q">
+  <button id="go" type="button" onclick="log('click:go')">Go</button>
+</form>
+<select id="sel" onchange="log('change:' + document.getElementById('sel').value)">
+  <option value="a">Alpha</option>
+  <option value="b">Beta</option>
+</select>
+<div id="log"></div>
+<script>
+  function log(m) { document.getElementById('log').textContent += m + '\n'; }
+</script>
+</body>
+</html>"#;
+
+        let body = PAGE_HTML.as_bytes().to_vec();
+        let server_clone = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in server_clone.incoming_requests() {
+                let resp = Response::new(
+                    200.into(),
+                    vec![Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    )
+                    .unwrap()],
+                    Cursor::new(body.clone()),
+                    Some(body.len()),
+                    None,
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        BrowseServer {
+            url,
+            _server: server,
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+impl Drop for BrowseServer {
+    fn drop(&mut self) {}
+}

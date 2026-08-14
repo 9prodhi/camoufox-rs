@@ -190,12 +190,43 @@ fn dispatch(request: DaemonRequest, manager: &Arc<Mutex<InstanceManager>>) -> Da
             }
         }
 
+        DaemonRequest::Click {
+            instance_id,
+            page_id,
+            x,
+            y,
+        } => {
+            let mgr = manager.lock().unwrap();
+            match mgr.click(&instance_id, &page_id, x, y) {
+                Ok(()) => DaemonResponse::ok(json!({ "clicked": true, "x": x, "y": y })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::ClickSelector {
+            instance_id,
+            page_id,
+            selector,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.click_selector(&instance_id, &page_id, &selector, timeout) {
+                Ok((x, y)) => DaemonResponse::ok(json!({
+                    "clicked": true, "selector": selector, "x": x, "y": y,
+                })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
         DaemonRequest::Screenshot {
             instance_id,
             page_id,
             format,
             quality,
             path,
+            selector,
+            clip,
             timeout_secs,
         } => {
             let mgr = manager.lock().unwrap();
@@ -206,11 +237,17 @@ fn dispatch(request: DaemonRequest, manager: &Arc<Mutex<InstanceManager>>) -> Da
                 format.as_deref(),
                 quality,
                 path.as_deref(),
+                selector.as_deref(),
+                clip,
                 timeout,
             ) {
-                Ok((bytes, out_path)) => DaemonResponse::ok(json!({
+                Ok((bytes, out_path, rect)) => DaemonResponse::ok(json!({
                     "bytes": bytes.len(),
                     "path": out_path,
+                    "clip": {
+                        "x": rect.x, "y": rect.y,
+                        "width": rect.width, "height": rect.height,
+                    },
                 })),
                 Err(e) => DaemonResponse::err(e),
             }
@@ -225,6 +262,310 @@ fn dispatch(request: DaemonRequest, manager: &Arc<Mutex<InstanceManager>>) -> Da
             let mgr = manager.lock().unwrap();
             match mgr.cookies(&instance_id) {
                 Ok(cookies) => DaemonResponse::ok(json!({ "cookies": cookies })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Reading
+        // -------------------------------------------------------------------
+        DaemonRequest::Text {
+            instance_id,
+            page_id,
+            selector,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.text(&instance_id, &page_id, selector.as_deref(), timeout) {
+                Ok(text) => DaemonResponse::ok(json!({ "text": text })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Html {
+            instance_id,
+            page_id,
+            selector,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.html(&instance_id, &page_id, selector.as_deref(), timeout) {
+                Ok(html) => DaemonResponse::ok(json!({ "html": html })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Links {
+            instance_id,
+            page_id,
+            selector,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.links(&instance_id, &page_id, selector.as_deref(), timeout) {
+                Ok(links) => DaemonResponse::ok(json!({ "links": links })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Data {
+            instance_id,
+            page_id,
+            og,
+            jsonld,
+            meta,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.data(&instance_id, &page_id, og, jsonld, meta, timeout) {
+                Ok(data) => DaemonResponse::ok(data),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Navigation / waiting
+        // -------------------------------------------------------------------
+        DaemonRequest::Url {
+            instance_id,
+            page_id,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.url(&instance_id, &page_id, timeout) {
+                Ok((url, title)) => DaemonResponse::ok(json!({ "url": url, "title": title })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Back {
+            instance_id,
+            page_id,
+        } => {
+            let mgr = manager.lock().unwrap();
+            match mgr.go_back(&instance_id, &page_id) {
+                Ok(navigated) => {
+                    DaemonResponse::ok(json!({ "navigated": navigated, "direction": "back" }))
+                }
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Forward {
+            instance_id,
+            page_id,
+        } => {
+            let mgr = manager.lock().unwrap();
+            match mgr.go_forward(&instance_id, &page_id) {
+                Ok(navigated) => {
+                    DaemonResponse::ok(json!({ "navigated": navigated, "direction": "forward" }))
+                }
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Reload {
+            instance_id,
+            page_id,
+        } => {
+            let mgr = manager.lock().unwrap();
+            match mgr.reload(&instance_id, &page_id) {
+                Ok(()) => DaemonResponse::ok(json!({ "reloaded": true })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Wait {
+            instance_id,
+            page_id,
+            selector,
+            timeout_secs,
+        } => {
+            // NOTE: intentionally holds the manager lock for the whole poll —
+            // matches every other handler; the daemon serialises page work.
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.wait_for_selector(&instance_id, &page_id, &selector, timeout) {
+                Ok(waited_ms) => DaemonResponse::ok(json!({
+                    "found": true, "selector": selector, "waited_ms": waited_ms,
+                })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Cookies / headers
+        // -------------------------------------------------------------------
+        DaemonRequest::SetCookie {
+            instance_id,
+            page_id,
+            name,
+            value,
+            url,
+            domain,
+            path,
+            secure,
+            http_only,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.set_cookie(
+                &instance_id,
+                &page_id,
+                &name,
+                &value,
+                url.as_deref(),
+                domain.as_deref(),
+                path.as_deref(),
+                secure,
+                http_only,
+                timeout,
+            ) {
+                Ok(data) => DaemonResponse::ok(data),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::SetHeader {
+            instance_id,
+            page_id,
+            name,
+            value,
+        } => {
+            let mut mgr = manager.lock().unwrap();
+            match mgr.set_header(&instance_id, &page_id, &name, &value) {
+                Ok(headers) => {
+                    let list: Vec<serde_json::Value> = headers
+                        .iter()
+                        .map(|(n, v)| json!({ "name": n, "value": v }))
+                        .collect();
+                    DaemonResponse::ok(json!({ "header_set": name, "headers": list }))
+                }
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Interaction
+        // -------------------------------------------------------------------
+        DaemonRequest::Fill {
+            instance_id,
+            page_id,
+            selector,
+            value,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.fill(&instance_id, &page_id, &selector, &value, timeout) {
+                Ok(tag) => DaemonResponse::ok(json!({
+                    "filled": true, "selector": selector, "tag": tag, "value": value,
+                })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Type {
+            instance_id,
+            page_id,
+            text,
+        } => {
+            let mgr = manager.lock().unwrap();
+            match mgr.insert_text(&instance_id, &page_id, &text) {
+                Ok(()) => DaemonResponse::ok(json!({ "typed": text })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Press {
+            instance_id,
+            page_id,
+            key,
+        } => {
+            let mgr = manager.lock().unwrap();
+            match mgr.press(&instance_id, &page_id, &key) {
+                Ok(()) => DaemonResponse::ok(json!({ "pressed": key })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Hover {
+            instance_id,
+            page_id,
+            selector,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.hover(&instance_id, &page_id, &selector, timeout) {
+                Ok((x, y)) => DaemonResponse::ok(json!({
+                    "hovered": true, "selector": selector, "x": x, "y": y,
+                })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Select {
+            instance_id,
+            page_id,
+            selector,
+            value,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.select_option(&instance_id, &page_id, &selector, &value, timeout) {
+                Ok(result) => DaemonResponse::ok(json!({
+                    "selected": true,
+                    "selector": selector,
+                    "option_value": result.get("value"),
+                    "option_text": result.get("text"),
+                })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::Scroll {
+            instance_id,
+            page_id,
+            selector,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match mgr.scroll(&instance_id, &page_id, selector.as_deref(), timeout) {
+                Ok(result) => DaemonResponse::ok(result),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Tabs
+        // -------------------------------------------------------------------
+        DaemonRequest::Tabs {
+            instance_id,
+            timeout_secs,
+        } => {
+            let mgr = manager.lock().unwrap();
+            match mgr.tabs(&instance_id, std::time::Duration::from_secs(timeout_secs)) {
+                Ok(tabs) => DaemonResponse::ok(json!({ "tabs": tabs })),
+                Err(e) => DaemonResponse::err(e),
+            }
+        }
+
+        DaemonRequest::CloseTab {
+            instance_id,
+            page_id,
+        } => {
+            let mut mgr = manager.lock().unwrap();
+            match mgr.close_tab(&instance_id, &page_id) {
+                Ok(()) => DaemonResponse::ok(json!({ "closed_page": page_id })),
                 Err(e) => DaemonResponse::err(e),
             }
         }

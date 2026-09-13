@@ -75,6 +75,14 @@ All notable changes to camoufox-rs are documented here.
   Sending `Enter` with `text: "\r"` therefore delivered a composition, not a keypress. The CLI
   now omits `text` entirely and lets Gecko derive the character, which is correct for both
   named keys and printable characters.
+- **`launch` advertised `Camoufox/<version>` in the User-Agent on Camoufox 150+.** Launched
+  without a fingerprint config, 152.0.4-beta.30 sends `Camoufox/152.0.4-beta.30` as the
+  product token both in the HTTP `User-Agent` header and in `navigator.userAgent`, where
+  135.0.1-beta.24 sent `Firefox/135.0`. On Linux, `launch` now reads the major version from the
+  `application.ini` next to the browser executable and pins `navigator.userAgent` to
+  `Mozilla/5.0 (X11; Linux x86_64; rv:<major>.0) Gecko/20100101 Firefox/<major>.0` via
+  `CAMOU_CONFIG`, which also fixes the header. Nothing is set when a `CAMOU_CONFIG*` variable is
+  already exported or the version can't be read.
 
 ### Changed
 

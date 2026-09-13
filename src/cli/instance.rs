@@ -5,7 +5,7 @@
 //! operations that CLI commands map to.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
 
@@ -24,6 +24,41 @@ fn default_executable() -> String {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         format!("{home}/.cache/camoufox/camoufox")
     })
+}
+
+/// `CAMOU_CONFIG_*` variables that pin a plain Firefox User-Agent for the
+/// browser at `executable`.
+///
+/// Camoufox 150+ launched without a fingerprint config sends
+/// `... Gecko/20100101 Camoufox/<version>` as its User-Agent, both over HTTP
+/// and in `navigator.userAgent`. The major version is read from the
+/// `application.ini` shipped next to the executable; if it can't be read,
+/// nothing is set. Only the Linux platform token has been verified against
+/// Camoufox, so other platforms are left alone. A `CAMOU_CONFIG*` already in
+/// `inherited_env_keys` is the user's own fingerprint and wins.
+fn user_agent_env(executable: &Path, inherited_env_keys: &[String]) -> HashMap<String, String> {
+    if !cfg!(target_os = "linux")
+        || inherited_env_keys
+            .iter()
+            .any(|key| key.starts_with("CAMOU_CONFIG"))
+    {
+        return HashMap::new();
+    }
+    let Some(major) = executable
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("application.ini")).ok())
+        .and_then(|ini| {
+            ini.lines()
+                .find_map(|line| line.strip_prefix("Version="))
+                .and_then(|version| version.split('.').next())
+                .and_then(|major| major.trim().parse::<u32>().ok())
+        })
+    else {
+        return HashMap::new();
+    };
+    let user_agent =
+        format!("Mozilla/5.0 (X11; Linux x86_64; rv:{major}.0) Gecko/20100101 Firefox/{major}.0");
+    LaunchConfig::camou_config_env(&json!({ "navigator.userAgent": user_agent }).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,12 +1055,17 @@ impl InstanceManager {
         let profile_dir =
             tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
 
+        let executable = PathBuf::from(
+            executable
+                .map(|s| s.to_owned())
+                .unwrap_or_else(default_executable),
+        );
+        let inherited_env_keys: Vec<String> = std::env::vars_os()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
         let config = LaunchConfig {
-            executable: PathBuf::from(
-                executable
-                    .map(|s| s.to_owned())
-                    .unwrap_or_else(default_executable),
-            ),
+            env: user_agent_env(&executable, &inherited_env_keys),
+            executable,
             profile_dir: Some(profile_dir.path().to_owned()),
             headless: headless.unwrap_or(true),
             ..Default::default()
@@ -1593,5 +1633,68 @@ mod tests {
         let err = key_descriptor("Frobnicate").unwrap_err();
         assert!(err.contains("unknown key"), "got: {err}");
         assert!(err.contains("Enter"), "error lists valid keys: {err}");
+    }
+
+    /// A browser install directory holding a Camoufox `application.ini` for
+    /// `version`, plus the path its executable would have.
+    fn fake_browser_install(version: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ini = format!(
+            "[App]\nVendor=Mozilla\nName=Firefox\nCodeName=Camoufox\nVersion={version}\n\
+             BuildID=20260831224046\n\n[Gecko]\nMinVersion=1.0\nMaxVersion=1.0\n"
+        );
+        std::fs::write(dir.path().join("application.ini"), ini).expect("write application.ini");
+        let exe = dir.path().join("camoufox");
+        (dir, exe)
+    }
+
+    fn configured_user_agent(env: &HashMap<String, String>) -> Option<String> {
+        let json = env.get("CAMOU_CONFIG_1")?;
+        let config: serde_json::Value = serde_json::from_str(json).expect("CAMOU_CONFIG_1 is JSON");
+        config["navigator.userAgent"].as_str().map(str::to_owned)
+    }
+
+    /// Camoufox 150+ launched without a fingerprint config sends
+    /// `Camoufox/<version>` in its User-Agent. Launch pins a plain Firefox UA
+    /// whose version matches the browser actually being started.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_agent_env_pins_firefox_user_agent_for_browser_version() {
+        let cases = [
+            (
+                "152.0.4-beta.30",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0",
+            ),
+            (
+                "135.0.1-beta.24",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0",
+            ),
+        ];
+        for (version, want) in cases {
+            let (_dir, exe) = fake_browser_install(version);
+            let env = user_agent_env(&exe, &[]);
+            assert_eq!(
+                configured_user_agent(&env).as_deref(),
+                Some(want),
+                "browser {version}"
+            );
+        }
+    }
+
+    /// A `CAMOU_CONFIG*` the user already exported is their fingerprint;
+    /// launch must not override it with the default UA.
+    #[test]
+    fn user_agent_env_leaves_user_supplied_camou_config_alone() {
+        let (_dir, exe) = fake_browser_install("152.0.4-beta.30");
+        let inherited = vec!["PATH".to_string(), "CAMOU_CONFIG_1".to_string()];
+        assert!(user_agent_env(&exe, &inherited).is_empty());
+    }
+
+    /// Without a readable `application.ini` the browser version is unknown,
+    /// so no UA is guessed.
+    #[test]
+    fn user_agent_env_sets_nothing_when_browser_version_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(user_agent_env(&dir.path().join("camoufox"), &[]).is_empty());
     }
 }

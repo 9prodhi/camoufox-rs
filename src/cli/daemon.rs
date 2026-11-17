@@ -14,6 +14,22 @@ use crate::cli::ipc::{DaemonRequest, DaemonResponse};
 
 /// Run the daemon, blocking forever (or until Shutdown).
 pub fn run(socket_path: &std::path::Path, foreground: bool) -> Result<(), String> {
+    // Block before spawning any threads; the sigwait thread handles shutdown.
+    let signals = unsafe {
+        let mut signals: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut signals);
+        libc::sigaddset(&mut signals, libc::SIGTERM);
+        libc::sigaddset(&mut signals, libc::SIGINT);
+        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut());
+        if rc != 0 {
+            return Err(format!(
+                "failed to block shutdown signals: {}",
+                std::io::Error::from_raw_os_error(rc)
+            ));
+        }
+        signals
+    };
+
     // Ensure parent directory exists with owner-only permissions.
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)
@@ -47,6 +63,21 @@ pub fn run(socket_path: &std::path::Path, foreground: bool) -> Result<(), String
     }
 
     let manager = Arc::new(Mutex::new(InstanceManager::new()));
+    let signal_manager = Arc::clone(&manager);
+    let signal_socket = socket_path.to_owned();
+    std::thread::Builder::new()
+        .name("camoufox-signal-waiter".into())
+        .spawn(move || {
+            let mut signal = 0;
+            let rc = unsafe { libc::sigwait(&signals, &mut signal) };
+            if rc == 0 {
+                signal_manager.lock().unwrap().shutdown_all();
+                let _ = std::fs::remove_file(signal_socket);
+                std::process::exit(0);
+            }
+            log::error!("sigwait failed: {}", std::io::Error::from_raw_os_error(rc));
+        })
+        .map_err(|e| format!("failed to start signal waiter: {e}"))?;
 
     if foreground {
         eprintln!("camoufox daemon listening on {}", socket_path.display());

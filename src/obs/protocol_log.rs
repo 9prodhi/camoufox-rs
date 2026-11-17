@@ -221,11 +221,24 @@ pub fn log_incoming(raw: &str) {
     ProtocolLogger::log_incoming(raw);
 }
 
+/// Log a parsed incoming message, serializing only when protocol trace is enabled.
+pub fn log_incoming_message(message: &crate::protocol::types::RawMessage) {
+    log_incoming_serializable(message);
+}
+
+fn log_incoming_serializable(message: &impl serde::Serialize) {
+    if !log::log_enabled!(target: "camoufox::protocol", log::Level::Trace) {
+        return;
+    }
+    let preview = truncate_json(message);
+    log::trace!(target: "camoufox::protocol", "RECV {}", preview);
+}
+
 /// Truncate a JSON value to a human-readable preview string.
 ///
 /// If the serialized form exceeds [`MAX_PREVIEW_LEN`], it is truncated
 /// at a UTF-8 character boundary and `"..."` is appended.
-fn truncate_json(value: &serde_json::Value) -> String {
+fn truncate_json(value: &impl serde::Serialize) -> String {
     match serde_json::to_string(value) {
         Ok(s) => {
             if s.len() > MAX_PREVIEW_LEN {
@@ -255,6 +268,29 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn connection_hooks_without_logger_do_not_panic() {
+        log_outgoing(&json!({"id": 1, "method": "Browser.enable"}));
+        log_incoming("{\"id\":1,\"result\":{}}");
+        let message = serde_json::from_value(json!({"id": 1, "result": {}})).unwrap();
+        log_incoming_message(&message);
+    }
+
+    #[test]
+    fn disabled_trace_skips_serialization() {
+        struct MustNotSerialize;
+
+        impl serde::Serialize for MustNotSerialize {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                panic!("disabled protocol logging must not serialize");
+            }
+        }
+
+        // This unit-test binary installs no global logger.
+        assert!(!log::log_enabled!(target: "camoufox::protocol", log::Level::Trace));
+        log_incoming_serializable(&MustNotSerialize);
+    }
 
     #[test]
     fn truncate_json_short() {

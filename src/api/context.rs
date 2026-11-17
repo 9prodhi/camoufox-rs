@@ -14,7 +14,7 @@ use serde_json::json;
 
 use crate::api::browser::{Connection, ProxyConfig, Session};
 use crate::api::main_frame::{MainFrame, SubscriptionGuard};
-use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
+use crate::protocol::errors::ProtocolError;
 
 // ---------------------------------------------------------------------------
 // Context configuration types
@@ -837,14 +837,7 @@ impl BrowserContext {
                     snapshot.len(),
                     summary.join(", "),
                 );
-                return Err(ProtocolError {
-                    kind: ProtocolErrorKind::Closed,
-                    method: Some("Browser.attachedToTarget".into()),
-                    message: msg,
-                    data: None,
-                    source: None,
-                    download_info: None,
-                });
+                return Err(ProtocolError::closed_with("Browser.attachedToTarget", msg));
             }
             match attach_rx.recv_timeout(remaining) {
                 Ok((sid, tid))
@@ -856,14 +849,10 @@ impl BrowserContext {
                 Ok(_) => continue,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(ProtocolError {
-                        kind: ProtocolErrorKind::Closed,
-                        method: Some("Browser.attachedToTarget".into()),
-                        message: "attach channel disconnected".into(),
-                        data: None,
-                        source: None,
-                        download_info: None,
-                    });
+                    return Err(ProtocolError::closed_with(
+                        "Browser.attachedToTarget",
+                        "attach channel disconnected",
+                    ));
                 }
             }
         };
@@ -886,31 +875,23 @@ impl BrowserContext {
         let frame_id = loop {
             let remaining = frame_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(ProtocolError {
-                    kind: ProtocolErrorKind::Closed,
-                    method: Some("Page.frameAttached".into()),
-                    message: format!(
+                return Err(ProtocolError::closed_with(
+                    "Page.frameAttached",
+                    format!(
                         "timeout waiting for main frame attach (no parentFrameId) after {}s",
                         Self::ATTACH_TIMEOUT.as_secs(),
                     ),
-                    data: None,
-                    source: None,
-                    download_info: None,
-                });
+                ));
             }
             match frame_rx.recv_timeout(remaining) {
                 Ok((sid, fid)) if sid == session_id && !fid.is_empty() => break fid,
                 Ok(_) => continue,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(ProtocolError {
-                        kind: ProtocolErrorKind::Closed,
-                        method: Some("Page.frameAttached".into()),
-                        message: "frame channel disconnected".into(),
-                        data: None,
-                        source: None,
-                        download_info: None,
-                    });
+                    return Err(ProtocolError::closed_with(
+                        "Page.frameAttached",
+                        "frame channel disconnected",
+                    ));
                 }
             }
         };

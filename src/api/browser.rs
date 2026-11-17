@@ -10,7 +10,7 @@ use serde_json::json;
 
 use crate::api::context::{BrowserContext, ContextOptions};
 pub use crate::protocol::client::{Connection, Session};
-use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
+use crate::protocol::errors::ProtocolError;
 
 // ---------------------------------------------------------------------------
 // ProxyConfig
@@ -263,16 +263,10 @@ impl Browser {
         {
             Some(id) => id.to_owned(),
             None => {
-                return Err(ProtocolError {
-                    kind: ProtocolErrorKind::Response,
-                    method: Some("Browser.createBrowserContext".to_owned()),
-                    message:
-                        "missing or empty browserContextId in Browser.createBrowserContext response"
-                            .to_owned(),
-                    data: None,
-                    source: None,
-                    download_info: None,
-                });
+                return Err(ProtocolError::response_msg(
+                    "Browser.createBrowserContext",
+                    "missing or empty browserContextId in Browser.createBrowserContext response",
+                ));
             }
         };
 

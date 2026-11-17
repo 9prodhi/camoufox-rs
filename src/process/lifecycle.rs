@@ -79,6 +79,8 @@ pub fn graceful_shutdown(child: &mut Child, timeout: Duration) -> Result<(), Pro
                 poll_interval = (poll_interval * 2).min(MAX_POLL_INTERVAL);
             }
             Err(e) => {
+                // Even a polling failure must not abandon a live process.
+                let _ = force_kill(child);
                 return Err(ProcessError::Io(e));
             }
         }
@@ -90,9 +92,10 @@ pub fn graceful_shutdown(child: &mut Child, timeout: Duration) -> Result<(), Pro
         timeout.as_secs_f64()
     );
 
-    child.kill().map_err(ProcessError::KillFailed)?;
+    force_kill(child)
+}
 
-    // Reap the zombie. This should return quickly after SIGKILL.
+fn reap(child: &mut Child) -> Result<(), ProcessError> {
     match child.wait() {
         Ok(status) => {
             log::debug!(
@@ -118,9 +121,14 @@ pub fn graceful_shutdown(child: &mut Child, timeout: Duration) -> Result<(), Pro
 /// - `ProcessError::Io` if `wait()` fails.
 pub fn force_kill(child: &mut Child) -> Result<(), ProcessError> {
     log::debug!("force-killing browser process (pid={})", child.id());
-    child.kill().map_err(ProcessError::KillFailed)?;
-    child.wait().map_err(ProcessError::Io)?;
-    Ok(())
+    let killed = child.kill();
+    // Always attempt to reap, even if kill failed (e.g. an exit raced it).
+    let reaped = reap(child);
+    if reaped.is_ok() {
+        return Ok(());
+    }
+    killed.map_err(ProcessError::KillFailed)?;
+    reaped
 }
 
 /// Check if the child process has already exited.
@@ -160,7 +168,7 @@ mod tests {
     fn spawn_sleeper(secs: u64) -> Child {
         Command::new("/bin/sh")
             .arg("-c")
-            .arg(format!("sleep {secs}"))
+            .arg(format!("exec sleep {secs}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -198,14 +206,9 @@ mod tests {
     fn graceful_shutdown_handles_already_exited_process() {
         let mut child = spawn_quick_exit();
         // Wait for it to finish.
-        let _ = child.wait();
-
-        // Calling graceful_shutdown on an already-exited process should be fine.
-        let result = graceful_shutdown(&mut child, Duration::from_secs(1));
-        // This may return Ok (try_wait returns the cached status) or an error
-        // depending on platform behavior. Either is acceptable since the
-        // process is already dead.
-        let _ = result;
+        assert!(child.wait().expect("wait").success());
+        graceful_shutdown(&mut child, Duration::from_secs(1)).expect("already reaped");
+        assert!(child.try_wait().expect("cached status").unwrap().success());
     }
 
     #[test]

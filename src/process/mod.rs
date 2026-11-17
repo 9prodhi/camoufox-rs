@@ -97,6 +97,34 @@ impl From<std::io::Error> for ProcessError {
     }
 }
 
+/// Owns a child until launch succeeds. Drop always kills and reaps it.
+/// Declare this after resources (such as a temporary profile) that must outlive it.
+#[derive(Debug)]
+pub struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    pub fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    pub fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("armed child guard")
+    }
+
+    /// Transfer responsibility for terminating and reaping the child.
+    pub fn into_child(mut self) -> Child {
+        self.0.take().expect("armed child guard")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = lifecycle::force_kill(child);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LaunchedProcess
 // ---------------------------------------------------------------------------
@@ -132,5 +160,41 @@ impl fmt::Debug for LaunchedProcess {
             .field("command_pipe", &self.command_pipe)
             .field("response_pipe", &self.response_pipe)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn guard_kills_and_reaps_on_drop() {
+        let child = Command::new("sleep").arg("30").spawn().expect("sleep");
+        let pid = child.id() as libc::pid_t;
+        drop(ChildGuard::new(child));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn disarm_keeps_child_alive() {
+        let child = Command::new("sleep").arg("30").spawn().expect("sleep");
+        let mut child = ChildGuard::new(child).into_child();
+        assert!(child.try_wait().expect("poll").is_none());
+        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, 0) }, 0);
+        lifecycle::force_kill(&mut child).expect("cleanup");
     }
 }

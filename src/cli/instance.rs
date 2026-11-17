@@ -195,6 +195,7 @@ pub struct Instance {
     _profile_dir: tempfile::TempDir,
     pages: HashMap<String, ManagedMainFrame>,
     page_counter: u32,
+    close_timeout: Duration,
 }
 
 impl Instance {
@@ -1001,26 +1002,18 @@ impl Instance {
     /// Shut down this instance.
     pub fn stop(self) -> Result<(), String> {
         let Instance {
-            browser, mut child, ..
+            browser,
+            mut child,
+            close_timeout,
+            _profile_dir,
+            ..
         } = self;
         let _ = browser.close();
-
-        // Wait for graceful exit, kill if needed.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Ok(());
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(_) => return Ok(()),
-            }
-        }
+        let result = crate::process::lifecycle::graceful_shutdown(&mut child, close_timeout)
+            .map_err(|e| format!("failed to stop browser: {e}"));
+        // Keep the profile alive through kill + wait, including error paths.
+        drop(_profile_dir);
+        result
     }
 }
 
@@ -1068,15 +1061,17 @@ impl InstanceManager {
             executable,
             profile_dir: Some(profile_dir.path().to_owned()),
             headless: headless.unwrap_or(true),
+            close_timeout: Duration::from_secs(10),
             ..Default::default()
         };
 
-        let mut launched = crate::process::unix::spawn(&config)
+        let launched = crate::process::unix::spawn(&config)
             .map_err(|e| format!("failed to spawn browser: {e}"))?;
 
-        let pid = launched.child.id();
+        let mut child = crate::process::ChildGuard::new(launched.child);
+        let pid = child.child_mut().id();
 
-        let _ = crate::process::readiness::wait_for_ready(&mut launched.child, config.timeout)
+        let _ = crate::process::readiness::wait_for_ready(child.child_mut(), config.timeout)
             .map_err(|e| format!("browser did not become ready: {e}"))?;
 
         let transport = PipeTransport::new(launched.command_pipe, launched.response_pipe);
@@ -1098,12 +1093,13 @@ impl InstanceManager {
 
         let instance = Instance {
             browser,
-            child: launched.child,
+            child: child.into_child(),
             version: version.clone(),
             pid,
             _profile_dir: profile_dir,
             pages: HashMap::new(),
             page_counter: 0,
+            close_timeout: config.close_timeout,
         };
 
         self.instances.insert(instance_id.clone(), instance);

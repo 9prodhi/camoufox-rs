@@ -7,8 +7,9 @@
 //! Created via
 //! [`BrowserContext::new_main_frame`](crate::api::context::BrowserContext::new_main_frame).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
@@ -1128,7 +1129,13 @@ impl MainFrame {
     // Runtime domain methods
     // -----------------------------------------------------------------------
 
-    /// Evaluate a JavaScript expression in the top-frame main world.
+    /// Evaluate a JavaScript expression in the top-frame execution context.
+    ///
+    /// On Camoufox 158+, `Runtime.evaluate` runs in an **isolated** world.
+    /// The DOM is shared with the page, but JavaScript globals set by page
+    /// scripts (e.g. `window.__my_global`) are not visible here.
+    /// To evaluate expressions in the page's main world, see
+    /// [`evaluate_main_world`](Self::evaluate_main_world).
     ///
     /// Polls the cached execution context (up to `timeout`); if `evaluate`
     /// fails with a "context destroyed" error (typical during SPA
@@ -1156,7 +1163,8 @@ impl MainFrame {
         let mut bad_ctx: Option<String> = None;
 
         for attempt in 0..=MAX_RETRIES {
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 break;
             }
 
@@ -1169,7 +1177,7 @@ impl MainFrame {
                         *self.execution_context_id.lock().unwrap() = None;
                         if Instant::now() >= deadline {
                             return Err(ProtocolError {
-                                kind: ProtocolErrorKind::Closed,
+                                kind: ProtocolErrorKind::Timeout,
                                 method: Some("Runtime.evaluate".into()),
                                 message: "timed out waiting for execution context".into(),
                                 data: None,
@@ -1182,19 +1190,25 @@ impl MainFrame {
                 }
             };
 
-            match self.session().send(
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                break;
+            }
+
+            match self.session().send_with_timeout(
                 "Runtime.evaluate",
                 json!({
                     "expression": expression,
                     "returnByValue": true,
                     "executionContextId": &exec_ctx,
                 }),
+                remaining,
             ) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     let msg = format!("{e}");
-                    let is_ctx_err =
-                        msg.contains("execution context") || msg.contains("Failed to find");
+                    let is_ctx_err = is_context_error(&msg);
                     if attempt < MAX_RETRIES && is_ctx_err {
                         bad_ctx = Some(exec_ctx);
                         std::thread::sleep(Duration::from_millis(300));
@@ -1206,13 +1220,107 @@ impl MainFrame {
         }
 
         Err(ProtocolError {
-            kind: ProtocolErrorKind::Closed,
+            kind: ProtocolErrorKind::Timeout,
             method: Some("Runtime.evaluate".into()),
             message: format!("evaluate failed after {MAX_RETRIES} retries"),
             data: None,
             source: None,
             download_info: None,
         })
+    }
+
+    /// Evaluate a JavaScript expression in the page's MAIN world via an injected `<script>` bridge.
+    ///
+    /// On Camoufox 158+, [`evaluate`](Self::evaluate) runs in an isolated world where page-defined
+    /// globals (e.g. `window.__click_result`) are not accessible. This method bridges into the
+    /// page's main execution context by injecting a temporary `<script>` element that evaluates
+    /// `expression` with indirect `(0, eval)(...)` in the global scope and returns the result
+    /// via a dataset attribute on `document.documentElement`.
+    ///
+    /// # Synchronous expressions only
+    ///
+    /// This method evaluates synchronous expressions only. Promises are **not** awaited;
+    /// evaluating an expression that returns a Promise yields a Promise object representation
+    /// (typically `{}`), not its resolved value.
+    ///
+    /// # Stealth trade-off
+    ///
+    /// Because this method injects and immediately removes a `<script>` tag into the DOM,
+    /// page-level JavaScript can potentially observe it via a `MutationObserver` or Content
+    /// Security Policy (CSP) violation reports if inline scripts are prohibited.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProtocolError`] if:
+    /// - The main-world script did not execute (e.g. CSP blocked inline scripts or JS is disabled).
+    /// - Evaluating `expression` in the page throws an uncaught JavaScript error (the error message is preserved).
+    /// - Communication with the browser times out or fails.
+    pub fn evaluate_main_world(
+        &self,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let token = generate_main_world_token();
+        let snippet = build_evaluate_main_world_snippet(expression, &token);
+        let raw = self.evaluate(&snippet, timeout)?;
+
+        let envelope_val = raw.pointer("/result/value").or_else(|| raw.get("value"));
+
+        let bridge: serde_json::Value = match envelope_val {
+            Some(serde_json::Value::String(s)) => {
+                serde_json::from_str(s).map_err(|e| ProtocolError {
+                    kind: ProtocolErrorKind::Response,
+                    method: Some("Runtime.evaluate".into()),
+                    message: format!("failed to parse main-world bridge response: {e}"),
+                    data: None,
+                    source: None,
+                    download_info: None,
+                })?
+            }
+            Some(obj @ serde_json::Value::Object(_)) => obj.clone(),
+            Some(serde_json::Value::Null) | None => {
+                return Err(ProtocolError {
+                    kind: ProtocolErrorKind::Response,
+                    method: Some("Runtime.evaluate".into()),
+                    message: "main-world script did not run (CSP or JavaScript disabled?)".into(),
+                    data: None,
+                    source: None,
+                    download_info: None,
+                });
+            }
+            Some(other) => {
+                return Err(ProtocolError {
+                    kind: ProtocolErrorKind::Response,
+                    method: Some("Runtime.evaluate".into()),
+                    message: format!("unexpected main-world bridge response: {other:?}"),
+                    data: None,
+                    source: None,
+                    download_info: None,
+                });
+            }
+        };
+
+        if bridge.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            let err_msg = bridge
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("main-world script evaluation failed");
+            return Err(ProtocolError {
+                kind: ProtocolErrorKind::Response,
+                method: Some("Runtime.evaluate".into()),
+                message: err_msg.to_owned(),
+                data: None,
+                source: None,
+                download_info: None,
+            });
+        }
+
+        let value = bridge
+            .get("value")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        Ok(value)
     }
 
     /// Call a JavaScript function with arguments.
@@ -1623,6 +1731,64 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+/// Context error detection helper for evaluate retry logic (D10.2).
+pub(crate) fn is_context_error(msg: &str) -> bool {
+    msg.contains("execution context") || msg.contains("Failed to find")
+}
+
+static MAIN_WORLD_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn generate_main_world_token() -> String {
+    let count = MAIN_WORLD_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("cfx{time}x{count}")
+}
+
+/// Escape a string into a JSON string literal with U+2028 and U+2029 line terminators escaped.
+fn escape_js_json_literal(s: &str) -> String {
+    let json = serde_json::to_string(s).expect("serde_json::to_string on string is infallible");
+    json.replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Build the isolated-world JavaScript snippet used to evaluate code in the main world (D5).
+pub fn build_evaluate_main_world_snippet(expression: &str, token: &str) -> String {
+    let expr_literal = escape_js_json_literal(expression);
+    let token_literal = escape_js_json_literal(token);
+
+    format!(
+        "(() => {{\
+           const token = {token_literal};\
+           const script = document.createElement(\"script\");\
+           script.textContent = \"(() => {{ \
+             let out; \
+             try {{ \
+               const val = (0, eval)(\" + JSON.stringify({expr_literal}).replace(/\\u2028/g, \"\\\\u2028\").replace(/\\u2029/g, \"\\\\u2029\") + \"); \
+               out = JSON.stringify({{ ok: true, value: val === undefined ? null : val }}); \
+             }} catch (e) {{ \
+               out = JSON.stringify({{ ok: false, error: String(e) }}); \
+             }} \
+             try {{ \
+               document.documentElement.dataset[\" + JSON.stringify(token) + \"] = out; \
+             }} catch (_) {{}} \
+           }})();\";\
+           const parent = document.head || document.documentElement;\
+           if (!parent) return null;\
+           parent.appendChild(script);\
+           script.remove();\
+           const res = document.documentElement.dataset[token];\
+           if (res !== undefined) {{\
+             delete document.documentElement.dataset[token];\
+             return res;\
+           }}\
+           return null;\
+         }})()"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1650,6 +1816,97 @@ mod tests {
     #[test]
     fn test_decode_base64_invalid_char() {
         assert!(decode_base64("SGVs!G8=").is_err());
+    }
+
+    // -- Context error helper unit test (D10.2) -----------------------------
+
+    #[test]
+    fn test_is_context_error() {
+        assert!(is_context_error("execution context was destroyed"));
+        assert!(is_context_error(
+            "Cannot find execution context with id 123"
+        ));
+        assert!(is_context_error("Failed to find execution context"));
+        assert!(is_context_error("Failed to find world"));
+        assert!(!is_context_error("ReferenceError: foo is not defined"));
+        assert!(!is_context_error("SyntaxError: Unexpected token '<'"));
+        assert!(!is_context_error("Session closed"));
+        assert!(!is_context_error(""));
+    }
+
+    // -- Snippet builder unit tests (D5) ------------------------------------
+
+    #[test]
+    fn test_build_evaluate_main_world_snippet_structure_and_safety() {
+        let token = "cfx_test_token_123";
+        let expr = "window.__click_result = { a: 1 };";
+        let snippet = build_evaluate_main_world_snippet(expr, token);
+
+        // Builder must use textContent, not innerHTML
+        assert!(snippet.contains("script.textContent ="));
+        assert!(!snippet.contains("innerHTML"));
+
+        // Must use indirect eval
+        assert!(snippet.contains("(0, eval)("));
+
+        // Must read and delete dataset attribute
+        assert!(snippet.contains("document.documentElement.dataset[token]"));
+        assert!(snippet.contains("delete document.documentElement.dataset[token]"));
+
+        // Expression appears ONLY as a JSON string literal
+        let expected_literal = serde_json::to_string(expr).unwrap();
+        assert!(snippet.contains(&expected_literal));
+        assert_eq!(
+            snippet.matches(&expected_literal).count(),
+            1,
+            "expression must appear exactly once as a JSON string literal"
+        );
+        // Raw code is never spliced directly
+        assert!(!snippet.contains("eval(window.__click_result"));
+    }
+
+    #[test]
+    fn test_build_evaluate_main_world_snippet_escapes_u2028_u2029() {
+        let token = "cfx_test_u2028";
+        let expr_with_separators = "var msg = 'line1\u{2028}line2\u{2029}line3';";
+        let snippet = build_evaluate_main_world_snippet(expr_with_separators, token);
+
+        assert!(
+            !snippet.contains('\u{2028}'),
+            "U+2028 must be escaped in snippet"
+        );
+        assert!(
+            !snippet.contains('\u{2029}'),
+            "U+2029 must be escaped in snippet"
+        );
+        assert!(snippet.contains(r"\u2028"));
+        assert!(snippet.contains(r"\u2029"));
+
+        // Token with U+2028/U+2029 is also escaped
+        let tricky_token = "tok\u{2028}en\u{2029}";
+        let snippet_token = build_evaluate_main_world_snippet("1", tricky_token);
+        assert!(!snippet_token.contains('\u{2028}'));
+        assert!(!snippet_token.contains('\u{2029}'));
+    }
+
+    #[test]
+    fn test_build_evaluate_main_world_snippet_breakout_resistance() {
+        let token = "cfx_breakout";
+        let tricky_expr = r#"console.log("</script><script>alert('xss')</script>"); let s = "\"quotes\\and\\backslashes\"";"#;
+        let snippet = build_evaluate_main_world_snippet(tricky_expr, token);
+
+        // Builder uses textContent
+        assert!(snippet.contains("script.textContent ="));
+        assert!(!snippet.contains("innerHTML"));
+
+        // Tricky expression appears as valid JSON string literal
+        let tricky_literal = serde_json::to_string(tricky_expr).unwrap();
+        assert!(snippet.contains(&tricky_literal));
+
+        // It does not contain an unescaped breakout
+        assert!(!snippet.contains(
+            "script.textContent = \"(() => { let out; try { const val = (0, eval)(console.log"
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -2097,6 +2354,7 @@ mod tests {
     /// G3 TDD case 3d: IPC serde round-trip — `DaemonRequest::Navigate` with
     /// `wait_until` field serialises and deserialises correctly.
     #[test]
+    #[cfg(feature = "cli")]
     fn navigate_ipc_wait_until_serde_round_trip() {
         use crate::cli::ipc::DaemonRequest;
 
@@ -2529,6 +2787,7 @@ mod tests {
     /// G4 TDD case 3: navigate response IPC serde includes `status_code`.
     /// Absence is backward-compatible (legacy callers ignore unknown fields).
     #[test]
+    #[cfg(feature = "cli")]
     fn navigate_response_serde_includes_status_code() {
         use crate::cli::ipc::DaemonResponse;
 
@@ -2578,6 +2837,7 @@ mod tests {
     /// G4 TDD case 4: `print_response` in human mode prints the status code
     /// when present.
     #[test]
+    #[cfg(feature = "cli")]
     fn print_response_shows_status_code() {
         use crate::cli::ipc::DaemonResponse;
         use crate::cli::output::print_response;

@@ -17,9 +17,10 @@
 
 use crate::process::ProcessError;
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::process::Child;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Readiness banner used by older Camoufox builds (patched Juggler message).
@@ -42,12 +43,10 @@ fn is_ready_line(line: &str) -> bool {
 
 /// Outcome of the stderr reader thread.
 enum ReadResult {
-    /// The sentinel string was found. The `String` contains all stderr output
-    /// collected up to and including the sentinel line.
+    /// The sentinel was found. The string contains the bounded recent output.
     Ready(String),
-    /// The child's stderr stream reached EOF (process exited) before the
-    /// sentinel was found. The `String` contains all collected stderr output.
-    Eof(String),
+    /// A stream reached EOF before the sentinel was found.
+    Eof,
     /// An I/O error occurred while reading stderr.
     Error(std::io::Error),
 }
@@ -71,8 +70,8 @@ enum ReadResult {
 ///
 /// # Returns
 ///
-/// * `Ok(output)` - A banner was found. Returns the output collected from the
-///   stream it appeared on, up to and including the banner line.
+/// * `Ok(output)` - A banner was found. Returns a bounded tail of recent
+///   stdout/stderr output, including the banner line.
 /// * `Err(ProcessError::ExitedBeforeReady)` - All watched streams reached EOF
 ///   (the process exited) before any banner appeared.
 /// * `Err(ProcessError::Timeout)` - The timeout expired. The child process is
@@ -80,24 +79,27 @@ enum ReadResult {
 /// * `Err(ProcessError::Io)` - Neither stdout nor stderr was piped.
 pub fn wait_for_ready(child: &mut Child, timeout: Duration) -> Result<String, ProcessError> {
     let (tx, rx) = mpsc::channel::<ReadResult>();
+    let tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
 
     // Spawn a reader per available stream. At least one must be piped.
     let mut readers = 0u32;
 
     if let Some(stdout) = child.stdout.take() {
         let tx = tx.clone();
+        let tail = Arc::clone(&tail);
         std::thread::Builder::new()
             .name("camoufox-stdout-reader".into())
-            .spawn(move || stream_reader("stdout", stdout, tx))
+            .spawn(move || stream_reader("stdout", stdout, tx, tail))
             .map_err(ProcessError::Io)?;
         readers += 1;
     }
 
     if let Some(stderr) = child.stderr.take() {
         let tx = tx.clone();
+        let tail = Arc::clone(&tail);
         std::thread::Builder::new()
             .name("camoufox-stderr-reader".into())
-            .spawn(move || stream_reader("stderr", stderr, tx))
+            .spawn(move || stream_reader("stderr", stderr, tx, tail))
             .map_err(ProcessError::Io)?;
         readers += 1;
     }
@@ -117,23 +119,19 @@ pub fn wait_for_ready(child: &mut Child, timeout: Duration) -> Result<String, Pr
     // Track outstanding readers; only when ALL of them EOF without a banner do
     // we conclude the process exited before becoming ready.
     let mut active = readers;
-    let mut last_output = String::new();
 
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(remaining) {
             Ok(ReadResult::Ready(output)) => return Ok(output),
 
-            Ok(ReadResult::Eof(output)) => {
-                if !output.is_empty() {
-                    last_output = output;
-                }
+            Ok(ReadResult::Eof) => {
                 active -= 1;
                 if active == 0 {
-                    let code = child.try_wait().ok().flatten().and_then(|s| s.code());
+                    let code = exit_code_after_eof(child);
                     return Err(ProcessError::ExitedBeforeReady {
                         code,
-                        stderr: last_output,
+                        stderr: tail.lock().unwrap().iter().cloned().collect(),
                     });
                 }
             }
@@ -151,53 +149,73 @@ pub fn wait_for_ready(child: &mut Child, timeout: Duration) -> Result<String, Pr
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 return Err(ProcessError::Timeout {
                     timeout,
-                    stderr: last_output,
+                    stderr: tail.lock().unwrap().iter().cloned().collect(),
                 });
             }
 
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // All readers dropped their senders without a banner.
-                let code = child.try_wait().ok().flatten().and_then(|s| s.code());
+                let code = exit_code_after_eof(child);
                 return Err(ProcessError::ExitedBeforeReady {
                     code,
-                    stderr: last_output,
+                    stderr: tail.lock().unwrap().iter().cloned().collect(),
                 });
             }
         }
     }
 }
 
-/// Background function that reads one stream line by line, looking for any
-/// readiness banner.
-///
-/// Sends at most one decisive [`ReadResult`] on the channel: `Ready` when a
-/// banner is seen, otherwise `Eof`/`Error` when the stream ends. After a
-/// `Ready` signal it keeps reading to EOF (discarding the data) so the browser
-/// never blocks on a full pipe buffer.
-fn stream_reader<R: Read>(label: &'static str, stream: R, tx: mpsc::Sender<ReadResult>) {
-    let reader = BufReader::new(stream);
-    let mut collected = String::new();
-    let mut signalled = false;
+/// Give a child that just closed its streams time to finish exiting.
+fn exit_code_after_eof(child: &mut Child) -> Option<i32> {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => return None,
+        }
+    }
+}
 
-    for line_result in reader.lines() {
-        match line_result {
-            Ok(line) => {
+/// Scan for readiness, retaining a bounded shared tail and draining to EOF
+/// even after readiness has been reported or the receiver has gone away.
+fn stream_reader<R: Read>(
+    label: &'static str,
+    stream: R,
+    tx: mpsc::Sender<ReadResult>,
+    tail: Arc<Mutex<VecDeque<String>>>,
+) {
+    let mut reader = BufReader::new(stream);
+    let mut buf = Vec::new();
+    let mut signalled = false;
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
                 log::debug!("browser {label}: {line}");
-                if !signalled {
-                    if is_ready_line(&line) {
-                        collected.push_str(&line);
-                        collected.push('\n');
-                        let _ = tx.send(ReadResult::Ready(std::mem::take(&mut collected)));
-                        signalled = true;
-                        // Keep draining the stream to EOF below.
-                    } else {
-                        collected.push_str(&line);
-                        collected.push('\n');
-                    }
+                let mut recent = tail.lock().unwrap();
+                // Bound both line count and retained bytes per line.
+                let end = line.len();
+                let mut start = end.saturating_sub(4096);
+                while !line.is_char_boundary(start) {
+                    start += 1;
+                }
+                recent.push_back(line[start..].to_owned());
+                if recent.len() > 50 {
+                    recent.pop_front();
+                }
+                if !signalled && is_ready_line(&line) {
+                    let output = recent.iter().cloned().collect();
+                    let _ = tx.send(ReadResult::Ready(output));
+                    signalled = true;
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                log::warn!("{label} read error: {e}");
                 if !signalled {
                     let _ = tx.send(ReadResult::Error(e));
                 }
@@ -205,10 +223,8 @@ fn stream_reader<R: Read>(label: &'static str, stream: R, tx: mpsc::Sender<ReadR
             }
         }
     }
-
-    // EOF reached — the child closed this stream (likely exited).
     if !signalled {
-        let _ = tx.send(ReadResult::Eof(collected));
+        let _ = tx.send(ReadResult::Eof);
     }
 }
 
@@ -220,6 +236,52 @@ fn stream_reader<R: Read>(label: &'static str, stream: R, tx: mpsc::Sender<ReadR
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn invalid_utf8_and_large_post_ready_output_are_drained() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "printf '\\377\\376 junk\\nJuggler pipe initialized\\n' >&2; dd if=/dev/zero bs=1024 count=256 >&2 2>/dev/null"])
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn");
+        let started = Instant::now();
+        let output = wait_for_ready(&mut child, Duration::from_secs(3)).expect("ready");
+        assert!(output.contains("junk"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll") {
+                assert!(status.success(), "output must be fully drained: {status}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("output was not drained");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn timeout_includes_recent_output() {
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 70 ]; do echo line-$i >&2; i=$((i+1)); done; exec sleep 30",
+            ])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let result = wait_for_ready(&mut child, Duration::from_millis(300));
+        crate::process::lifecycle::force_kill(&mut child).expect("cleanup");
+        match result {
+            Err(ProcessError::Timeout { stderr, .. }) => {
+                assert!(stderr.contains("line-69"), "{stderr}");
+                assert!(!stderr.contains("line-0\n"), "tail must be bounded");
+                assert!(stderr.lines().count() <= 50);
+            }
+            other => panic!("expected timeout, got {other:?}"),
+        }
+    }
 
     /// Helper: spawn a child process that writes the given text to stderr
     /// and then exits.

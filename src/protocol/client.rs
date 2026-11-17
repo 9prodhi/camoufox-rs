@@ -804,10 +804,6 @@ fn reader_thread(
                 log::debug!("reader thread: transport I/O error: {e}");
                 break;
             }
-            Err(crate::transport::errors::TransportError::ProcessExited(code)) => {
-                log::debug!("reader thread: process exited: {code:?}");
-                break;
-            }
         };
 
         let incoming = match raw_message.classify() {

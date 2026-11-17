@@ -7,6 +7,7 @@
 //! Created via
 //! [`BrowserContext::new_main_frame`](crate::api::context::BrowserContext::new_main_frame).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,7 +16,7 @@ use serde_json::json;
 
 use crate::api::browser::Session;
 use crate::protocol::client::Connection;
-use crate::protocol::errors::{DownloadInfo, ProtocolError, ProtocolErrorKind};
+use crate::protocol::errors::{DownloadInfo, ProtocolError};
 use crate::protocol::events::HandlerId;
 
 /// Upper bound (ms) on how long `navigate` spins waiting for the main-document
@@ -35,6 +36,13 @@ const MAX_ATTACHMENT_WAIT_MS: u64 = 2000;
 #[cfg(test)]
 const MAX_ATTACHMENT_WAIT_MS: u64 = 200;
 
+/// Upper bound (ms) on how long `navigate` waits for the final status when
+/// a redirect is in flight (e.g. after receiving a 3xx or chaining forward).
+#[cfg(not(test))]
+const MAX_REDIRECT_WAIT_MS: u64 = 2000;
+#[cfg(test)]
+const MAX_REDIRECT_WAIT_MS: u64 = 200;
+
 #[derive(Debug, Clone)]
 enum LifecycleSignal {
     Event,
@@ -45,6 +53,11 @@ enum LifecycleSignal {
 struct DownloadState {
     info: Option<DownloadInfo>,
     lifecycle_tx: Option<std::sync::mpsc::Sender<LifecycleSignal>>,
+}
+
+fn is_attachment_type(val: &str) -> bool {
+    let token = val.split(';').next().unwrap_or("").trim();
+    token.eq_ignore_ascii_case("attachment")
 }
 
 fn has_attachment_disposition(params: &serde_json::Value) -> bool {
@@ -59,7 +72,7 @@ fn has_attachment_disposition(params: &serde_json::Value) -> bool {
             let name = h.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if name.eq_ignore_ascii_case("content-disposition") {
                 let val = h.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                if val.to_ascii_lowercase().contains("attachment") {
+                if is_attachment_type(val) {
                     return true;
                 }
             }
@@ -68,7 +81,7 @@ fn has_attachment_disposition(params: &serde_json::Value) -> bool {
         for (name, val) in map {
             if name.eq_ignore_ascii_case("content-disposition") {
                 let val_str = val.as_str().unwrap_or("");
-                if val_str.to_ascii_lowercase().contains("attachment") {
+                if is_attachment_type(val_str) {
                     return true;
                 }
             }
@@ -414,17 +427,13 @@ impl MainFrame {
         match value {
             "load" => Ok("load"),
             "domcontentloaded" => Ok("DOMContentLoaded"),
-            other => Err(ProtocolError {
-                kind: ProtocolErrorKind::Response,
-                method: Some("Page.navigate".into()),
-                message: format!(
+            other => Err(ProtocolError::response_msg(
+                "Page.navigate",
+                format!(
                     "unsupported --wait-until value {:?}; supported values are: load, domcontentloaded",
                     other
                 ),
-                data: None,
-                source: None,
-                download_info: None,
-            }),
+            )),
         }
     }
 
@@ -581,28 +590,20 @@ impl MainFrame {
                 Some("Page.navigate".into()),
                 info,
             )),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ProtocolError {
-                kind: ProtocolErrorKind::Timeout,
-                method: Some("Page.navigate".into()),
-                message: format!(
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ProtocolError::timeout_msg(
+                "Page.navigate",
+                format!(
                     "timed out waiting for lifecycle event {:?} after {:?}",
                     event_name, timeout
                 ),
-                data: None,
-                source: None,
-                download_info: None,
-            }),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProtocolError {
-                kind: ProtocolErrorKind::Closed,
-                method: Some("Page.navigate".into()),
-                message: format!(
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProtocolError::closed_with(
+                "Page.navigate",
+                format!(
                     "channel disconnected while waiting for lifecycle event {:?}",
                     event_name
                 ),
-                data: None,
-                source: None,
-                download_info: None,
-            }),
+            )),
         }
     }
 
@@ -739,6 +740,12 @@ impl MainFrame {
             /// True when the tracked main-document response specifies an attachment
             /// in its Content-Disposition header.
             is_attachment: bool,
+            /// True when a redirect continuation is in flight (e.g. 3xx status received
+            /// or chain forwarded via redirectedFrom, but final response not yet received).
+            redirect_in_flight: bool,
+            /// Map of requestId -> (status, is_attachment) buffering responses in case
+            /// responseReceived arrives before requestWillBeSent chains forward.
+            responses: HashMap<String, (u16, bool)>,
         }
         let net_state: Arc<Mutex<NetState>> = Arc::new(Mutex::new(NetState::default()));
         // Populated after Page.navigate returns; handlers read it under the same Mutex.
@@ -764,6 +771,36 @@ impl MainFrame {
                     }
                 }
 
+                let redirected_from = event.params.get("redirectedFrom").and_then(|v| v.as_str());
+
+                let mut st = state_rws.lock().unwrap();
+
+                // CHAIN FORWARD: a redirect hop's continuation request whose
+                // `redirectedFrom` is the request we're tracking. Advance the
+                // tracked id to this hop so the final response's status wins.
+                // Checked BEFORE nav_id_ok because a redirect continuation is
+                // definitively part of our chain by definition.
+                if let Some(from) = redirected_from {
+                    if st.main_request_id.as_deref() == Some(from) {
+                        st.main_request_id = Some(req_id.clone());
+                        st.redirect_in_flight = true;
+                        // If response for this new hop arrived out-of-order before
+                        // requestWillBeSent, apply it immediately.
+                        if let Some(&(resp_status, is_attach)) = st.responses.get(&req_id) {
+                            st.status = Some(resp_status);
+                            st.is_attachment = is_attach;
+                            st.redirect_in_flight = (300..400).contains(&resp_status);
+                        } else {
+                            // New hop in flight; clear previous hop's intermediate 3xx.
+                            st.status = None;
+                        }
+                        return;
+                    }
+                    // A `redirectedFrom` that does not match our chain belongs to
+                    // some other request; ignore it (cannot hijack the chain).
+                    return;
+                }
+
                 let ev_nav_id = event
                     .params
                     .get("navigationId")
@@ -781,25 +818,6 @@ impl MainFrame {
                     return;
                 }
 
-                let redirected_from = event.params.get("redirectedFrom").and_then(|v| v.as_str());
-
-                let mut st = state_rws.lock().unwrap();
-
-                // CHAIN FORWARD: a redirect hop's continuation request whose
-                // `redirectedFrom` is the request we're tracking. Advance the
-                // tracked id to this hop so the final response's status wins.
-                // Checked before the document-cause gate because redirect
-                // continuations are tied to the chain, not re-discovered.
-                if let Some(from) = redirected_from {
-                    if st.main_request_id.as_deref() == Some(from) {
-                        st.main_request_id = Some(req_id);
-                        return;
-                    }
-                    // A `redirectedFrom` that does not match our chain belongs to
-                    // some other request; ignore it (cannot hijack the chain).
-                    return;
-                }
-
                 // LOCK: only the FIRST document-type request (no redirectedFrom)
                 // establishes the chain head. Accept both the spec-mapped value
                 // ("document") and the raw Firefox type names emitted in practice
@@ -814,7 +832,14 @@ impl MainFrame {
                     "document" | "TYPE_DOCUMENT" | "TYPE_SUBDOCUMENT" | "TYPE_REFRESH"
                 );
                 if is_document_cause && st.main_request_id.is_none() {
-                    st.main_request_id = Some(req_id);
+                    st.main_request_id = Some(req_id.clone());
+                    if let Some(&(resp_status, is_attach)) = st.responses.get(&req_id) {
+                        st.status = Some(resp_status);
+                        st.is_attachment = is_attach;
+                        if (300..400).contains(&resp_status) {
+                            st.redirect_in_flight = true;
+                        }
+                    }
                 }
             }),
         );
@@ -832,19 +857,34 @@ impl MainFrame {
             "Network.responseReceived",
             Arc::new(move |event| {
                 let req_id = match event.params.get("requestId").and_then(|v| v.as_str()) {
-                    Some(id) => id,
+                    Some(id) => id.to_owned(),
                     None => return,
                 };
+                let status = event
+                    .params
+                    .get("status")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|s| u16::try_from(s).ok());
+                let is_attach = has_attachment_disposition(&event.params);
+
                 let mut st = state_rr.lock().unwrap();
-                // Capture for the CURRENT tracked request and ALLOW OVERWRITE so
-                // that on a redirect chain (A→B), the final hop's status wins:
-                // respReceived A sets 301, then after the chain advances to B,
-                // respReceived B overwrites to the final 200/404.
-                if st.main_request_id.as_deref() == Some(req_id) {
-                    if let Some(s) = event.params.get("status").and_then(|v| v.as_u64()) {
-                        st.status = u16::try_from(s).ok();
+                if let Some(s) = status {
+                    // Buffer response in case requestWillBeSent arrives out-of-order.
+                    st.responses.insert(req_id.clone(), (s, is_attach));
+
+                    if st.main_request_id.as_deref() == Some(&req_id) {
+                        let current_is_final =
+                            matches!(st.status, Some(code) if !(300..400).contains(&code));
+                        let new_is_final = !(300..400).contains(&s);
+
+                        // Once a final (non-3xx) status has been captured, do not allow
+                        // an out-of-order 3xx response to overwrite it.
+                        if !current_is_final || new_is_final {
+                            st.status = Some(s);
+                            st.is_attachment = is_attach;
+                            st.redirect_in_flight = (300..400).contains(&s);
+                        }
                     }
-                    st.is_attachment = has_attachment_disposition(&event.params);
                 }
             }),
         );
@@ -910,11 +950,9 @@ impl MainFrame {
         // Cap at 500 ms so we don't meaningfully delay callers without
         // --wait-until when Network events don't flow.
         //
-        // Redirect-aware: a 3xx status means the chain is still in flight (the
-        // browser will issue the redirect-target request next), so we keep
-        // polling until a FINAL (non-3xx) status arrives or the cap elapses —
-        // otherwise we'd return the redirect hop's status (e.g. 301) instead of
-        // the final 200/404.
+        // Redirect-aware: a 3xx status or in-flight redirect continuation waits
+        // up to MAX_REDIRECT_WAIT_MS for the final (non-3xx) status, breaking
+        // immediately as soon as the final status arrives.
         //
         // Download-aware: if the main-document response specifies an attachment,
         // we wait for Browser.downloadCreated (bounded by remaining deadline,
@@ -922,10 +960,11 @@ impl MainFrame {
         // as before.
         const MAX_STATUS_WAIT: Duration = Duration::from_millis(MAX_STATUS_WAIT_MS);
         const MAX_ATTACHMENT_WAIT: Duration = Duration::from_millis(MAX_ATTACHMENT_WAIT_MS);
+        const MAX_REDIRECT_WAIT: Duration = Duration::from_millis(MAX_REDIRECT_WAIT_MS);
         let status_cap = Instant::now() + MAX_STATUS_WAIT;
-        let effective_deadline = status_cap.min(deadline);
         let is_final = |s: Option<u16>| matches!(s, Some(code) if !(300..400).contains(&code));
         let mut attachment_deadline: Option<Instant> = None;
+        let mut redirect_deadline: Option<Instant> = None;
 
         let status_code = loop {
             if let Some(info) = download_state.lock().unwrap().info.clone() {
@@ -935,9 +974,9 @@ impl MainFrame {
                 ));
             }
 
-            let (status, is_attachment) = {
+            let (status, is_attachment, redirect_in_flight) = {
                 let st = net_state.lock().unwrap();
-                (st.status, st.is_attachment)
+                (st.status, st.is_attachment, st.redirect_in_flight)
             };
 
             if is_attachment {
@@ -948,9 +987,14 @@ impl MainFrame {
                 }
             } else if is_final(status) {
                 break status;
-            } else if Instant::now() >= effective_deadline {
-                // Return whatever we have (could be a 3xx if a redirect never
-                // resolved within the budget, or None if nothing arrived).
+            } else if redirect_in_flight {
+                let r_deadline = *redirect_deadline
+                    .get_or_insert_with(|| (Instant::now() + MAX_REDIRECT_WAIT).min(deadline));
+                if Instant::now() >= r_deadline {
+                    break status;
+                }
+            } else if Instant::now() >= status_cap.min(deadline) {
+                // Return whatever we have (or None if no network events flowed).
                 break status;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -1152,14 +1196,7 @@ impl MainFrame {
 
         // Decode base64 using a simple decoder. We avoid adding a dependency
         // on the `base64` crate by implementing a minimal decoder.
-        decode_base64(b64_data).map_err(|msg| ProtocolError {
-            kind: crate::protocol::errors::ProtocolErrorKind::Response,
-            method: Some("Page.screenshot".into()),
-            message: msg,
-            data: None,
-            source: None,
-            download_info: None,
-        })
+        decode_base64(b64_data).map_err(|msg| ProtocolError::response_msg("Page.screenshot", msg))
     }
 
     /// Describe a DOM node.
@@ -1453,14 +1490,10 @@ impl MainFrame {
                     _ => {
                         *self.execution_context_id.lock().unwrap() = None;
                         if Instant::now() >= deadline {
-                            return Err(ProtocolError {
-                                kind: ProtocolErrorKind::Timeout,
-                                method: Some("Runtime.evaluate".into()),
-                                message: "timed out waiting for execution context".into(),
-                                data: None,
-                                source: None,
-                                download_info: None,
-                            });
+                            return Err(ProtocolError::timeout_msg(
+                                "Runtime.evaluate",
+                                "timed out waiting for execution context",
+                            ));
                         }
                         std::thread::sleep(Duration::from_millis(100));
                     }
@@ -1496,14 +1529,10 @@ impl MainFrame {
             }
         }
 
-        Err(ProtocolError {
-            kind: ProtocolErrorKind::Timeout,
-            method: Some("Runtime.evaluate".into()),
-            message: format!("evaluate failed after {MAX_RETRIES} retries"),
-            data: None,
-            source: None,
-            download_info: None,
-        })
+        Err(ProtocolError::timeout_msg(
+            "Runtime.evaluate",
+            format!("evaluate failed after {MAX_RETRIES} retries"),
+        ))
     }
 
     /// Evaluate a JavaScript expression in the page's MAIN world via an injected `<script>` bridge.
@@ -1544,36 +1573,24 @@ impl MainFrame {
         let envelope_val = raw.pointer("/result/value").or_else(|| raw.get("value"));
 
         let bridge: serde_json::Value = match envelope_val {
-            Some(serde_json::Value::String(s)) => {
-                serde_json::from_str(s).map_err(|e| ProtocolError {
-                    kind: ProtocolErrorKind::Response,
-                    method: Some("Runtime.evaluate".into()),
-                    message: format!("failed to parse main-world bridge response: {e}"),
-                    data: None,
-                    source: None,
-                    download_info: None,
-                })?
-            }
+            Some(serde_json::Value::String(s)) => serde_json::from_str(s).map_err(|e| {
+                ProtocolError::response_msg(
+                    "Runtime.evaluate",
+                    format!("failed to parse main-world bridge response: {e}"),
+                )
+            })?,
             Some(obj @ serde_json::Value::Object(_)) => obj.clone(),
             Some(serde_json::Value::Null) | None => {
-                return Err(ProtocolError {
-                    kind: ProtocolErrorKind::Response,
-                    method: Some("Runtime.evaluate".into()),
-                    message: "main-world script did not run (CSP or JavaScript disabled?)".into(),
-                    data: None,
-                    source: None,
-                    download_info: None,
-                });
+                return Err(ProtocolError::response_msg(
+                    "Runtime.evaluate",
+                    "main-world script did not run (CSP or JavaScript disabled?)",
+                ));
             }
             Some(other) => {
-                return Err(ProtocolError {
-                    kind: ProtocolErrorKind::Response,
-                    method: Some("Runtime.evaluate".into()),
-                    message: format!("unexpected main-world bridge response: {other:?}"),
-                    data: None,
-                    source: None,
-                    download_info: None,
-                });
+                return Err(ProtocolError::response_msg(
+                    "Runtime.evaluate",
+                    format!("unexpected main-world bridge response: {other:?}"),
+                ));
             }
         };
 
@@ -1582,14 +1599,7 @@ impl MainFrame {
                 .get("error")
                 .and_then(|v| v.as_str())
                 .unwrap_or("main-world script evaluation failed");
-            return Err(ProtocolError {
-                kind: ProtocolErrorKind::Response,
-                method: Some("Runtime.evaluate".into()),
-                message: err_msg.to_owned(),
-                data: None,
-                source: None,
-                download_info: None,
-            });
+            return Err(ProtocolError::response_msg("Runtime.evaluate", err_msg));
         }
 
         let value = bridge
@@ -1736,14 +1746,8 @@ impl MainFrame {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let body = decode_base64(b64).map_err(|msg| ProtocolError {
-            kind: crate::protocol::errors::ProtocolErrorKind::Response,
-            method: Some("Network.getResponseBody".into()),
-            message: msg,
-            data: None,
-            source: None,
-            download_info: None,
-        })?;
+        let body = decode_base64(b64)
+            .map_err(|msg| ProtocolError::response_msg("Network.getResponseBody", msg))?;
 
         Ok((body, evicted))
     }
@@ -3850,5 +3854,239 @@ mod tests {
         );
 
         h.closed.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn attachment_disposition_type_parsing() {
+        assert!(is_attachment_type("attachment"));
+        assert!(is_attachment_type("Attachment; filename=x"));
+        assert!(!is_attachment_type("inline; filename=\"attachment.pdf\""));
+        assert!(!is_attachment_type("inline"));
+    }
+
+    /// Unit test reproducing the failing redirect race: hop 1 gets 302, hop 2
+    /// request is sent, but hop 2's response is delayed past MAX_STATUS_WAIT_MS
+    /// (50ms in test mode). The redirect_in_flight tracking keeps the loop waiting
+    /// up to MAX_REDIRECT_WAIT_MS (200ms in test mode), so it captures Some(200).
+    #[test]
+    fn navigate_redirect_waits_for_inflight_redirect_response() {
+        let h = build_mock_frame("page-redir-delay", "frame-redir-delay");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+            in_tx
+                .send(navigate_success_response(id, "page-redir-delay"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-delay",
+                    "page-redir-delay",
+                ))
+                .expect("send rws 1");
+            in_tx
+                .send(response_received_msg("req-1", 302, "page-redir-delay"))
+                .expect("send respReceived 1");
+            in_tx
+                .send(redirect_request_msg(
+                    "req-2",
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-delay",
+                    "page-redir-delay",
+                ))
+                .expect("send rws 2");
+
+            // Sleep 70ms: past the 50ms test MAX_STATUS_WAIT_MS, but within 200ms MAX_REDIRECT_WAIT_MS.
+            std::thread::sleep(Duration::from_millis(70));
+            in_tx
+                .send(response_received_msg("req-2", 200, "page-redir-delay"))
+                .expect("send respReceived 2");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com/redirect",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed");
+        assert_eq!(outcome.status_code, Some(200));
+    }
+
+    /// Candidate 3: responseReceived for hop 2 arrives BEFORE requestWillBeSent for hop 2.
+    /// Buffered response is applied when requestWillBeSent chains forward.
+    #[test]
+    fn navigate_redirect_response_arriving_before_request_will_be_sent() {
+        let h = build_mock_frame("page-redir-ooo", "frame-redir-ooo");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+            in_tx
+                .send(navigate_success_response(id, "page-redir-ooo"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-ooo",
+                    "page-redir-ooo",
+                ))
+                .expect("send rws 1");
+            in_tx
+                .send(response_received_msg("req-1", 302, "page-redir-ooo"))
+                .expect("send respReceived 1");
+
+            // Out-of-order: responseReceived for req-2 arrives BEFORE requestWillBeSent for req-2.
+            in_tx
+                .send(response_received_msg("req-2", 200, "page-redir-ooo"))
+                .expect("send respReceived 2 before rws 2");
+            std::thread::sleep(Duration::from_millis(10));
+            in_tx
+                .send(redirect_request_msg(
+                    "req-2",
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-ooo",
+                    "page-redir-ooo",
+                ))
+                .expect("send rws 2");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com/redirect",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed");
+        assert_eq!(outcome.status_code, Some(200));
+    }
+
+    /// Candidate 4: stale 302 response received after final 200 does not overwrite it.
+    #[test]
+    fn navigate_redirect_stale_302_does_not_overwrite_200() {
+        let h = build_mock_frame("page-redir-stale", "frame-redir-stale");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+            in_tx
+                .send(navigate_success_response(id, "page-redir-stale"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-stale",
+                    "page-redir-stale",
+                ))
+                .expect("send rws 1");
+            in_tx
+                .send(redirect_request_msg(
+                    "req-2",
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-stale",
+                    "page-redir-stale",
+                ))
+                .expect("send rws 2");
+            // Hop 2 completes with 200.
+            in_tx
+                .send(response_received_msg("req-2", 200, "page-redir-stale"))
+                .expect("send respReceived 2");
+            // Late/stale 302 response for req-2 does not overwrite 200.
+            in_tx
+                .send(response_received_msg("req-2", 302, "page-redir-stale"))
+                .expect("send late 302");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com/redirect",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed");
+        assert_eq!(outcome.status_code, Some(200));
+    }
+
+    /// Candidate 5: redirect continuation request with missing or different navigationId
+    /// is not rejected by nav_id_ok gate.
+    #[test]
+    fn navigate_redirect_hop_without_matching_nav_id_succeeds() {
+        let h = build_mock_frame("page-redir-navid", "frame-redir-navid");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+            in_tx
+                .send(navigate_success_response(id, "page-redir-navid"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-navid",
+                    "page-redir-navid",
+                ))
+                .expect("send rws 1");
+            in_tx
+                .send(response_received_msg("req-1", 302, "page-redir-navid"))
+                .expect("send respReceived 1");
+            // Redirect continuation has NO navigationId.
+            in_tx
+                .send(redirect_request_msg(
+                    "req-2",
+                    "req-1",
+                    None,
+                    "frame-redir-navid",
+                    "page-redir-navid",
+                ))
+                .expect("send rws 2");
+            in_tx
+                .send(response_received_msg("req-2", 200, "page-redir-navid"))
+                .expect("send respReceived 2");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com/redirect",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed");
+        assert_eq!(outcome.status_code, Some(200));
     }
 }

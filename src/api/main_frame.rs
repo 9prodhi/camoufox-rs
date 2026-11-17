@@ -15,7 +15,7 @@ use serde_json::json;
 
 use crate::api::browser::Session;
 use crate::protocol::client::Connection;
-use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
+use crate::protocol::errors::{DownloadInfo, ProtocolError, ProtocolErrorKind};
 use crate::protocol::events::HandlerId;
 
 /// Upper bound (ms) on how long `navigate` spins waiting for the main-document
@@ -27,6 +27,55 @@ use crate::protocol::events::HandlerId;
 const MAX_STATUS_WAIT_MS: u64 = 500;
 #[cfg(test)]
 const MAX_STATUS_WAIT_MS: u64 = 80;
+
+/// Upper bound (ms) on how long `navigate` waits for `Browser.downloadCreated`
+/// after an attachment response is detected on the main-document request.
+#[cfg(not(test))]
+const MAX_ATTACHMENT_WAIT_MS: u64 = 2000;
+#[cfg(test)]
+const MAX_ATTACHMENT_WAIT_MS: u64 = 200;
+
+#[derive(Debug, Clone)]
+enum LifecycleSignal {
+    Event,
+    Download(DownloadInfo),
+}
+
+#[derive(Default)]
+struct DownloadState {
+    info: Option<DownloadInfo>,
+    lifecycle_tx: Option<std::sync::mpsc::Sender<LifecycleSignal>>,
+}
+
+fn has_attachment_disposition(params: &serde_json::Value) -> bool {
+    let headers_val = params
+        .get("headers")
+        .or_else(|| params.get("response").and_then(|r| r.get("headers")));
+    let Some(headers) = headers_val else {
+        return false;
+    };
+    if let Some(arr) = headers.as_array() {
+        for h in arr {
+            let name = h.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.eq_ignore_ascii_case("content-disposition") {
+                let val = h.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if val.to_ascii_lowercase().contains("attachment") {
+                    return true;
+                }
+            }
+        }
+    } else if let Some(map) = headers.as_object() {
+        for (name, val) in map {
+            if name.eq_ignore_ascii_case("content-disposition") {
+                let val_str = val.as_str().unwrap_or("");
+                if val_str.to_ascii_lowercase().contains("attachment") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 // ---------------------------------------------------------------------------
 // Supporting types
@@ -409,14 +458,35 @@ impl MainFrame {
         event_name: &str,
         timeout: Duration,
     ) -> Result<(), ProtocolError> {
+        self.wait_for_lifecycle_internal(event_name, timeout, None)
+    }
+
+    fn wait_for_lifecycle_internal(
+        &self,
+        event_name: &str,
+        timeout: Duration,
+        external_download_state: Option<&Arc<Mutex<DownloadState>>>,
+    ) -> Result<(), ProtocolError> {
         use std::sync::mpsc;
 
-        let (tx, rx) = mpsc::channel::<()>();
+        if let Some(dl_state) = external_download_state {
+            let st = dl_state.lock().unwrap();
+            if let Some(ref info) = st.info {
+                return Err(ProtocolError::navigation_became_download(
+                    Some("Page.navigate".into()),
+                    info.clone(),
+                ));
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<LifecycleSignal>();
         let frame_id = self.frame_id.clone();
         let expected_name = event_name.to_owned();
         let session_key = self.session.key().to_owned();
 
-        let handler_id = self.connection.on_event(
+        let tx_event = tx.clone();
+        let frame_id_event = frame_id.clone();
+        let event_handler_id = self.connection.on_event(
             &session_key,
             "Page.eventFired",
             Arc::new(move |event| {
@@ -430,25 +500,87 @@ impl MainFrame {
                     .get("frameId")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if ev_name == expected_name && ev_frame == frame_id {
-                    // Ignore send error: the receiver may have already dropped
-                    // (e.g. timeout path ran first). This is benign.
-                    let _ = tx.send(());
+                if ev_name == expected_name && ev_frame == frame_id_event {
+                    let _ = tx_event.send(LifecycleSignal::Event);
                 }
             }),
         );
-
-        // RAII: deregister the handler on every exit path (success, timeout,
-        // error, panic) so the closure cannot leak in the router.
-        let _guard = SubscriptionGuard::session(
+        let _guard_event = SubscriptionGuard::session(
             Arc::clone(&self.connection),
             &session_key,
             "Page.eventFired",
-            handler_id,
+            event_handler_id,
         );
 
+        struct ResetLifecycleTx<'a>(&'a Mutex<DownloadState>);
+        impl<'a> Drop for ResetLifecycleTx<'a> {
+            fn drop(&mut self) {
+                let mut st = self.0.lock().unwrap();
+                st.lifecycle_tx = None;
+            }
+        }
+
+        let _guard_dl: Option<SubscriptionGuard>;
+        let _reset_guard: Option<ResetLifecycleTx>;
+
+        if let Some(dl_state) = external_download_state {
+            {
+                let mut st = dl_state.lock().unwrap();
+                if let Some(ref info) = st.info {
+                    return Err(ProtocolError::navigation_became_download(
+                        Some("Page.navigate".into()),
+                        info.clone(),
+                    ));
+                }
+                st.lifecycle_tx = Some(tx.clone());
+            }
+            _reset_guard = Some(ResetLifecycleTx(dl_state.as_ref()));
+            _guard_dl = None;
+        } else {
+            let tx_dl = tx.clone();
+            let frame_id_dl = frame_id.clone();
+            let dl_handler_id = self.connection.on_event(
+                "",
+                "Browser.downloadCreated",
+                Arc::new(move |event| {
+                    let ev_frame = event.params.get("frameId").and_then(|v| v.as_str());
+                    if ev_frame != Some(&frame_id_dl) {
+                        return;
+                    }
+                    let url = event
+                        .params
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let download_id = event
+                        .params
+                        .get("uuid")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_owned());
+                    let info = DownloadInfo {
+                        url,
+                        frame_id: Some(frame_id_dl.clone()),
+                        download_id,
+                    };
+                    let _ = tx_dl.send(LifecycleSignal::Download(info));
+                }),
+            );
+            _guard_dl = Some(SubscriptionGuard::session(
+                Arc::clone(&self.connection),
+                "",
+                "Browser.downloadCreated",
+                dl_handler_id,
+            ));
+            _reset_guard = None;
+        }
+
         match rx.recv_timeout(timeout) {
-            Ok(()) => Ok(()),
+            Ok(LifecycleSignal::Event) => Ok(()),
+            Ok(LifecycleSignal::Download(info)) => Err(ProtocolError::navigation_became_download(
+                Some("Page.navigate".into()),
+                info,
+            )),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ProtocolError {
                 kind: ProtocolErrorKind::Timeout,
                 method: Some("Page.navigate".into()),
@@ -525,6 +657,52 @@ impl MainFrame {
         let frame_id = self.frame_id.clone();
 
         // -----------------------------------------------------------------------
+        // Download detection: Subscribe to Browser.downloadCreated on the ROOT
+        // session ("") BEFORE sending Page.navigate, filtered to this frame.
+        // -----------------------------------------------------------------------
+        let download_state: Arc<Mutex<DownloadState>> =
+            Arc::new(Mutex::new(DownloadState::default()));
+        let frame_id_dl = frame_id.clone();
+        let dl_state = Arc::clone(&download_state);
+        let dl_id = self.connection.on_event(
+            "",
+            "Browser.downloadCreated",
+            Arc::new(move |event| {
+                let ev_frame = event.params.get("frameId").and_then(|v| v.as_str());
+                if ev_frame != Some(&frame_id_dl) {
+                    return;
+                }
+                let url = event
+                    .params
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let download_id = event
+                    .params
+                    .get("uuid")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned());
+                let info = DownloadInfo {
+                    url,
+                    frame_id: Some(frame_id_dl.clone()),
+                    download_id,
+                };
+                let mut st = dl_state.lock().unwrap();
+                st.info = Some(info.clone());
+                if let Some(ref tx) = st.lifecycle_tx {
+                    let _ = tx.send(LifecycleSignal::Download(info));
+                }
+            }),
+        );
+        let _guard_dl = SubscriptionGuard::session(
+            Arc::clone(&self.connection),
+            "",
+            "Browser.downloadCreated",
+            dl_id,
+        );
+
+        // -----------------------------------------------------------------------
         // G4: Subscribe Network event handlers BEFORE issuing Page.navigate.
         //
         // Correlation approach (redirect-aware):
@@ -558,6 +736,9 @@ impl MainFrame {
             /// Status of the most recent matching response. Overwritten as the
             /// redirect chain progresses so the FINAL hop's status is reported.
             status: Option<u16>,
+            /// True when the tracked main-document response specifies an attachment
+            /// in its Content-Disposition header.
+            is_attachment: bool,
         }
         let net_state: Arc<Mutex<NetState>> = Arc::new(Mutex::new(NetState::default()));
         // Populated after Page.navigate returns; handlers read it under the same Mutex.
@@ -663,6 +844,7 @@ impl MainFrame {
                     if let Some(s) = event.params.get("status").and_then(|v| v.as_u64()) {
                         st.status = u16::try_from(s).ok();
                     }
+                    st.is_attachment = has_attachment_disposition(&event.params);
                 }
             }),
         );
@@ -689,6 +871,15 @@ impl MainFrame {
             &self.frame_id,
             timeout,
         )?;
+
+        // If Browser.downloadCreated arrived before/with ack, short-circuit immediately.
+        if let Some(info) = download_state.lock().unwrap().info.clone() {
+            return Err(ProtocolError::navigation_became_download(
+                Some("Page.navigate".into()),
+                info,
+            ));
+        }
+
         let nav_id = result
             .get("navigationId")
             .and_then(|v| v.as_str())
@@ -706,11 +897,12 @@ impl MainFrame {
             *self.execution_context_id.lock().unwrap() = None;
         }
 
-        // If a lifecycle event was requested, block until it fires — but only
-        // for the time remaining against the single navigate deadline.
+        // If a lifecycle event was requested, block until it fires or a downloadCreated
+        // event short-circuits the wait — but only for the time remaining against
+        // the single navigate deadline.
         if let Some(event_name) = lifecycle_event {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            self.wait_for_lifecycle(event_name, remaining)?;
+            self.wait_for_lifecycle_internal(event_name, remaining, Some(&download_state))?;
         }
 
         // Poll briefly for the status code. The response typically arrives
@@ -723,27 +915,56 @@ impl MainFrame {
         // polling until a FINAL (non-3xx) status arrives or the cap elapses —
         // otherwise we'd return the redirect hop's status (e.g. 301) instead of
         // the final 200/404.
+        //
+        // Download-aware: if the main-document response specifies an attachment,
+        // we wait for Browser.downloadCreated (bounded by remaining deadline,
+        // up to MAX_ATTACHMENT_WAIT_MS). Non-download responses return as fast
+        // as before.
         const MAX_STATUS_WAIT: Duration = Duration::from_millis(MAX_STATUS_WAIT_MS);
+        const MAX_ATTACHMENT_WAIT: Duration = Duration::from_millis(MAX_ATTACHMENT_WAIT_MS);
         let status_cap = Instant::now() + MAX_STATUS_WAIT;
         let effective_deadline = status_cap.min(deadline);
         let is_final = |s: Option<u16>| matches!(s, Some(code) if !(300..400).contains(&code));
+        let mut attachment_deadline: Option<Instant> = None;
+
         let status_code = loop {
-            {
-                let st = net_state.lock().unwrap();
-                if is_final(st.status) {
-                    break st.status;
-                }
+            if let Some(info) = download_state.lock().unwrap().info.clone() {
+                return Err(ProtocolError::navigation_became_download(
+                    Some("Page.navigate".into()),
+                    info,
+                ));
             }
-            if Instant::now() >= effective_deadline {
+
+            let (status, is_attachment) = {
+                let st = net_state.lock().unwrap();
+                (st.status, st.is_attachment)
+            };
+
+            if is_attachment {
+                let dl_deadline = *attachment_deadline
+                    .get_or_insert_with(|| (Instant::now() + MAX_ATTACHMENT_WAIT).min(deadline));
+                if Instant::now() >= dl_deadline {
+                    break status;
+                }
+            } else if is_final(status) {
+                break status;
+            } else if Instant::now() >= effective_deadline {
                 // Return whatever we have (could be a 3xx if a redirect never
                 // resolved within the budget, or None if nothing arrived).
-                break net_state.lock().unwrap().status;
+                break status;
             }
             std::thread::sleep(Duration::from_millis(5));
         };
 
-        // _guard_rws and _guard_rr drop here — both handlers are deregistered
-        // on every exit path (success, error, timeout, panic).
+        if let Some(info) = download_state.lock().unwrap().info.clone() {
+            return Err(ProtocolError::navigation_became_download(
+                Some("Page.navigate".into()),
+                info,
+            ));
+        }
+
+        // _guard_dl, _guard_rws, and _guard_rr drop here — all handlers are
+        // deregistered on every exit path (success, error, timeout, panic).
         Ok(NavigateOutcome {
             nav_id,
             status_code,
@@ -3230,6 +3451,402 @@ mod tests {
                 .event_handler_count_for("page-g4l", "Network.responseReceived"),
             0,
             "Network.responseReceived handler must not leak after a redirect navigate"
+        );
+
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    // -----------------------------------------------------------------------
+    // Download detection unit tests
+    // -----------------------------------------------------------------------
+
+    fn download_created_msg(frame_id: &str, url: &str, uuid: &str) -> RawMessage {
+        RawMessage {
+            id: None,
+            method: Some("Browser.downloadCreated".to_owned()),
+            params: Some(serde_json::json!({
+                "frameId": frame_id,
+                "url": url,
+                "uuid": uuid,
+            })),
+            result: None,
+            error: None,
+            session_id: None,
+        }
+    }
+
+    fn response_received_with_headers_msg(
+        request_id: &str,
+        status: u16,
+        headers: serde_json::Value,
+        session_key: &str,
+    ) -> RawMessage {
+        RawMessage {
+            id: None,
+            method: Some("Network.responseReceived".to_owned()),
+            params: Some(serde_json::json!({
+                "requestId": request_id,
+                "status": status,
+                "statusText": "OK",
+                "headers": headers,
+                "fromServiceWorker": false,
+            })),
+            result: None,
+            error: None,
+            session_id: Some(session_key.to_owned()),
+        }
+    }
+
+    /// (a) ack, then 200 response with an attachment header, then downloadCreated
+    /// → Err NavigationBecameDownload with url/frame/uuid.
+    #[test]
+    fn navigate_attachment_response_then_download_created_returns_error() {
+        let h = build_mock_frame("page-dla", "frame-dla");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+
+            in_tx
+                .send(navigate_success_response(id, "page-dla"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-dla",
+                    "page-dla",
+                ))
+                .expect("send rws");
+            in_tx
+                .send(response_received_with_headers_msg(
+                    "req-1",
+                    200,
+                    serde_json::json!([
+                        {"name": "Content-Disposition", "value": "attachment; filename=\"report.pdf\""}
+                    ]),
+                    "page-dla",
+                ))
+                .expect("send respReceived with attachment");
+
+            std::thread::sleep(Duration::from_millis(15));
+            in_tx
+                .send(download_created_msg(
+                    "frame-dla",
+                    "https://example.com/report.pdf",
+                    "dl-uuid-123",
+                ))
+                .expect("send downloadCreated");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com/report.pdf",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let err = result.expect_err("navigate to attachment must return Err");
+        assert_eq!(
+            err.kind,
+            ProtocolErrorKind::NavigationBecameDownload,
+            "expected NavigationBecameDownload, got {:?}",
+            err.kind
+        );
+        let info = err.download_info.expect("download_info populated");
+        assert_eq!(info.url, "https://example.com/report.pdf");
+        assert_eq!(info.frame_id.as_deref(), Some("frame-dla"));
+        assert_eq!(info.download_id.as_deref(), Some("dl-uuid-123"));
+
+        // (e) No handlers leak after navigate.
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("", "Browser.downloadCreated"),
+            0,
+            "Browser.downloadCreated handler must not leak"
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dla", "Network.requestWillBeSent"),
+            0,
+            "Network.requestWillBeSent handler must not leak"
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dla", "Network.responseReceived"),
+            0,
+            "Network.responseReceived handler must not leak"
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dla", "Page.eventFired"),
+            0,
+            "Page.eventFired handler must not leak"
+        );
+    }
+
+    /// (b) ack, then downloadCreated during wait_until=load → Err promptly
+    /// (well before the timeout).
+    #[test]
+    fn navigate_download_created_during_wait_until_load_returns_error_promptly() {
+        let h = build_mock_frame("page-dlb", "frame-dlb");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+
+            in_tx
+                .send(navigate_success_response(id, "page-dlb"))
+                .expect("send nav response");
+
+            // Delay slightly so wait_for_lifecycle is actively waiting.
+            std::thread::sleep(Duration::from_millis(20));
+            in_tx
+                .send(download_created_msg(
+                    "frame-dlb",
+                    "https://example.com/invoice.pdf",
+                    "dl-uuid-456",
+                ))
+                .expect("send downloadCreated");
+        });
+
+        let start = Instant::now();
+        let result = h.frame.navigate(
+            "https://example.com/invoice.pdf",
+            NavigateOptions {
+                wait_until: Some("load".to_owned()),
+                ..Default::default()
+            },
+            Duration::from_secs(10),
+        );
+        let elapsed = start.elapsed();
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "download event must short-circuit lifecycle wait promptly, took {elapsed:?}"
+        );
+
+        let err = result.expect_err("navigate with wait_until on download must error");
+        assert_eq!(err.kind, ProtocolErrorKind::NavigationBecameDownload);
+        let info = err.download_info.expect("download_info populated");
+        assert_eq!(info.url, "https://example.com/invoice.pdf");
+        assert_eq!(info.frame_id.as_deref(), Some("frame-dlb"));
+        assert_eq!(info.download_id.as_deref(), Some("dl-uuid-456"));
+
+        // (e) No handlers leak after navigate.
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("", "Browser.downloadCreated"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlb", "Network.requestWillBeSent"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlb", "Network.responseReceived"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlb", "Page.eventFired"),
+            0
+        );
+    }
+
+    /// (c) downloadCreated for a DIFFERENT frameId is ignored and navigate returns Ok.
+    #[test]
+    fn navigate_download_created_for_different_frame_is_ignored() {
+        let h = build_mock_frame("page-dlc", "frame-dlc");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+
+            in_tx
+                .send(navigate_success_response(id, "page-dlc"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-c",
+                    Some("nav-1"),
+                    "frame-dlc",
+                    "page-dlc",
+                ))
+                .expect("send rws");
+            in_tx
+                .send(response_received_msg("req-c", 200, "page-dlc"))
+                .expect("send responseReceived");
+            // Inject a downloadCreated for another frame.
+            in_tx
+                .send(download_created_msg(
+                    "other-frame",
+                    "https://example.com/other.pdf",
+                    "dl-uuid-other",
+                ))
+                .expect("send downloadCreated for other frame");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed ignoring other frame's download");
+        assert_eq!(outcome.status_code, Some(200));
+
+        // (e) No handlers leak after navigate.
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("", "Browser.downloadCreated"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlc", "Network.requestWillBeSent"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlc", "Network.responseReceived"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlc", "Page.eventFired"),
+            0
+        );
+    }
+
+    /// (d) a normal 200 navigation returns as fast as before, with no added wait.
+    #[test]
+    fn navigate_normal_200_returns_fast_without_added_wait() {
+        let h = build_mock_frame("page-dld", "frame-dld");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+
+            in_tx
+                .send(navigate_success_response(id, "page-dld"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-d",
+                    Some("nav-1"),
+                    "frame-dld",
+                    "page-dld",
+                ))
+                .expect("send rws");
+            in_tx
+                .send(response_received_msg("req-d", 200, "page-dld"))
+                .expect("send responseReceived");
+        });
+
+        let start = Instant::now();
+        let result = h.frame.navigate(
+            "https://example.com",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+        let elapsed = start.elapsed();
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("normal 200 navigation must succeed");
+        assert_eq!(outcome.status_code, Some(200));
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "normal 200 navigation must return immediately without waiting, took {elapsed:?}"
+        );
+
+        // (e) No handlers leak after navigate.
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("", "Browser.downloadCreated"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dld", "Network.requestWillBeSent"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dld", "Network.responseReceived"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dld", "Page.eventFired"),
+            0
+        );
+    }
+
+    /// (e) Standalone wait_for_lifecycle handler leak check and download wake.
+    #[test]
+    fn wait_for_lifecycle_standalone_wakes_on_download_and_does_not_leak() {
+        let h = build_mock_frame("page-dle", "frame-dle");
+        let in_tx = h.in_tx.clone();
+
+        // 1. Download event wakes standalone wait_for_lifecycle promptly.
+        let tx1 = in_tx.clone();
+        let responder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            tx1.send(download_created_msg(
+                "frame-dle",
+                "https://example.com/standalone.pdf",
+                "dl-uuid-standalone",
+            ))
+            .unwrap();
+        });
+
+        let err = h
+            .frame
+            .wait_for_lifecycle("load", Duration::from_secs(5))
+            .expect_err("standalone wait must error on download");
+        assert_eq!(err.kind, ProtocolErrorKind::NavigationBecameDownload);
+        let info = err.download_info.expect("download_info");
+        assert_eq!(info.url, "https://example.com/standalone.pdf");
+        responder.join().unwrap();
+
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dle", "Page.eventFired"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("", "Browser.downloadCreated"),
+            0
         );
 
         h.closed.store(true, Ordering::SeqCst);

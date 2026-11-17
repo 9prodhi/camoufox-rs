@@ -67,7 +67,52 @@ All notable changes to camoufox-rs are documented here.
   network response is received). Navigate never fails on 4xx/5xx responses — the result is
   always `"ok": true` and the caller inspects `status_code` to decide how to proceed.
 
+- **`evaluate --main-world` / `MainFrame::evaluate_main_world`.** On Camoufox 158, `evaluate`
+  runs in an isolated world: the DOM is shared, but globals set by page scripts are invisible.
+  The new API runs a synchronous expression in the page's main world through an injected
+  `<script>` bridge (expression passed only as a JSON string literal) and returns the plain
+  value. The page can observe it, and a strict CSP blocks it.
+- `ProtocolError::{new, closed_with, response_msg, timeout_msg}` constructors;
+  `Connection::off_event_global`; `NulJsonCodec::with_max_frame`; `process::ChildGuard`.
+
 ### Fixed
+
+- **Undefined behaviour in the connection.** `SplitTransport` handed `&mut PipeTransport`
+  to the reader and writer threads at the same time (both wrote `closed`, and `close()` could
+  free the writer mid-send). Replaced with an owned reader/writer split.
+- **One bad handler or frame could kill the connection.** Event handlers ran under the
+  connection mutex, so a panic poisoned it and a re-entrant handler deadlocked the reader.
+  Handlers now run outside the lock inside `catch_unwind`. A single undecodable frame (e.g. a
+  lone UTF-16 surrogate from `console.log`) used to close the whole connection; it is now
+  skipped.
+- **Handler leaks.** Each `new_main_frame` permanently registered four event handlers that
+  ran on every later event, and one buffered without bound after an attach timeout. All are
+  now RAII-scoped; `MainFrame` removes its listeners on drop.
+- **60s hangs on closed or crashed tabs.** `Browser.detachedFromTarget` and `Page.crashed`
+  now fail in-flight calls immediately. When the browser exits, event waiters are released.
+- **Downloads landed in `~/Downloads`.** Download cancellation was only applied to the
+  default context. Every new context now cancels downloads unless configured otherwise.
+- **`evaluate` ignored its timeout** for the RPC itself (it used the 60s default) and reported
+  timeouts as `Closed`. The CLI `evaluate` reported page exceptions as success and printed a
+  raw `{"result":{}}` for `undefined`.
+- **Orphaned browsers and leaked fds.** A failed launch left the browser running with its
+  profile deleted underneath it. Failed spawns leaked two fds each. Killing the daemon left
+  browsers behind. Now: kill-on-drop guard, `OwnedFd` pipes, `PR_SET_PDEATHSIG` (Linux), and
+  SIGTERM/SIGINT run a clean shutdown. `stop` honours `close_timeout` and never reports
+  success without reaping.
+- **Launch stalled for the full timeout** if the browser printed a non-UTF-8 byte before its
+  readiness banner. Output is now decoded lossily and drained for the browser's lifetime.
+- **macOS build.** `pipe2` does not exist on Apple targets; the crate failed to compile there.
+- **Daemon serialized everything.** One `launch` blocked every other client for up to 180s.
+  The daemon now uses per-instance locks and starts browsers without holding any lock. The
+  client's read timeout follows the request's own timeout (it was a fixed 120s).
+- **`cargo test` did not compile without `--features cli`.**
+- `cookies` printed its count on stdout (now stderr). `screenshot -o <relative>` wrote
+  relative to the daemon's cwd. `LaunchConfig::validate` was never called, so a missing
+  profile panicked. `--juggler-*` args with `--` prefixes slipped past validation.
+  `obs::protocol_log` panicked on multi-byte UTF-8 at the truncation point.
+- `Browser::new_context` silently used the default context if the browser returned no
+  `browserContextId`. The codec buffered without limit; frames are now capped at 256 MiB.
 
 - **`press Enter` never submitted forms.** Juggler's `Page.dispatchKeyEvent` routes a keydown
   through `commitCompositionWith(text, …)` whenever `text` is present *and differs from*
@@ -84,8 +129,31 @@ All notable changes to camoufox-rs are documented here.
   `CAMOU_CONFIG`, which also fixes the header. Nothing is set when a `CAMOU_CONFIG*` variable is
   already exported or the version can't be read.
 
+### Security
+
+- **Any request containing the text `Shutdown` stopped the daemon.** Shutdown was detected
+  with a substring match on the raw request, so `type I P Shutdown` killed every browser.
+  It is now matched on the parsed request.
+- **Socket directory hijack.** When `XDG_RUNTIME_DIR` is unset, another local user could
+  pre-create `/tmp/camoufox-<uid>`, swap in their own socket, and read `fill` values, cookies,
+  and headers. The runtime directory must now be a real, owner-only directory owned by the
+  current user. Linux also checks the peer uid on every connection.
+- **The stale-socket cleanup deleted any file** at `--socket` and chmodded its parent. It now
+  only replaces sockets. A `<socket>.lock` flock prevents two daemons racing for one path.
+- **Screenshots were world-readable** at a shared `/tmp/screenshot-p1.png`. They now default
+  to the private runtime directory, are named per instance and page, and use mode `0600`.
+- IPC requests are capped at 16 MiB with a 30s read timeout.
+
 ### Changed
 
+- **BREAKING:** `protocol::events::EventHandler` is `Arc<dyn Fn(&EventMessage) + Send + Sync>`
+  (was `Box<dyn Fn + Send>`), and `Connection::on_event_global` returns a `HandlerId`.
+- **BREAKING:** removed the unused `compat` module, `CodecError::Incomplete`, and
+  `TransportError::ProcessExited`.
+- **BREAKING (CLI):** removed the no-op `serve --foreground` flag. The plugin skill reads the
+  CLI path from `CAMOUFOX_CLI`; `CAMOUFOX_BIN` still means the browser executable.
+- `rust-version` is now 1.85. The previous 1.70 was not buildable: clap 4.5 needs 1.74 and
+  tempfile's getrandom needs 1.85.
 - **`screenshot` with no crop options now captures the current viewport.** It previously
   always clipped to `(0, 0, innerWidth, innerHeight)`; because Juggler's clip is in *document*
   coordinates, a scrolled page was captured from the top of the document rather than from

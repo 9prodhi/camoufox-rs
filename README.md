@@ -8,14 +8,14 @@ This crate implements the full stack needed to automate a Camoufox browser proce
 
 - Library crate with a synchronous API for Juggler domains (`Browser`, `MainFrame`, `Network`, `Runtime`, `Heap`)
 - Optional CLI (`--features cli`) with a Unix socket daemon for multi-instance management
-- Unix-first implementation (Linux/macOS style process + fd pipe model)
+- Unix implementation (process + fd pipe model): Linux and macOS. Windows is not supported.
 - Protocol reference docs in-repo:
   - `docs/PROTOCOL.md`
   - `docs/UNDERSTANDING.md`
 
 ## Requirements
 
-- Rust 1.70+ (see `Cargo.toml`)
+- Rust 1.85+ (`rust-version` in `Cargo.toml`)
 - Unix-like OS for full functionality (process spawning + Unix sockets)
 - Camoufox binary available on disk
 
@@ -46,7 +46,7 @@ The CLI uses a daemon process and newline-delimited JSON over a Unix domain sock
 Start daemon (run in a dedicated shell):
 
 ```bash
-cargo run --features cli --bin camoufox -- serve --foreground
+cargo run --features cli --bin camoufox -- serve
 ```
 
 Launch an instance:
@@ -67,6 +67,17 @@ Navigate and evaluate:
 cargo run --features cli --bin camoufox -- navigate <instance_id> <page_id> https://example.com
 cargo run --features cli --bin camoufox -- evaluate <instance_id> <page_id> "document.title"
 ```
+
+`evaluate` runs in an isolated JavaScript world (Camoufox 158+): the DOM is shared with the
+page, but globals defined by page scripts (`window.__NEXT_DATA__`, app state) are not visible.
+To read them, add `--main-world`:
+
+```bash
+cargo run --features cli --bin camoufox -- evaluate --main-world <instance_id> <page_id> "window.__NEXT_DATA__.page"
+```
+
+`--main-world` injects a `<script>` into the page, so it accepts synchronous expressions only,
+the page can observe it, and a strict Content-Security-Policy blocks it (you get an error).
 
 Navigate with wait-until and status_code:
 
@@ -195,6 +206,25 @@ Socket resolution:
 - else `$XDG_RUNTIME_DIR/camoufox/daemon.sock`
 - else `/tmp/camoufox-<uid>/daemon.sock`
 
+Daemon security and lifecycle:
+
+- The default runtime directory is created `0700`. The daemon and the client both refuse to
+  use it unless it is a real directory (not a symlink), owned by the current user, with no
+  group/other permissions. On Linux the daemon also rejects connections from other uids
+  (`SO_PEERCRED`). An explicit `--socket` is used as given, and the daemon never chmods its
+  parent.
+- The daemon only ever replaces a stale *socket* at the path, never another kind of file.
+  It holds an exclusive lock on `<socket>.lock` for its lifetime, so a second `serve`
+  on the same path fails with `daemon is already running`.
+- `shutdown`, SIGTERM and SIGINT stop every browser, wait for in-flight requests, and
+  remove the socket. On Linux, browsers are spawned with `PR_SET_PDEATHSIG`, so they die
+  with the daemon even on SIGKILL (temporary profiles may remain in that case).
+- Screenshots without `-o` are written to the runtime directory as
+  `screenshot-<instance>-<page>.<ext>` with mode `0600`. A relative `-o` path is resolved
+  against the client's working directory.
+- Requests for different instances run in parallel. Requests to the same instance are
+  serialized. `launch` holds no lock while the browser starts.
+
 ## Library Bootstrap Example
 
 The low-level lifecycle is:
@@ -274,9 +304,15 @@ let outcome = main_frame.navigate("https://example.com", Default::default(), Dur
 println!("status: {:?}", outcome.status_code);
 
 // evaluate(expr, timeout) — the cached execution context is maintained internally,
-// so no execution-context id is threaded through.
+// so no execution-context id is threaded through. It runs in an isolated world:
+// DOM access works, page-defined JS globals are not visible.
 let title = main_frame.evaluate("document.title", Duration::from_secs(15))?;
 println!("title: {title}");
+
+// evaluate_main_world runs a synchronous expression in the page's own world via an
+// injected <script> (observable by the page; blocked by strict CSP) and returns the
+// plain JSON value.
+let app_state = main_frame.evaluate_main_world("window.__NEXT_DATA__.page", Duration::from_secs(15))?;
 ```
 
 A complete, runnable version is in [`examples/web_browse.rs`](examples/web_browse.rs):
@@ -296,7 +332,19 @@ End-to-end wiring is also exercised in `tests/integration.rs` and `src/cli/insta
 - Navigations that the browser diverts into a download (e.g. a
   `Content-Disposition: attachment` URL) are detected via `Browser.downloadCreated`
   and surfaced promptly as a `NavigationBecameDownload` error instead of blocking
-  forever waiting for a navigation response that never arrives.
+  forever waiting for a navigation response that never arrives. Every context
+  created by `Browser::new_context` cancels downloads unless
+  `ContextOptions::download_options` says otherwise, so nothing is written to disk.
+- Event handlers run outside the connection lock and inside `catch_unwind`: a
+  panicking handler is logged instead of killing the connection, and a handler may
+  call back into the connection. An undecodable frame from the browser is logged and
+  skipped.
+- When a page closes (`Browser.detachedFromTarget`) or crashes (`Page.crashed`),
+  in-flight calls on it fail immediately with `Closed` / `Crashed`. If the browser
+  goes away entirely, every pending call and event waiter is released.
+- `MainFrame` removes its event listeners when dropped, so opening and closing tabs in
+  a long-running process does not accumulate handlers.
+- A failed launch (readiness timeout, bootstrap error) kills and reaps the browser.
 
 ## Architecture
 
@@ -308,7 +356,6 @@ Core layers (top to bottom):
 - `codec/`: null-byte-delimited JSON framing (`NulJsonCodec`)
 - `process/`: spawn/readiness/lifecycle around Camoufox child process
 - `cli/` (feature-gated): daemon + command dispatch over Unix socket
-- `compat/`: Camoufox detection/version capability checks
 - `obs/`: protocol logging helpers
 
 ## Testing
@@ -348,10 +395,11 @@ RUST_LOG=camoufox=trace cargo test
 - API is synchronous/blocking today (no async runtime integration)
 - `MainFrame` is top-frame only; there is no public API for operating on sub-frames
 - CLI daemon uses in-memory instance state only
-- CLI daemon executes commands **serially** — it holds a single lock for the duration of each
-  request across all instances. A long-polling command (e.g. `wait --timeout 60`) on one page
-  therefore blocks every other instance and page until it returns. Fine for driving a single
-  browser; keep timeouts tight if you drive multiple instances from one daemon.
+- Requests to the *same* instance are serialized: a long-polling command (e.g.
+  `wait --timeout 60`) on one page blocks other commands for that instance until it returns.
+  Other instances are unaffected.
+- `stop` / `shutdown` take up to the close timeout (10s) per browser: Camoufox 158 does not
+  act on `Browser.close`, so each browser is SIGKILLed once the timeout expires.
 - `back` / `forward` are wired to `Page.goBack` / `Page.goForward` but are inert against the
   Camoufox builds tested here: pages created via `Browser.newPage` expose no session history
   (`history.length === 0`), so both always report "no history entry". Re-`navigate` instead.

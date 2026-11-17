@@ -72,6 +72,8 @@ All notable changes to camoufox-rs are documented here.
   The new API runs a synchronous expression in the page's main world through an injected
   `<script>` bridge (expression passed only as a JSON string literal) and returns the plain
   value. The page can observe it, and a strict CSP blocks it.
+- Protocol tracing: `RUST_LOG=camoufox::protocol=trace` logs every SEND/RECV message with
+  bounded previews (no cost when disabled).
 - `ProtocolError::{new, closed_with, response_msg, timeout_msg}` constructors;
   `Connection::off_event_global`; `NulJsonCodec::with_max_frame`; `process::ChildGuard`.
 
@@ -111,6 +113,15 @@ All notable changes to camoufox-rs are documented here.
   relative to the daemon's cwd. `LaunchConfig::validate` was never called, so a missing
   profile panicked. `--juggler-*` args with `--` prefixes slipped past validation.
   `obs::protocol_log` panicked on multi-byte UTF-8 at the truncation point.
+- **Downloads were reported as successful navigations on Camoufox 158.** The browser acks
+  `Page.navigate` before `Browser.downloadCreated` arrives, so `navigate` returned `Ok(200)`.
+  It now watches for the download event itself, including during `--wait-until`, and returns
+  `NavigationBecameDownload`.
+- **`navigate` intermittently reported a redirect's 3xx instead of the final status.** A local
+  302 -> 200 chain takes ~500ms on Camoufox 158, which straddled the fixed 500ms status cap
+  (the redirect integration test failed ~50% of runs). `navigate` now waits up to 2s while a
+  redirect hop is in flight, tolerates out-of-order events, and reports `None` rather than a
+  stale 3xx if the chain never completes.
 - `Browser::new_context` silently used the default context if the browser returned no
   `browserContextId`. The codec buffered without limit; frames are now capped at 256 MiB.
 

@@ -316,6 +316,7 @@ impl Connection {
             download_info: None,
         })?;
 
+        crate::obs::log_outgoing(&value);
         let mut writer = self
             .writer
             .lock()
@@ -483,6 +484,7 @@ impl Session {
             (rx, id, value)
         };
         // Inner lock released. Now send through the transport with write serialization.
+        crate::obs::log_outgoing(&value);
         {
             let mut writer = self
                 .writer
@@ -644,6 +646,7 @@ impl Session {
             (rx, value, id)
         };
 
+        crate::obs::log_outgoing(&value);
         {
             let mut writer = self
                 .writer
@@ -806,6 +809,7 @@ fn reader_thread(
             }
         };
 
+        crate::obs::log_incoming_message(&raw_message);
         let incoming = match raw_message.classify() {
             Some(msg) => msg,
             None => {

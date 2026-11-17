@@ -129,14 +129,7 @@ impl PendingMap {
             let error = match kind {
                 ProtocolErrorKind::Closed => ProtocolError::closed(Some(pending.method)),
                 ProtocolErrorKind::Crashed => ProtocolError::crashed(Some(pending.method)),
-                _ => ProtocolError {
-                    kind,
-                    method: Some(pending.method),
-                    message: format!("{kind:?}"),
-                    data: None,
-                    source: None,
-                    download_info: None,
-                },
+                _ => ProtocolError::new(kind, Some(pending.method), format!("{kind:?}")),
             };
             let _ = pending.sender.send(Err(error));
         }

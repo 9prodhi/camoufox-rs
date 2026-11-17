@@ -53,6 +53,32 @@ pub struct ProtocolError {
 }
 
 impl ProtocolError {
+    /// Create a new `ProtocolError` with the given kind, optional method, and message.
+    pub fn new(
+        kind: ProtocolErrorKind,
+        method: Option<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            method,
+            message: message.into(),
+            data: None,
+            source: None,
+            download_info: None,
+        }
+    }
+
+    /// Build a `Closed` error with a specific method and custom message.
+    pub fn closed_with(method: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(ProtocolErrorKind::Closed, Some(method.into()), message)
+    }
+
+    /// Build a `Response` error with a specific method and plain message string.
+    pub fn response_msg(method: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(ProtocolErrorKind::Response, Some(method.into()), message)
+    }
+
     pub fn response(method: impl Into<String>, error: ErrorData) -> Self {
         Self {
             kind: ProtocolErrorKind::Response,
@@ -65,25 +91,11 @@ impl ProtocolError {
     }
 
     pub fn closed(method: Option<String>) -> Self {
-        Self {
-            kind: ProtocolErrorKind::Closed,
-            method,
-            message: "Session closed".into(),
-            data: None,
-            source: None,
-            download_info: None,
-        }
+        Self::new(ProtocolErrorKind::Closed, method, "Session closed")
     }
 
     pub fn crashed(method: Option<String>) -> Self {
-        Self {
-            kind: ProtocolErrorKind::Crashed,
-            method,
-            message: "Page crashed".into(),
-            data: None,
-            source: None,
-            download_info: None,
-        }
+        Self::new(ProtocolErrorKind::Crashed, method, "Page crashed")
     }
 
     pub fn transport(err: TransportError) -> Self {
@@ -127,14 +139,16 @@ impl ProtocolError {
     /// [`Session::send_with_timeout`](crate::protocol::client::Session::send_with_timeout).
     pub fn timeout(method: impl Into<String>, deadline: Duration) -> Self {
         let method = method.into();
-        Self {
-            kind: ProtocolErrorKind::Timeout,
-            message: format!("Request '{method}' timed out after {:?}", deadline,),
-            method: Some(method),
-            data: None,
-            source: None,
-            download_info: None,
-        }
+        Self::new(
+            ProtocolErrorKind::Timeout,
+            Some(method.clone()),
+            format!("Request '{method}' timed out after {deadline:?}"),
+        )
+    }
+
+    /// Build a `Timeout` error with a specific method and plain message string.
+    pub fn timeout_msg(method: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(ProtocolErrorKind::Timeout, Some(method.into()), message)
     }
 }
 
@@ -159,5 +173,89 @@ impl std::error::Error for ProtocolError {
 impl From<TransportError> for ProtocolError {
     fn from(e: TransportError) -> Self {
         Self::transport(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_constructor() {
+        let err = ProtocolError::new(
+            ProtocolErrorKind::Timeout,
+            Some("Page.navigate".into()),
+            "custom error message",
+        );
+        assert_eq!(err.kind, ProtocolErrorKind::Timeout);
+        assert_eq!(err.method.as_deref(), Some("Page.navigate"));
+        assert_eq!(err.message, "custom error message");
+        assert!(err.data.is_none());
+        assert!(err.source.is_none());
+        assert!(err.download_info.is_none());
+
+        // Without method
+        let err_no_method = ProtocolError::new(ProtocolErrorKind::Closed, None, "target closed");
+        assert_eq!(err_no_method.kind, ProtocolErrorKind::Closed);
+        assert!(err_no_method.method.is_none());
+        assert_eq!(err_no_method.message, "target closed");
+    }
+
+    #[test]
+    fn timeout_constructor() {
+        let d = Duration::from_millis(500);
+        let err = ProtocolError::timeout("Browser.getVersion", d);
+        assert_eq!(err.kind, ProtocolErrorKind::Timeout);
+        assert_eq!(err.method.as_deref(), Some("Browser.getVersion"));
+        assert_eq!(
+            err.message,
+            format!("Request 'Browser.getVersion' timed out after {:?}", d)
+        );
+        assert!(err.data.is_none());
+        assert!(err.source.is_none());
+        assert!(err.download_info.is_none());
+    }
+
+    #[test]
+    fn timeout_msg_constructor() {
+        let err = ProtocolError::timeout_msg("Page.navigate", "request timed out");
+        assert_eq!(err.kind, ProtocolErrorKind::Timeout);
+        assert_eq!(err.method.as_deref(), Some("Page.navigate"));
+        assert_eq!(err.message, "request timed out");
+        assert!(err.data.is_none());
+        assert!(err.source.is_none());
+        assert!(err.download_info.is_none());
+    }
+
+    #[test]
+    fn closed_with_constructor() {
+        let err =
+            ProtocolError::closed_with("Target.closeTarget", "Browser window was closed by user");
+        assert_eq!(err.kind, ProtocolErrorKind::Closed);
+        assert_eq!(err.method.as_deref(), Some("Target.closeTarget"));
+        assert_eq!(err.message, "Browser window was closed by user");
+        assert!(err.data.is_none());
+        assert!(err.source.is_none());
+        assert!(err.download_info.is_none());
+    }
+
+    #[test]
+    fn response_msg_constructor() {
+        let err = ProtocolError::response_msg("Runtime.evaluate", "Syntax error in expression");
+        assert_eq!(err.kind, ProtocolErrorKind::Response);
+        assert_eq!(err.method.as_deref(), Some("Runtime.evaluate"));
+        assert_eq!(err.message, "Syntax error in expression");
+        assert!(err.data.is_none());
+        assert!(err.source.is_none());
+        assert!(err.download_info.is_none());
+    }
+
+    #[test]
+    fn display_formatting() {
+        let err = ProtocolError::timeout_msg("Page.navigate", "timed out");
+        assert_eq!(format!("{err}"), "Timeout (Page.navigate): timed out");
+
+        let err_no_method = ProtocolError::new(ProtocolErrorKind::Closed, None, "closed");
+        assert_eq!(format!("{err_no_method}"), "Closed: closed");
     }
 }

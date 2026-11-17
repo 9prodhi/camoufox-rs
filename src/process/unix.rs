@@ -71,6 +71,7 @@ unsafe fn close_fd(fd: libc::c_int) {
 /// - `ProcessError::Io` if pipe creation fails.
 /// - `ProcessError::SpawnFailed` if `Command::spawn` fails.
 pub fn spawn(config: &LaunchConfig) -> Result<LaunchedProcess, ProcessError> {
+    config.validate().map_err(std::io::Error::other)?;
     // --- Create pipe pairs ---
     //
     // Pipe A (commands):  parent writes to pipe_a_write,

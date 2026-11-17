@@ -30,6 +30,8 @@ const CAMOU_CONFIG_CHUNK_SIZE_WINDOWS: usize = 2047;
 pub enum ConfigError {
     /// The executable path is empty.
     MissingExecutable,
+    /// No profile directory has been assigned before launch.
+    MissingProfile,
     /// A user-supplied arg collides with internally managed flags.
     ForbiddenArg(String),
     /// A user-supplied arg is empty.
@@ -40,6 +42,7 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingExecutable => write!(f, "executable path must not be empty"),
+            Self::MissingProfile => write!(f, "profile_dir must be set before launch"),
             Self::ForbiddenArg(a) => write!(
                 f,
                 "user arg {a:?} conflicts with managed flags (-profile, -juggler)"
@@ -122,9 +125,13 @@ impl LaunchConfig {
             if lower.starts_with("-profile") || lower.starts_with("--profile") {
                 return Err(ConfigError::ForbiddenArg(arg.clone()));
             }
-            if lower.starts_with("-juggler") {
+            if lower.trim_start_matches('-').starts_with("juggler") {
                 return Err(ConfigError::ForbiddenArg(arg.clone()));
             }
+        }
+
+        if self.profile_dir.is_none() {
+            return Err(ConfigError::MissingProfile);
         }
 
         Ok(())
@@ -342,14 +349,47 @@ mod tests {
     }
 
     #[test]
-    fn validate_ok_for_default() {
+    fn validate_requires_profile_before_launch() {
         let cfg = LaunchConfig::default();
-        cfg.validate().unwrap();
+        assert!(matches!(cfg.validate(), Err(ConfigError::MissingProfile)));
+    }
+
+    #[test]
+    fn validate_rejects_all_juggler_dash_prefixes() {
+        for arg in ["--juggler-pipe", "--juggler=x", "---JuGgLeR-pipe"] {
+            let cfg = LaunchConfig {
+                profile_dir: Some(PathBuf::from("/tmp/profile")),
+                args: vec![arg.into()],
+                ..Default::default()
+            };
+            assert!(matches!(cfg.validate(), Err(ConfigError::ForbiddenArg(_))));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_rejects_invalid_config_without_panicking() {
+        for cfg in [
+            LaunchConfig::default(),
+            LaunchConfig {
+                profile_dir: Some(PathBuf::from("/tmp/profile")),
+                args: vec!["--juggler-pipe".into()],
+                ..Default::default()
+            },
+        ] {
+            let err = match crate::process::unix::spawn(&cfg) {
+                Err(err) => err,
+                Ok(_) => panic!("invalid config must fail before spawning"),
+            };
+            assert!(matches!(err, crate::process::ProcessError::Io(ref e)
+                if e.get_ref().is_some_and(|source| source.is::<ConfigError>())));
+        }
     }
 
     #[test]
     fn validate_ok_with_harmless_args() {
         let cfg = LaunchConfig {
+            profile_dir: Some(PathBuf::from("/tmp/profile")),
             args: vec!["--width=1920".into(), "--some-flag".into()],
             ..Default::default()
         };

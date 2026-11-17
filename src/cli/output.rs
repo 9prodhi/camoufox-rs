@@ -222,7 +222,7 @@ pub fn render(data: Option<&Value>) -> Rendered {
 
     // Cookies response
     if let Some(cookies) = data.get("cookies").and_then(|v| v.as_array()) {
-        let mut lines: Vec<String> = cookies
+        let lines: Vec<String> = cookies
             .iter()
             .map(|cookie| {
                 let name = cookie.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -230,8 +230,7 @@ pub fn render(data: Option<&Value>) -> Rendered {
                 format!("{name}={value}")
             })
             .collect();
-        lines.push(format!("{} cookie(s)", cookies.len()));
-        return Rendered::out(lines.join("\n"));
+        return Rendered::out(lines.join("\n")).with_note(format!("{} cookie(s)", cookies.len()));
     }
 
     // Navigation response
@@ -290,7 +289,7 @@ mod tests {
         );
     }
 
-    /// Human mode lists every cookie (HttpOnly included) plus a count line.
+    /// Human mode lists every cookie on stdout and puts the count on stderr.
     #[test]
     fn human_mode_renders_all_cookies_with_count() {
         let data = json!({
@@ -300,10 +299,15 @@ mod tests {
             ]
         });
         let rendered = render(Some(&data));
-        assert_eq!(
-            rendered.stdout,
-            "session=abc\nPHPSESSID=secret\n2 cookie(s)"
-        );
+        assert_eq!(rendered.stdout, "session=abc\nPHPSESSID=secret");
+        assert_eq!(rendered.stderr, vec!["2 cookie(s)"]);
+    }
+
+    #[test]
+    fn empty_cookies_keep_stdout_clean() {
+        let rendered = render(Some(&json!({ "cookies": [] })));
+        assert_eq!(rendered.stdout, "");
+        assert_eq!(rendered.stderr, vec!["0 cookie(s)"]);
     }
 
     /// `print_response` in JSON mode for an error response does not panic.

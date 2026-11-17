@@ -20,11 +20,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Start the daemon process.
-    Serve {
-        /// Run in the foreground (don't daemonize).
-        #[arg(long)]
-        foreground: bool,
-    },
+    Serve,
 
     /// Launch a new browser instance.
     Launch {

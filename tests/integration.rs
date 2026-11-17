@@ -561,7 +561,8 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
     //   MainFrame::dispatch_mouse_event calls (mousemove/mousedown/mouseup).
     //
     // The fixture page arms a capture-phase click listener that records the
-    // last click into window.__click_result. We assert the listener fired with
+    // last click into a shared DOM dataset (visible across isolated worlds).
+    // We assert the listener fired with
     // isTrusted == true at the dispatched coordinates.
     //
     // Run with (requires the `cli` feature — the `click` command only exists
@@ -599,6 +600,15 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
         .click(&instance_id, &page_id, CLICK_X, CLICK_Y)
         .expect("click failed");
 
+    // Undefined must be null, and page exceptions must be errors, not envelopes.
+    let undefined = manager.evaluate(&instance_id, &page_id, "void 0", Duration::from_secs(10));
+    let exception = manager.evaluate(
+        &instance_id,
+        &page_id,
+        "(() => { throw new Error('evaluate regression'); })()",
+        Duration::from_secs(10),
+    );
+
     // Read back the recorded event field by field, operating on the returned
     // serde_json::Value via its inherent accessors — matching this file's
     // evaluate-result convention (no serde_json import needed).
@@ -606,7 +616,7 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
         .evaluate(
             &instance_id,
             &page_id,
-            "window.__click_result && window.__click_result.trusted",
+            "JSON.parse(document.documentElement.dataset.clickResult || 'null')?.trusted",
             Duration::from_secs(10),
         )
         .expect("evaluate trusted failed");
@@ -614,7 +624,7 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
         .evaluate(
             &instance_id,
             &page_id,
-            "window.__click_result ? window.__click_result.x : -1",
+            "JSON.parse(document.documentElement.dataset.clickResult || 'null')?.x ?? -1",
             Duration::from_secs(10),
         )
         .expect("evaluate clientX failed");
@@ -622,13 +632,18 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
         .evaluate(
             &instance_id,
             &page_id,
-            "window.__click_result ? window.__click_result.y : -1",
+            "JSON.parse(document.documentElement.dataset.clickResult || 'null')?.y ?? -1",
             Duration::from_secs(10),
         )
         .expect("evaluate clientY failed");
 
     // Stop the browser before asserting so a failed assertion can't leak it.
     let _ = manager.stop(&instance_id);
+
+    assert!(undefined.expect("evaluate undefined failed").is_null());
+    assert!(exception
+        .expect_err("page exception must fail")
+        .contains("page script error"));
 
     // The load-bearing assertion: the event must be TRUSTED. `None` means the
     // listener never fired (no click registered); `Some(false)` means the event

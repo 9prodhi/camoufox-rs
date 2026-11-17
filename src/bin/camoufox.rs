@@ -13,9 +13,9 @@ fn main() {
     let sock = socket_path(cli.socket.as_deref());
 
     match cli.command {
-        Command::Serve { foreground } => {
+        Command::Serve => {
             env_logger::init();
-            if let Err(e) = camoufox::cli::daemon::run(&sock, foreground) {
+            if let Err(e) = camoufox::cli::daemon::run(&sock, true) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -125,6 +125,10 @@ fn main() {
             clip,
             timeout,
         } => {
+            let output = output.map(|p| {
+                absolute_output_path(&p)
+                    .unwrap_or_else(|e| fail(cli.json, &format!("resolve screenshot path: {e}")))
+            });
             let clip = match clip.as_deref().map(parse_clip) {
                 Some(Ok(rect)) => Some(rect),
                 Some(Err(e)) => fail(cli.json, &e),
@@ -535,6 +539,17 @@ fn split_once_trimmed(s: &str, sep: char) -> Option<(String, String)> {
     Some((name.to_string(), value.trim().to_string()))
 }
 
+/// Resolve screenshot destinations against the client's cwd, not the daemon's.
+fn absolute_output_path(path: &str) -> std::io::Result<String> {
+    let path = std::path::Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(absolute.to_string_lossy().into_owned())
+}
+
 /// Parse a `x,y,width,height` clip string into four floats.
 fn parse_clip(s: &str) -> Result<[f64; 4], String> {
     let parts: Vec<&str> = s.split(',').map(str::trim).collect();
@@ -600,6 +615,26 @@ fn run_client(sock: &std::path::Path, request: &DaemonRequest, json_mode: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_paths_resolve_against_client_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            absolute_output_path("shots/page.png").unwrap(),
+            cwd.join("shots/page.png").to_string_lossy()
+        );
+        let absolute = cwd.join("absolute.png");
+        assert_eq!(
+            absolute_output_path(absolute.to_str().unwrap()).unwrap(),
+            absolute.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn serve_rejects_removed_foreground_flag() {
+        assert!(Cli::try_parse_from(["camoufox", "serve"]).is_ok());
+        assert!(Cli::try_parse_from(["camoufox", "serve", "--foreground"]).is_err());
+    }
 
     /// `name=value` / `Name: value` pairs split on the FIRST separator, so a
     /// value may itself contain one (e.g. a URL in a header value).

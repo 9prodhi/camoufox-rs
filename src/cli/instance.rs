@@ -265,24 +265,7 @@ impl Instance {
         expression: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
-        let result = mp
-            .main_frame
-            .evaluate(expression, timeout)
-            .map_err(|e| format!("evaluate failed: {e}"))?;
-
-        // Unwrap `{result: {value: …}}` to just the value, matching today's
-        // CLI output shape.
-        let value = result
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .or_else(|| result.get("value"))
-            .cloned()
-            .unwrap_or(result);
-        Ok(value)
+        self.eval_checked(page_id, expression, timeout)
     }
 
     // -----------------------------------------------------------------------

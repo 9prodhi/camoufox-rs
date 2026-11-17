@@ -3,8 +3,6 @@ use std::fmt;
 /// Errors from the null-byte JSON codec layer.
 #[derive(Debug)]
 pub enum CodecError {
-    /// Incomplete message (no `\0` delimiter found yet).
-    Incomplete,
     /// The bytes between delimiters are not valid UTF-8.
     InvalidUtf8(std::string::FromUtf8Error),
     /// The UTF-8 string is not valid JSON.
@@ -16,7 +14,6 @@ pub enum CodecError {
 impl fmt::Display for CodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Incomplete => write!(f, "incomplete message"),
             Self::InvalidUtf8(e) => write!(f, "invalid UTF-8: {e}"),
             Self::InvalidJson(e) => write!(f, "invalid JSON: {e}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
@@ -30,7 +27,6 @@ impl std::error::Error for CodecError {
             Self::InvalidUtf8(e) => Some(e),
             Self::InvalidJson(e) => Some(e),
             Self::Io(e) => Some(e),
-            Self::Incomplete => None,
         }
     }
 }

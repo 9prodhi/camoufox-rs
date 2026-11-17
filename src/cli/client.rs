@@ -8,6 +8,7 @@ use crate::cli::ipc::{DaemonRequest, DaemonResponse};
 
 /// Send a request to the daemon and return the response.
 pub fn send_request(socket_path: &Path, request: &DaemonRequest) -> Result<DaemonResponse, String> {
+    crate::cli::socket::check_socket_parent(socket_path, false)?;
     let stream = UnixStream::connect(socket_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound
             || e.kind() == std::io::ErrorKind::ConnectionRefused
@@ -19,7 +20,10 @@ pub fn send_request(socket_path: &Path, request: &DaemonRequest) -> Result<Daemo
     })?;
 
     // Set a timeout so we don't hang forever.
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
+    let timeout = request.read_timeout();
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
 
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
@@ -37,7 +41,13 @@ pub fn send_request(socket_path: &Path, request: &DaemonRequest) -> Result<Daemo
     let mut line = String::new();
     reader
         .read_line(&mut line)
-        .map_err(|e| format!("failed to read response: {e}"))?;
+        .map_err(|e| {
+            if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) {
+                format!("timed out waiting for daemon after {}s (the daemon may still complete the request)", timeout.as_secs())
+            } else {
+                format!("failed to read response: {e}")
+            }
+        })?;
 
     if line.is_empty() {
         return Err("daemon closed connection without responding".into());

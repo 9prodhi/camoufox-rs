@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::api::browser::{Connection, ProxyConfig, Session};
-use crate::api::main_frame::MainFrame;
+use crate::api::main_frame::{MainFrame, SubscriptionGuard};
 use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 
 // ---------------------------------------------------------------------------
@@ -547,7 +547,10 @@ impl BrowserContext {
 
     /// Timeout for waiting on `Browser.attachedToTarget` (Layer 1) and on
     /// the main frame's `Page.frameAttached` event (Layer 2).
+    #[cfg(not(test))]
     const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
+    #[cfg(test)]
+    const ATTACH_TIMEOUT: Duration = Duration::from_millis(100);
 
     /// Create a new page and return a fully-wired [`MainFrame`].
     ///
@@ -589,10 +592,10 @@ impl BrowserContext {
         let skipped: Arc<Mutex<Vec<(String, Option<String>)>>> =
             Arc::new(Mutex::new(Vec::with_capacity(MAX_SKIPPED_ATTACHES)));
         let skipped_clone = Arc::clone(&skipped);
-        conn.on_event(
+        let attach_id = conn.on_event(
             "",
             "Browser.attachedToTarget",
-            Box::new(move |event| {
+            Arc::new(move |event| {
                 let ti = event.params.get("targetInfo");
                 let t_type = ti
                     .and_then(|v| v.get("type"))
@@ -617,12 +620,20 @@ impl BrowserContext {
                         .to_owned();
                     let _ = attach_tx.send((session_id, target_id));
                 } else {
-                    let mut s = skipped_clone.lock().unwrap();
+                    let mut s = skipped_clone
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if s.len() < MAX_SKIPPED_ATTACHES {
                         s.push((t_type.to_owned(), t_url));
                     }
                 }
             }),
+        );
+        let _attach_guard = SubscriptionGuard::session(
+            Arc::clone(&self.connection),
+            "",
+            "Browser.attachedToTarget",
+            attach_id,
         );
 
         // === Layer 2 fix (hybrid fallback): listen for Page.frameAttached
@@ -631,7 +642,7 @@ impl BrowserContext {
         // Registered BEFORE Browser.newPage. Filtered on receive by
         // session_id (we don't know the session_id yet at register time).
         let (frame_tx, frame_rx) = mpsc::channel::<(String, String)>(); // (sid, frame_id)
-        conn.on_event_global(Box::new(move |event| {
+        let frame_handler_id = conn.on_event_global(Arc::new(move |event| {
             if event.method != "Page.frameAttached" {
                 return;
             }
@@ -654,6 +665,8 @@ impl BrowserContext {
                 let _ = frame_tx.send((sid, fid));
             }
         }));
+        let _frame_guard =
+            SubscriptionGuard::global(Arc::clone(&self.connection), frame_handler_id);
 
         // === Layer 3 fix: event-buffering listener for
         // Runtime.executionContextCreated, registered BEFORE Browser.newPage.
@@ -684,13 +697,17 @@ impl BrowserContext {
         // a navigation completes), defeating the lazy retry path.
         let exec_ctx_for_destroyed = Arc::clone(&exec_ctx);
         let session_holder_for_destroyed = Arc::clone(&session_id_holder);
-        conn.on_event_global(Box::new(move |event| {
+        let destroyed_id = conn.on_event_global(Arc::new(move |event| {
             if event.method != "Runtime.executionContextDestroyed" {
                 return;
             }
             let event_sid = event.session_id.as_deref().unwrap_or("");
             // Only react once we know our session.
-            let our_sid = match session_holder_for_destroyed.lock().unwrap().clone() {
+            let our_sid = match session_holder_for_destroyed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
                 Some(s) => s,
                 None => return,
             };
@@ -705,17 +722,20 @@ impl BrowserContext {
             if dead.is_empty() {
                 return;
             }
-            let mut guard = exec_ctx_for_destroyed.lock().unwrap();
+            let mut guard = exec_ctx_for_destroyed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.as_deref() == Some(dead) {
                 *guard = None;
             }
         }));
+        let destroyed_guard = SubscriptionGuard::global(Arc::clone(&self.connection), destroyed_id);
 
         let session_holder_for_listener = Arc::clone(&session_id_holder);
         let frame_holder_for_listener = Arc::clone(&frame_id_holder);
         let buffer_for_listener = Arc::clone(&exec_buffer);
         let exec_ctx_for_listener = Arc::clone(&exec_ctx);
-        conn.on_event_global(Box::new(move |event| {
+        let created_id = conn.on_event_global(Arc::new(move |event| {
             if event.method != "Runtime.executionContextCreated" {
                 return;
             }
@@ -742,9 +762,17 @@ impl BrowserContext {
 
             // Lock order: buffer -> session_id_holder -> frame_id_holder
             //   -> exec_ctx.
-            let mut buf = buffer_for_listener.lock().unwrap();
-            let known_sid = session_holder_for_listener.lock().unwrap().clone();
-            let known_fid = frame_holder_for_listener.lock().unwrap().clone();
+            let mut buf = buffer_for_listener
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let known_sid = session_holder_for_listener
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let known_fid = frame_holder_for_listener
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
 
             match (known_sid, known_fid) {
                 (None, _) => {
@@ -771,11 +799,14 @@ impl BrowserContext {
                 (Some(_), Some(fid)) => {
                     // Both known — apply final filter directly.
                     if event_fid == fid && is_main_world {
-                        *exec_ctx_for_listener.lock().unwrap() = Some(ctx_id);
+                        *exec_ctx_for_listener
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ctx_id);
                     }
                 }
             }
         }));
+        let created_guard = SubscriptionGuard::global(Arc::clone(&self.connection), created_id);
 
         // === Send Browser.newPage. ===
         let result = self.session().send(
@@ -906,7 +937,9 @@ impl BrowserContext {
                 }
             }
             if let Some(c) = latest {
-                *exec_ctx.lock().unwrap() = Some(c);
+                *exec_ctx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(c);
             }
         }
 
@@ -916,6 +949,7 @@ impl BrowserContext {
             frame_id,
             exec_ctx,
             Arc::clone(&self.connection),
+            vec![destroyed_guard, created_guard],
         ))
     }
 
@@ -1100,5 +1134,233 @@ impl std::fmt::Debug for BrowserContext {
         f.debug_struct("BrowserContext")
             .field("context_id", &self.context_id)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::client::Connection;
+    use crate::protocol::types::RawMessage;
+    use crate::transport::errors::TransportError;
+    use crate::transport::{Transport, TransportReader, TransportWriter};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+
+    struct TestWriter {
+        outgoing_tx: mpsc::Sender<serde_json::Value>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl TransportWriter for TestWriter {
+        fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(TransportError::Closed);
+            }
+            self.outgoing_tx
+                .send(message.clone())
+                .map_err(|_| TransportError::Closed)
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    struct TestReader {
+        incoming_rx: mpsc::Receiver<RawMessage>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl TransportReader for TestReader {
+        fn receive(&mut self) -> Result<RawMessage, TransportError> {
+            loop {
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(TransportError::Closed);
+                }
+                match self
+                    .incoming_rx
+                    .recv_timeout(std::time::Duration::from_millis(10))
+                {
+                    Ok(msg) => return Ok(msg),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(TransportError::Closed);
+                    }
+                }
+            }
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    struct TestTransport {
+        incoming_rx: mpsc::Receiver<RawMessage>,
+        outgoing_tx: mpsc::Sender<serde_json::Value>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl TestTransport {
+        fn new() -> (
+            Self,
+            mpsc::Sender<RawMessage>,
+            mpsc::Receiver<serde_json::Value>,
+        ) {
+            let (in_tx, in_rx) = mpsc::channel();
+            let (out_tx, out_rx) = mpsc::channel();
+            (
+                Self {
+                    incoming_rx: in_rx,
+                    outgoing_tx: out_tx,
+                    closed: Arc::new(AtomicBool::new(false)),
+                },
+                in_tx,
+                out_rx,
+            )
+        }
+    }
+
+    impl Transport for TestTransport {
+        fn into_split(self: Box<Self>) -> (Box<dyn TransportWriter>, Box<dyn TransportReader>) {
+            (
+                Box::new(TestWriter {
+                    outgoing_tx: self.outgoing_tx,
+                    closed: Arc::clone(&self.closed),
+                }),
+                Box::new(TestReader {
+                    incoming_rx: self.incoming_rx,
+                    closed: self.closed,
+                }),
+            )
+        }
+    }
+
+    #[test]
+    fn new_main_frame_handler_leak_regression() {
+        let (transport, in_tx, out_rx) = TestTransport::new();
+        let conn = Arc::new(Connection::new(Box::new(transport)));
+        let root_session = conn.root_session();
+        let context = BrowserContext::new("ctx-test".into(), &root_session, Arc::clone(&conn));
+
+        assert_eq!(conn.handler_count(), 0);
+
+        // 1. Timeout path: Browser.newPage responds, but attach event never comes
+        let in_tx_clone = in_tx.clone();
+        let responder1 = thread::spawn(move || {
+            let req = out_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            let id = req["id"].as_i64().unwrap();
+            assert_eq!(req["method"], "Browser.newPage");
+            in_tx_clone
+                .send(RawMessage {
+                    id: Some(id),
+                    method: None,
+                    params: None,
+                    result: Some(json!({"targetId": "target-1"})),
+                    error: None,
+                    session_id: None,
+                })
+                .unwrap();
+            out_rx
+        });
+
+        let err = context
+            .new_main_frame()
+            .expect_err("new_main_frame should time out");
+        assert!(err.message.contains("timeout"));
+        assert_eq!(
+            conn.handler_count(),
+            0,
+            "handler count must return to 0 after new_main_frame timeout"
+        );
+        let out_rx = responder1.join().unwrap();
+
+        // 2. Success path: MainFrame constructed, retains 2 exec-ctx handlers, drops to 0 on drop
+        let in_tx_clone2 = in_tx.clone();
+        let responder2 = thread::spawn(move || {
+            let req = out_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            let id = req["id"].as_i64().unwrap();
+            assert_eq!(req["method"], "Browser.newPage");
+            in_tx_clone2
+                .send(RawMessage {
+                    id: Some(id),
+                    method: None,
+                    params: None,
+                    result: Some(json!({"targetId": "target-2"})),
+                    error: None,
+                    session_id: None,
+                })
+                .unwrap();
+
+            // Send page attached event
+            in_tx_clone2
+                .send(RawMessage {
+                    id: None,
+                    method: Some("Browser.attachedToTarget".into()),
+                    params: Some(json!({
+                        "sessionId": "page-session-2",
+                        "targetInfo": {
+                            "type": "page",
+                            "targetId": "target-2",
+                        }
+                    })),
+                    result: None,
+                    error: None,
+                    session_id: None,
+                })
+                .unwrap();
+
+            // Send frame attached event
+            in_tx_clone2
+                .send(RawMessage {
+                    id: None,
+                    method: Some("Page.frameAttached".into()),
+                    params: Some(json!({
+                        "frameId": "frame-2",
+                        "parentFrameId": "",
+                    })),
+                    result: None,
+                    error: None,
+                    session_id: Some("page-session-2".into()),
+                })
+                .unwrap();
+
+            out_rx
+        });
+
+        let main_frame = context
+            .new_main_frame()
+            .expect("new_main_frame should succeed");
+        assert_eq!(
+            conn.handler_count(),
+            2,
+            "MainFrame should retain exactly 2 execution context handlers"
+        );
+
+        drop(main_frame);
+        assert_eq!(
+            conn.handler_count(),
+            0,
+            "handler count must return to 0 when MainFrame is dropped"
+        );
+
+        let _out_rx = responder2.join().unwrap();
+        drop(in_tx);
+        drop(context);
+        let mut conn = Arc::try_unwrap(conn).ok().expect("should unwrap Arc");
+        conn.wait_closed();
     }
 }

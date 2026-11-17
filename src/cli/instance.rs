@@ -5,8 +5,14 @@
 //! operations that CLI commands map to.
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
 
 use serde_json::json;
@@ -18,6 +24,59 @@ use crate::api::{Browser, BrowserOptions, ContextOptions, CookieOptions, MainFra
 use crate::config::LaunchConfig;
 use crate::protocol::client::Connection;
 use crate::transport::pipe::PipeTransport;
+
+fn screenshot_path(
+    instance_id: &str,
+    page_id: &str,
+    format: Option<&str>,
+    explicit: Option<&str>,
+) -> Result<String, String> {
+    if let Some(path) = explicit {
+        return Ok(path.to_owned());
+    }
+    let dir = crate::cli::socket::ensure_runtime_dir()?;
+    Ok(default_screenshot_path(&dir, instance_id, page_id, format)
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn default_screenshot_path(
+    dir: &Path,
+    instance_id: &str,
+    page_id: &str,
+    format: Option<&str>,
+) -> PathBuf {
+    let ext = if matches!(format, Some("jpeg" | "jpg" | "image/jpeg")) {
+        "jpg"
+    } else {
+        "png"
+    };
+    dir.join(format!("screenshot-{instance_id}-{page_id}.{ext}"))
+}
+
+fn write_screenshot(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("failed to open screenshot: {e}"))?;
+    // Also secure an existing file rather than preserving world-readable mode.
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("failed to secure screenshot: {e}"))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("failed to write screenshot: {e}"))
+}
+
+fn element_center(rect: &Rect) -> (i32, i32) {
+    (
+        (rect.x + rect.width / 2.0).round().max(0.0) as i32,
+        (rect.y + rect.height / 2.0).round().max(0.0) as i32,
+    )
+}
 
 fn default_executable() -> String {
     std::env::var("CAMOUFOX_BIN").unwrap_or_else(|_| {
@@ -188,6 +247,7 @@ pub struct ManagedMainFrame {
 
 /// A running Camoufox browser instance managed by the daemon.
 pub struct Instance {
+    instance_id: String,
     pub browser: Browser,
     pub child: Child,
     pub version: Option<String>,
@@ -199,6 +259,18 @@ pub struct Instance {
 }
 
 impl Instance {
+    fn page(&self, id: &str) -> Result<&ManagedMainFrame, String> {
+        self.pages
+            .get(id)
+            .ok_or_else(|| format!("page {id} not found"))
+    }
+
+    fn page_mut(&mut self, id: &str) -> Result<&mut ManagedMainFrame, String> {
+        self.pages
+            .get_mut(id)
+            .ok_or_else(|| format!("page {id} not found"))
+    }
+
     /// Create a new page in this instance's context, fully wired with
     /// session, top frame id, and execution context tracking.
     pub fn create_page(&mut self, context: &crate::api::BrowserContext) -> Result<String, String> {
@@ -240,10 +312,7 @@ impl Instance {
         timeout: Duration,
         wait_until: Option<&str>,
     ) -> Result<NavigateOutcome, String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
 
         // Force `evaluate` to wait for a fresh post-navigation context.
         *mp.main_frame.execution_context_handle().lock().unwrap() = None;
@@ -283,10 +352,7 @@ impl Instance {
         expression: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
         let raw = mp
             .main_frame
             .evaluate(expression, timeout)
@@ -507,10 +573,7 @@ impl Instance {
 
     /// Go back one session-history entry. Returns `false` if there was none.
     pub fn go_back(&self, page_id: &str) -> Result<bool, String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
         mp.main_frame
             .go_back()
             .map_err(|e| format!("go back failed: {e}"))
@@ -518,10 +581,7 @@ impl Instance {
 
     /// Go forward one session-history entry. Returns `false` if there was none.
     pub fn go_forward(&self, page_id: &str) -> Result<bool, String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
         mp.main_frame
             .go_forward()
             .map_err(|e| format!("go forward failed: {e}"))
@@ -529,10 +589,7 @@ impl Instance {
 
     /// Reload the page.
     pub fn reload(&self, page_id: &str) -> Result<(), String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
         mp.main_frame
             .reload()
             .map_err(|e| format!("reload failed: {e}"))
@@ -595,10 +652,7 @@ impl Instance {
         name: &str,
         value: &str,
     ) -> Result<Vec<(String, String)>, String> {
-        let mp = self
-            .pages
-            .get_mut(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page_mut(page_id)?;
 
         mp.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
         mp.headers.push((name.to_string(), value.to_string()));
@@ -630,8 +684,7 @@ impl Instance {
         timeout: Duration,
     ) -> Result<(i32, i32), String> {
         let (rect, _, _) = self.element_rect(page_id, selector, timeout)?;
-        let x = (rect.x + rect.width / 2.0).round().max(0.0) as i32;
-        let y = (rect.y + rect.height / 2.0).round().max(0.0) as i32;
+        let (x, y) = element_center(&rect);
         self.click(page_id, x, y)?;
         Ok((x, y))
     }
@@ -644,13 +697,9 @@ impl Instance {
         timeout: Duration,
     ) -> Result<(i32, i32), String> {
         let (rect, _, _) = self.element_rect(page_id, selector, timeout)?;
-        let x = (rect.x + rect.width / 2.0).round().max(0.0) as i32;
-        let y = (rect.y + rect.height / 2.0).round().max(0.0) as i32;
+        let (x, y) = element_center(&rect);
 
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
         mp.main_frame
             .dispatch_mouse_event(MouseEventParams {
                 r#type: "mousemove".to_string(),
@@ -667,10 +716,7 @@ impl Instance {
 
     /// Insert text into whichever element currently has focus.
     pub fn insert_text(&self, page_id: &str, text: &str) -> Result<(), String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
         mp.main_frame
             .insert_text(text)
             .map_err(|e| format!("type failed: {e}"))
@@ -708,10 +754,7 @@ impl Instance {
     /// Press a named key (keydown followed by keyup).
     pub fn press(&self, page_id: &str, key: &str) -> Result<(), String> {
         let (code, key_name, key_code) = key_descriptor(key)?;
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
 
         // `text` is deliberately omitted — see `key_descriptor`.
         let make = |kind: &str| KeyEventParams {
@@ -832,10 +875,7 @@ impl Instance {
     /// cross-origin / closed-shadow widgets (e.g. Cloudflare Turnstile) that
     /// synthetic JS events cannot reach.
     pub fn click(&self, page_id: &str, x: i32, y: i32) -> Result<(), String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
 
         let mv = MouseEventParams {
             r#type: "mousemove".to_string(),
@@ -901,10 +941,7 @@ impl Instance {
         clip: Option<[f64; 4]>,
         timeout: Duration,
     ) -> Result<(Vec<u8>, String, Rect), String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
 
         let rect = match (clip, selector) {
             (Some([x, y, width, height]), _) => Rect {
@@ -963,14 +1000,8 @@ impl Instance {
             .screenshot(options)
             .map_err(|e| format!("screenshot failed: {e}"))?;
 
-        let ext = if mime == "image/jpeg" { "jpg" } else { "png" };
-        let out_path = match path {
-            Some(p) => p.to_string(),
-            None => format!("/tmp/screenshot-{page_id}.{ext}"),
-        };
-
-        std::fs::write(&out_path, &bytes)
-            .map_err(|e| format!("failed to write screenshot: {e}"))?;
+        let out_path = screenshot_path(&self.instance_id, page_id, Some(mime), path)?;
+        write_screenshot(Path::new(&out_path), &bytes)?;
 
         Ok((bytes, out_path, rect))
     }
@@ -1007,27 +1038,39 @@ impl Instance {
 /// Manages all browser instances for the daemon.
 #[derive(Default)]
 pub struct InstanceManager {
-    instances: HashMap<String, Instance>,
-    /// Per-instance context stored separately so we can borrow mutably.
-    contexts: HashMap<String, crate::api::BrowserContext>,
-    counter: u32,
+    instances: Mutex<HashMap<String, Arc<Mutex<ManagedInstance>>>>,
+    counter: AtomicU64,
+}
+
+struct ManagedInstance {
+    instance: Option<Instance>,
+    context: crate::api::BrowserContext,
 }
 
 impl InstanceManager {
     pub fn new() -> Self {
         InstanceManager {
-            instances: HashMap::new(),
-            contexts: HashMap::new(),
-            counter: 0,
+            instances: Mutex::new(HashMap::new()),
+            counter: AtomicU64::new(0),
         }
     }
 
-    /// Launch a new browser instance.
+    /// Launch a new browser instance. Retains the mutable receiver for existing
+    /// callers; daemon workers use the shared-receiver implementation.
     pub fn launch(
         &mut self,
         headless: Option<bool>,
         executable: Option<&str>,
     ) -> Result<(String, Option<String>, u32), String> {
+        self.launch_shared(headless, executable)
+    }
+
+    pub(crate) fn launch_shared(
+        &self,
+        headless: Option<bool>,
+        executable: Option<&str>,
+    ) -> Result<(String, Option<String>, u32), String> {
+        let instance_id = format!("{:08x}", self.counter.fetch_add(1, Ordering::Relaxed) + 1);
         let profile_dir =
             tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
 
@@ -1070,11 +1113,8 @@ impl InstanceManager {
             .new_context(ContextOptions::default())
             .map_err(|e| format!("failed to create context: {e}"))?;
 
-        // Assign instance ID.
-        self.counter += 1;
-        let instance_id = format!("{:08x}", self.counter);
-
         let instance = Instance {
+            instance_id: instance_id.clone(),
             browser,
             child: child.into_child(),
             version: version.clone(),
@@ -1085,8 +1125,16 @@ impl InstanceManager {
             close_timeout: config.close_timeout,
         };
 
-        self.instances.insert(instance_id.clone(), instance);
-        self.contexts.insert(instance_id.clone(), context);
+        self.instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                instance_id.clone(),
+                Arc::new(Mutex::new(ManagedInstance {
+                    instance: Some(instance),
+                    context,
+                })),
+            );
 
         Ok((instance_id, version, pid))
     }
@@ -1094,13 +1142,25 @@ impl InstanceManager {
     /// List all instances.
     pub fn list(&self) -> Vec<serde_json::Value> {
         let mut result = Vec::new();
-        for (id, inst) in &self.instances {
-            result.push(json!({
-                "instance_id": id,
-                "pid": inst.pid,
-                "version": inst.version,
-                "pages": inst.page_ids(),
-            }));
+        let entries: Vec<_> = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(id, inst)| (id.clone(), Arc::clone(inst)))
+            .collect();
+        for (id, entry) in entries {
+            let entry = entry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(inst) = &entry.instance {
+                result.push(json!({
+                    "instance_id": id,
+                    "pid": inst.pid,
+                    "version": inst.version,
+                    "pages": inst.page_ids(),
+                }));
+            }
         }
         result.sort_by(|a, b| {
             a.get("instance_id")
@@ -1111,28 +1171,25 @@ impl InstanceManager {
     }
 
     /// Stop an instance.
-    pub fn stop(&mut self, instance_id: &str) -> Result<(), String> {
-        let inst = self
+    pub fn stop(&self, instance_id: &str) -> Result<(), String> {
+        let entry = self
             .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        self.contexts.remove(instance_id);
+            .ok_or_else(|| Self::missing(instance_id))?;
+        let inst = entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .instance
+            .take()
+            .ok_or_else(|| Self::missing(instance_id))?;
         inst.stop()
     }
 
     /// Create a new page in an instance.
-    pub fn new_page(&mut self, instance_id: &str) -> Result<String, String> {
-        let context = self
-            .contexts
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        // We need a raw pointer dance because we need &mut Instance and &BrowserContext
-        // at the same time, but they're in different HashMaps so this is safe.
-        let inst = self
-            .instances
-            .get_mut(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.create_page(context)
+    pub fn new_page(&self, instance_id: &str) -> Result<String, String> {
+        self.with_instance(instance_id, |inst, context| inst.create_page(context))
     }
 
     /// Navigate a page.
@@ -1146,11 +1203,9 @@ impl InstanceManager {
         timeout: Duration,
         wait_until: Option<&str>,
     ) -> Result<NavigateOutcome, String> {
-        let inst = self
-            .instances
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.navigate(page_id, url, timeout, wait_until)
+        self.with_instance(instance_id, |inst, _| {
+            inst.navigate(page_id, url, timeout, wait_until)
+        })
     }
 
     /// Evaluate JavaScript.
@@ -1161,20 +1216,14 @@ impl InstanceManager {
         expression: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        let inst = self
-            .instances
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.evaluate(page_id, expression, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.evaluate(page_id, expression, timeout)
+        })
     }
 
     /// Dispatch a trusted left-click at viewport coordinates (x, y).
     pub fn click(&self, instance_id: &str, page_id: &str, x: i32, y: i32) -> Result<(), String> {
-        let inst = self
-            .instances
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.click(page_id, x, y)
+        self.with_instance(instance_id, |inst, _| inst.click(page_id, x, y))
     }
 
     /// Take a screenshot.
@@ -1190,25 +1239,33 @@ impl InstanceManager {
         clip: Option<[f64; 4]>,
         timeout: Duration,
     ) -> Result<(Vec<u8>, String, Rect), String> {
-        let inst = self
+        self.with_instance(instance_id, |inst, _| {
+            inst.screenshot(page_id, format, quality, path, selector, clip, timeout)
+        })
+    }
+
+    fn missing(id: &str) -> String {
+        format!("instance {id} not found")
+    }
+
+    /// Snapshot the entry under the map lock, then lock only this instance.
+    fn with_instance<T>(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut Instance, &crate::api::BrowserContext) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let entry = self
             .instances
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.screenshot(page_id, format, quality, path, selector, clip, timeout)
-    }
-
-    /// Borrow an instance by id, or report a clear "not found" error.
-    fn instance(&self, instance_id: &str) -> Result<&Instance, String> {
-        self.instances
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))
-    }
-
-    /// Mutably borrow an instance by id.
-    fn instance_mut(&mut self, instance_id: &str) -> Result<&mut Instance, String> {
-        self.instances
-            .get_mut(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Self::missing(id))?;
+        let mut entry = entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ManagedInstance { instance, context } = &mut *entry;
+        f(instance.as_mut().ok_or_else(|| Self::missing(id))?, context)
     }
 
     // -----------------------------------------------------------------------
@@ -1223,7 +1280,7 @@ impl InstanceManager {
         selector: Option<&str>,
         timeout: Duration,
     ) -> Result<String, String> {
-        self.instance(instance_id)?.text(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| inst.text(page_id, selector, timeout))
     }
 
     /// Extract page HTML.
@@ -1234,7 +1291,7 @@ impl InstanceManager {
         selector: Option<&str>,
         timeout: Duration,
     ) -> Result<String, String> {
-        self.instance(instance_id)?.html(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| inst.html(page_id, selector, timeout))
     }
 
     /// Collect page links.
@@ -1245,8 +1302,9 @@ impl InstanceManager {
         selector: Option<&str>,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        self.instance(instance_id)?
-            .links(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.links(page_id, selector, timeout)
+        })
     }
 
     /// Extract structured page metadata.
@@ -1259,8 +1317,9 @@ impl InstanceManager {
         meta: bool,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        self.instance(instance_id)?
-            .data(page_id, og, jsonld, meta, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.data(page_id, og, jsonld, meta, timeout)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1274,22 +1333,22 @@ impl InstanceManager {
         page_id: &str,
         timeout: Duration,
     ) -> Result<(String, String), String> {
-        self.instance(instance_id)?.url(page_id, timeout)
+        self.with_instance(instance_id, |inst, _| inst.url(page_id, timeout))
     }
 
     /// Go back one history entry.
     pub fn go_back(&self, instance_id: &str, page_id: &str) -> Result<bool, String> {
-        self.instance(instance_id)?.go_back(page_id)
+        self.with_instance(instance_id, |inst, _| inst.go_back(page_id))
     }
 
     /// Go forward one history entry.
     pub fn go_forward(&self, instance_id: &str, page_id: &str) -> Result<bool, String> {
-        self.instance(instance_id)?.go_forward(page_id)
+        self.with_instance(instance_id, |inst, _| inst.go_forward(page_id))
     }
 
     /// Reload a page.
     pub fn reload(&self, instance_id: &str, page_id: &str) -> Result<(), String> {
-        self.instance(instance_id)?.reload(page_id)
+        self.with_instance(instance_id, |inst, _| inst.reload(page_id))
     }
 
     /// Wait for a selector to appear.
@@ -1300,8 +1359,9 @@ impl InstanceManager {
         selector: &str,
         timeout: Duration,
     ) -> Result<u128, String> {
-        self.instance(instance_id)?
-            .wait_for_selector(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.wait_for_selector(page_id, selector, timeout)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1326,59 +1386,55 @@ impl InstanceManager {
         http_only: bool,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        let ctx = self
-            .contexts
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-
-        let resolved_url = match (url, domain) {
-            (Some(u), _) => Some(u.to_string()),
-            (None, Some(_)) => None,
-            (None, None) => {
-                let (page_url, _) = self.instance(instance_id)?.url(page_id, timeout)?;
-                if !page_url.starts_with("http") {
-                    return Err(format!(
-                        "page {page_id} is at {page_url:?}; pass --url or --domain to \
+        self.with_instance(instance_id, |inst, ctx| {
+            let resolved_url = match (url, domain) {
+                (Some(u), _) => Some(u.to_string()),
+                (None, Some(_)) => None,
+                (None, None) => {
+                    let (page_url, _) = inst.url(page_id, timeout)?;
+                    if !page_url.starts_with("http") {
+                        return Err(format!(
+                            "page {page_id} is at {page_url:?}; pass --url or --domain to \
                          say where the cookie belongs"
-                    ));
+                        ));
+                    }
+                    Some(page_url)
                 }
-                Some(page_url)
-            }
-        };
+            };
 
-        let options = CookieOptions {
-            name: name.to_string(),
-            value: value.to_string(),
-            url: resolved_url.clone(),
-            domain: domain.map(|d| d.to_string()),
-            path: path.map(|p| p.to_string()),
-            secure: if secure { Some(true) } else { None },
-            http_only: if http_only { Some(true) } else { None },
-            same_site: None,
-            expires: None,
-        };
+            let options = CookieOptions {
+                name: name.to_string(),
+                value: value.to_string(),
+                url: resolved_url.clone(),
+                domain: domain.map(|d| d.to_string()),
+                path: path.map(|p| p.to_string()),
+                secure: if secure { Some(true) } else { None },
+                http_only: if http_only { Some(true) } else { None },
+                same_site: None,
+                expires: None,
+            };
 
-        ctx.set_cookies(std::slice::from_ref(&options))
-            .map_err(|e| format!("set_cookies failed: {e}"))?;
+            ctx.set_cookies(std::slice::from_ref(&options))
+                .map_err(|e| format!("set_cookies failed: {e}"))?;
 
-        Ok(json!({
-            "cookie_set": name,
-            "value": value,
-            "url": resolved_url,
-            "domain": domain,
-        }))
+            Ok(json!({
+                "cookie_set": name,
+                "value": value,
+                "url": resolved_url,
+                "domain": domain,
+            }))
+        })
     }
 
     /// Add an extra HTTP request header to a page.
     pub fn set_header(
-        &mut self,
+        &self,
         instance_id: &str,
         page_id: &str,
         name: &str,
         value: &str,
     ) -> Result<Vec<(String, String)>, String> {
-        self.instance_mut(instance_id)?
-            .set_header(page_id, name, value)
+        self.with_instance(instance_id, |inst, _| inst.set_header(page_id, name, value))
     }
 
     // -----------------------------------------------------------------------
@@ -1393,8 +1449,9 @@ impl InstanceManager {
         selector: &str,
         timeout: Duration,
     ) -> Result<(i32, i32), String> {
-        self.instance(instance_id)?
-            .click_selector(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.click_selector(page_id, selector, timeout)
+        })
     }
 
     /// Hover an element by CSS selector.
@@ -1405,8 +1462,9 @@ impl InstanceManager {
         selector: &str,
         timeout: Duration,
     ) -> Result<(i32, i32), String> {
-        self.instance(instance_id)?
-            .hover(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.hover(page_id, selector, timeout)
+        })
     }
 
     /// Fill an element by CSS selector.
@@ -1418,18 +1476,19 @@ impl InstanceManager {
         value: &str,
         timeout: Duration,
     ) -> Result<String, String> {
-        self.instance(instance_id)?
-            .fill(page_id, selector, value, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.fill(page_id, selector, value, timeout)
+        })
     }
 
     /// Insert text into the focused element.
     pub fn insert_text(&self, instance_id: &str, page_id: &str, text: &str) -> Result<(), String> {
-        self.instance(instance_id)?.insert_text(page_id, text)
+        self.with_instance(instance_id, |inst, _| inst.insert_text(page_id, text))
     }
 
     /// Press a named key.
     pub fn press(&self, instance_id: &str, page_id: &str, key: &str) -> Result<(), String> {
-        self.instance(instance_id)?.press(page_id, key)
+        self.with_instance(instance_id, |inst, _| inst.press(page_id, key))
     }
 
     /// Select an option in a `<select>`.
@@ -1441,8 +1500,9 @@ impl InstanceManager {
         value: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        self.instance(instance_id)?
-            .select_option(page_id, selector, value, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.select_option(page_id, selector, value, timeout)
+        })
     }
 
     /// Scroll an element into view, or to the page bottom.
@@ -1453,8 +1513,9 @@ impl InstanceManager {
         selector: Option<&str>,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        self.instance(instance_id)?
-            .scroll(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.scroll(page_id, selector, timeout)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1467,12 +1528,12 @@ impl InstanceManager {
         instance_id: &str,
         timeout: Duration,
     ) -> Result<Vec<serde_json::Value>, String> {
-        Ok(self.instance(instance_id)?.tabs(timeout))
+        self.with_instance(instance_id, |inst, _| Ok(inst.tabs(timeout)))
     }
 
     /// Close a page.
-    pub fn close_tab(&mut self, instance_id: &str, page_id: &str) -> Result<(), String> {
-        self.instance_mut(instance_id)?.close_tab(page_id)
+    pub fn close_tab(&self, instance_id: &str, page_id: &str) -> Result<(), String> {
+        self.with_instance(instance_id, |inst, _| inst.close_tab(page_id))
     }
 
     /// Export all cookies for an instance's browser context (including HttpOnly).
@@ -1481,28 +1542,35 @@ impl InstanceManager {
     /// `browserContextId`. HttpOnly cookies are included — the Juggler protocol
     /// returns them in the same array as ordinary cookies.
     pub fn cookies(&self, instance_id: &str) -> Result<Vec<serde_json::Value>, String> {
-        let ctx = self
-            .contexts
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        let cookies = ctx
-            .get_cookies()
-            .map_err(|e| format!("get_cookies failed: {e}"))?;
-        let values: Vec<serde_json::Value> = cookies
-            .iter()
-            .map(|c| serde_json::to_value(c).expect("Cookie is always serializable"))
-            .collect();
-        Ok(values)
+        self.with_instance(instance_id, |_, ctx| {
+            let cookies = ctx
+                .get_cookies()
+                .map_err(|e| format!("get_cookies failed: {e}"))?;
+            let values: Vec<serde_json::Value> = cookies
+                .iter()
+                .map(|c| serde_json::to_value(c).expect("Cookie is always serializable"))
+                .collect();
+            Ok(values)
+        })
     }
 
     /// Number of running instances.
     pub fn instance_count(&self) -> usize {
-        self.instances.len()
+        self.instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Shut down all instances.
-    pub fn shutdown_all(&mut self) {
-        let ids: Vec<String> = self.instances.keys().cloned().collect();
+    pub fn shutdown_all(&self) {
+        let ids: Vec<String> = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
         for id in ids {
             let _ = self.stop(&id);
         }
@@ -1516,6 +1584,52 @@ impl InstanceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_runtime_path_and_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = default_screenshot_path(dir.path(), "00000001", "p1", None);
+        assert_eq!(path, dir.path().join("screenshot-00000001-p1.png"));
+        assert_ne!(
+            path,
+            default_screenshot_path(dir.path(), "00000002", "p1", None)
+        );
+        assert_eq!(
+            default_screenshot_path(&crate::cli::socket::runtime_dir(), "i", "p1", Some("jpeg"))
+                .parent()
+                .unwrap(),
+            crate::cli::socket::runtime_dir()
+        );
+        write_screenshot(&path, b"png").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_screenshot(&path, b"new").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn manager_recovers_poisoned_map() {
+        let manager = InstanceManager::new();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = manager.instances.lock().unwrap();
+            panic!("test poison");
+        });
+        assert_eq!(manager.instance_count(), 0);
+        assert!(manager.list().is_empty());
+        assert!(manager
+            .new_page("missing")
+            .unwrap_err()
+            .contains("not found"));
+        manager.shutdown_all();
+    }
 
     /// `js_literal` produces a quoted literal that survives being pasted into
     /// a JavaScript expression — quotes, backslashes and newlines escaped.

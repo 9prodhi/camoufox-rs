@@ -97,16 +97,15 @@ pub fn spawn(config: &LaunchConfig) -> Result<LaunchedProcess, ProcessError> {
                 .map_err(|e| e.to_string())?;
             Ok(tx)
         });
-        let spawner = spawner.as_ref().map_err(|e| {
-            ProcessError::Io(std::io::Error::other(e.clone()))
-        })?;
+        let spawner = spawner
+            .as_ref()
+            .map_err(|e| ProcessError::Io(std::io::Error::other(e.clone())))?;
         let (tx, rx) = mpsc::channel();
-        spawner.send((config.clone(), tx)).map_err(|e| {
-            ProcessError::Io(std::io::Error::other(e.to_string()))
-        })?;
-        rx.recv().map_err(|e| {
-            ProcessError::Io(std::io::Error::other(e.to_string()))
-        })?
+        spawner
+            .send((config.clone(), tx))
+            .map_err(|e| ProcessError::Io(std::io::Error::other(e.to_string())))?;
+        rx.recv()
+            .map_err(|e| ProcessError::Io(std::io::Error::other(e.to_string())))?
     }
     #[cfg(not(target_os = "linux"))]
     spawn_inner(config)

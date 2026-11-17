@@ -292,6 +292,36 @@ pub enum DaemonRequest {
     },
 }
 
+impl DaemonRequest {
+    /// Operation budget, before the client's transport margin.
+    pub fn timeout_secs(&self) -> u64 {
+        match self {
+            Self::Launch { .. } => 180,
+            Self::Navigate { timeout_secs, .. }
+            | Self::Evaluate { timeout_secs, .. }
+            | Self::ClickSelector { timeout_secs, .. }
+            | Self::Screenshot { timeout_secs, .. }
+            | Self::Text { timeout_secs, .. }
+            | Self::Html { timeout_secs, .. }
+            | Self::Links { timeout_secs, .. }
+            | Self::Data { timeout_secs, .. }
+            | Self::Url { timeout_secs, .. }
+            | Self::Wait { timeout_secs, .. }
+            | Self::SetCookie { timeout_secs, .. }
+            | Self::Fill { timeout_secs, .. }
+            | Self::Hover { timeout_secs, .. }
+            | Self::Select { timeout_secs, .. }
+            | Self::Scroll { timeout_secs, .. }
+            | Self::Tabs { timeout_secs, .. } => *timeout_secs,
+            _ => 60,
+        }
+    }
+
+    pub fn read_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs().saturating_add(30))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Response
 // ---------------------------------------------------------------------------
@@ -343,6 +373,69 @@ impl DaemonResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn client_timeout_budget_per_request_type() {
+        let timed = [
+            "Navigate",
+            "Evaluate",
+            "ClickSelector",
+            "Screenshot",
+            "Text",
+            "Html",
+            "Links",
+            "Data",
+            "Url",
+            "Wait",
+            "SetCookie",
+            "Fill",
+            "Hover",
+            "Select",
+            "Scroll",
+            "Tabs",
+        ];
+        for method in timed {
+            let request: DaemonRequest = serde_json::from_value(json!({
+                "method": method, "params": {
+                    "instance_id": "i", "page_id": "p1", "url": "about:blank",
+                    "expression": "1", "selector": "input", "name": "n", "value": "v",
+                    "timeout_secs": 400
+                }
+            }))
+            .unwrap();
+            assert_eq!(request.timeout_secs(), 400, "{method}");
+            assert_eq!(request.read_timeout().as_secs(), 430, "{method}");
+        }
+        let default_methods = [
+            "Ping",
+            "List",
+            "Shutdown",
+            "Stop",
+            "NewPage",
+            "Click",
+            "Cookies",
+            "Back",
+            "Forward",
+            "Reload",
+            "SetHeader",
+            "Type",
+            "Press",
+            "CloseTab",
+        ];
+        for method in default_methods {
+            let request: DaemonRequest = serde_json::from_value(if matches!(method, "Ping" | "List" | "Shutdown") {
+                json!({"method": method})
+            } else {
+                json!({"method": method, "params": {"instance_id": "i", "page_id": "p1", "x": 1, "y": 2, "name": "n", "value": "v", "text": "t", "key": "Enter"}})
+            }).unwrap();
+            assert_eq!(request.read_timeout().as_secs(), 90, "{method}");
+        }
+        let launch = DaemonRequest::Launch {
+            headless: None,
+            executable: None,
+        };
+        assert_eq!(launch.read_timeout().as_secs(), 210);
+    }
 
     /// `DaemonRequest::Cookies` serialises to the expected JSON shape and
     /// deserialises back to the same variant (round-trip).

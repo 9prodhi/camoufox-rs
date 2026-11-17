@@ -109,7 +109,9 @@ pub fn wait_for_ready(child: &mut Child, timeout: Duration) -> Result<String, Pr
     drop(tx);
 
     if readers == 0 {
-        return Err(ProcessError::Io(std::io::Error::other("neither child stdout nor stderr is piped (were they already taken?)")));
+        return Err(ProcessError::Io(std::io::Error::other(
+            "neither child stdout nor stderr is piped (were they already taken?)",
+        )));
     }
 
     let deadline = Instant::now() + timeout;

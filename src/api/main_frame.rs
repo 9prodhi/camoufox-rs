@@ -206,24 +206,76 @@ pub struct Point {
 // SubscriptionGuard
 // ---------------------------------------------------------------------------
 
-/// RAII guard that deregisters an event handler when dropped.
-///
-/// Holding one of these guarantees the `(session_key, method, id)` handler is
-/// removed from the connection's [`EventRouter`](crate::protocol::events::EventRouter)
-/// on every exit path of the enclosing scope — normal return, early return,
-/// or panic — so transient subscriptions (e.g. a single-shot lifecycle wait)
-/// can never leak a dead closure.
-struct SubscriptionGuard<'a> {
-    connection: &'a Connection,
-    session_key: &'a str,
-    method: &'static str,
-    id: HandlerId,
+pub(crate) enum SubscriptionTarget {
+    SessionScoped {
+        session_key: String,
+        method: &'static str,
+    },
+    Global,
 }
 
-impl Drop for SubscriptionGuard<'_> {
+/// RAII guard that deregisters an event handler when dropped.
+///
+/// Holding one of these guarantees the handler is removed from the connection's
+/// [`EventRouter`](crate::protocol::events::EventRouter) on every exit path —
+/// normal return, early return, or panic — so transient subscriptions
+/// can never leak a dead closure.
+pub(crate) struct SubscriptionGuard {
+    connection: Arc<Connection>,
+    target: SubscriptionTarget,
+    id: HandlerId,
+    active: bool,
+}
+
+impl SubscriptionGuard {
+    pub(crate) fn session(
+        connection: Arc<Connection>,
+        session_key: impl Into<String>,
+        method: &'static str,
+        id: HandlerId,
+    ) -> Self {
+        Self {
+            connection,
+            target: SubscriptionTarget::SessionScoped {
+                session_key: session_key.into(),
+                method,
+            },
+            id,
+            active: true,
+        }
+    }
+
+    pub(crate) fn global(connection: Arc<Connection>, id: HandlerId) -> Self {
+        Self {
+            connection,
+            target: SubscriptionTarget::Global,
+            id,
+            active: true,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for SubscriptionGuard {
     fn drop(&mut self) {
-        self.connection
-            .off_event(self.session_key, self.method, self.id);
+        if !self.active {
+            return;
+        }
+        match &self.target {
+            SubscriptionTarget::SessionScoped {
+                session_key,
+                method,
+            } => {
+                self.connection.off_event(session_key, method, self.id);
+            }
+            SubscriptionTarget::Global => {
+                self.connection.off_event_global(self.id);
+            }
+        }
     }
 }
 
@@ -251,6 +303,8 @@ pub struct MainFrame {
     execution_context_id: Arc<Mutex<Option<String>>>,
     /// Shared connection — used for `on_event` subscriptions (e.g. lifecycle wait).
     connection: Arc<Connection>,
+    /// RAII guards for event subscriptions owned by this frame (e.g. executionContextCreated/Destroyed).
+    _context_guards: Vec<SubscriptionGuard>,
 }
 
 impl MainFrame {
@@ -261,6 +315,7 @@ impl MainFrame {
         frame_id: String,
         execution_context_id: Arc<Mutex<Option<String>>>,
         connection: Arc<Connection>,
+        context_guards: Vec<SubscriptionGuard>,
     ) -> Self {
         MainFrame {
             session,
@@ -268,6 +323,7 @@ impl MainFrame {
             frame_id,
             execution_context_id,
             connection,
+            _context_guards: context_guards,
         }
     }
 
@@ -362,7 +418,7 @@ impl MainFrame {
         let handler_id = self.connection.on_event(
             &session_key,
             "Page.eventFired",
-            Box::new(move |event| {
+            Arc::new(move |event| {
                 let ev_name = event
                     .params
                     .get("name")
@@ -383,12 +439,12 @@ impl MainFrame {
 
         // RAII: deregister the handler on every exit path (success, timeout,
         // error, panic) so the closure cannot leak in the router.
-        let _guard = SubscriptionGuard {
-            connection: &self.connection,
-            session_key: &session_key,
-            method: "Page.eventFired",
-            id: handler_id,
-        };
+        let _guard = SubscriptionGuard::session(
+            Arc::clone(&self.connection),
+            &session_key,
+            "Page.eventFired",
+            handler_id,
+        );
 
         match rx.recv_timeout(timeout) {
             Ok(()) => Ok(()),
@@ -513,7 +569,7 @@ impl MainFrame {
         let rws_id = self.connection.on_event(
             &session_key,
             "Network.requestWillBeSent",
-            Box::new(move |event| {
+            Arc::new(move |event| {
                 let req_id = match event.params.get("requestId").and_then(|v| v.as_str()) {
                     Some(id) => id.to_owned(),
                     None => return,
@@ -580,19 +636,19 @@ impl MainFrame {
                 }
             }),
         );
-        let _guard_rws = SubscriptionGuard {
-            connection: &self.connection,
-            session_key: &session_key,
-            method: "Network.requestWillBeSent",
-            id: rws_id,
-        };
+        let _guard_rws = SubscriptionGuard::session(
+            Arc::clone(&self.connection),
+            &session_key,
+            "Network.requestWillBeSent",
+            rws_id,
+        );
 
         // Handler 2: Network.responseReceived
         let state_rr = Arc::clone(&net_state);
         let rr_id = self.connection.on_event(
             &session_key,
             "Network.responseReceived",
-            Box::new(move |event| {
+            Arc::new(move |event| {
                 let req_id = match event.params.get("requestId").and_then(|v| v.as_str()) {
                     Some(id) => id,
                     None => return,
@@ -609,12 +665,12 @@ impl MainFrame {
                 }
             }),
         );
-        let _guard_rr = SubscriptionGuard {
-            connection: &self.connection,
-            session_key: &session_key,
-            method: "Network.responseReceived",
-            id: rr_id,
-        };
+        let _guard_rr = SubscriptionGuard::session(
+            Arc::clone(&self.connection),
+            &session_key,
+            "Network.responseReceived",
+            rr_id,
+        );
 
         // -----------------------------------------------------------------------
 
@@ -1666,10 +1722,53 @@ mod tests {
     use crate::protocol::errors::ProtocolErrorKind;
     use crate::protocol::types::RawMessage;
     use crate::transport::errors::TransportError;
-    use crate::transport::Transport;
+    use crate::transport::{Transport, TransportReader, TransportWriter};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc as StdArc;
+
+    struct SilentMockWriter {
+        closed: StdArc<AtomicBool>,
+        outgoing: mpsc::Sender<serde_json::Value>,
+    }
+
+    impl TransportWriter for SilentMockWriter {
+        fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(TransportError::Closed);
+            }
+            let _ = self.outgoing.send(message.clone());
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    struct SilentMockReader {
+        closed: StdArc<AtomicBool>,
+    }
+
+    impl TransportReader for SilentMockReader {
+        fn receive(&mut self) -> Result<RawMessage, TransportError> {
+            loop {
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(TransportError::Closed);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
 
     /// Silent mock transport: send drops messages, receive blocks until
     /// the transport is closed (then returns Closed).
@@ -1680,30 +1779,16 @@ mod tests {
     }
 
     impl Transport for SilentMockTransport {
-        fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
-            if self.closed.load(Ordering::SeqCst) {
-                return Err(TransportError::Closed);
-            }
-            let _ = self.outgoing.send(message.clone());
-            Ok(())
-        }
-
-        fn receive(&mut self) -> Result<RawMessage, TransportError> {
-            loop {
-                if self.closed.load(Ordering::SeqCst) {
-                    return Err(TransportError::Closed);
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-
-        fn close(&mut self) -> Result<(), TransportError> {
-            self.closed.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn is_closed(&self) -> bool {
-            self.closed.load(Ordering::SeqCst)
+        fn into_split(self: Box<Self>) -> (Box<dyn TransportWriter>, Box<dyn TransportReader>) {
+            (
+                Box::new(SilentMockWriter {
+                    closed: StdArc::clone(&self.closed),
+                    outgoing: self.outgoing,
+                }),
+                Box::new(SilentMockReader {
+                    closed: StdArc::clone(&self.closed),
+                }),
+            )
         }
     }
 
@@ -1725,6 +1810,7 @@ mod tests {
             "frame-test".to_owned(),
             exec_ctx,
             StdArc::clone(&conn_arc),
+            Vec::new(),
         );
 
         let start = Instant::now();
@@ -1772,15 +1858,12 @@ mod tests {
     // message injection, mirroring the pattern in protocol::client::tests.
     // -----------------------------------------------------------------------
 
-    /// A full mock transport: `receive()` blocks on a channel of injected
-    /// `RawMessage`s; `send()` forwards to an outgoing channel.
-    struct MockTransport {
-        incoming_rx: mpsc::Receiver<RawMessage>,
+    struct MockWriter {
         outgoing_tx: mpsc::Sender<serde_json::Value>,
         closed: StdArc<AtomicBool>,
     }
 
-    impl Transport for MockTransport {
+    impl TransportWriter for MockWriter {
         fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
             if self.closed.load(Ordering::SeqCst) {
                 return Err(TransportError::Closed);
@@ -1789,6 +1872,22 @@ mod tests {
             Ok(())
         }
 
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    struct MockReader {
+        incoming_rx: mpsc::Receiver<RawMessage>,
+        closed: StdArc<AtomicBool>,
+    }
+
+    impl TransportReader for MockReader {
         fn receive(&mut self) -> Result<RawMessage, TransportError> {
             loop {
                 if self.closed.load(Ordering::SeqCst) {
@@ -1804,13 +1903,31 @@ mod tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
-            self.closed.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
         fn is_closed(&self) -> bool {
             self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A full mock transport: `receive()` blocks on a channel of injected
+    /// `RawMessage`s; `send()` forwards to an outgoing channel.
+    struct MockTransport {
+        incoming_rx: mpsc::Receiver<RawMessage>,
+        outgoing_tx: mpsc::Sender<serde_json::Value>,
+        closed: StdArc<AtomicBool>,
+    }
+
+    impl Transport for MockTransport {
+        fn into_split(self: Box<Self>) -> (Box<dyn TransportWriter>, Box<dyn TransportReader>) {
+            (
+                Box::new(MockWriter {
+                    outgoing_tx: self.outgoing_tx,
+                    closed: StdArc::clone(&self.closed),
+                }),
+                Box::new(MockReader {
+                    incoming_rx: self.incoming_rx,
+                    closed: StdArc::clone(&self.closed),
+                }),
+            )
         }
     }
 
@@ -1849,6 +1966,7 @@ mod tests {
             frame_id.to_owned(),
             StdArc::clone(&exec_ctx),
             StdArc::clone(&conn_arc),
+            Vec::new(),
         );
 
         MockFrameHarness {

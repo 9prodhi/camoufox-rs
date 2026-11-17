@@ -282,7 +282,14 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
         DaemonRequest::Stop { instance_id } => respond(mgr.stop(&instance_id)),
         DaemonRequest::NewPage { instance_id } => respond(mgr.new_page(&instance_id).map(|page_id| json!({"page_id": page_id}))),
         DaemonRequest::Navigate { instance_id, page_id, url, wait_until, .. } => respond(mgr.navigate(&instance_id, &page_id, &url, timeout, wait_until.as_deref()).map(|o| json!({"navigation_id": o.nav_id, "status_code": o.status_code}))),
-        DaemonRequest::Evaluate { instance_id, page_id, expression, .. } => respond(mgr.evaluate(&instance_id, &page_id, &expression, timeout).map(|result| json!({"result": result}))),
+        DaemonRequest::Evaluate { instance_id, page_id, expression, main_world, .. } => {
+            let result = if main_world {
+                mgr.evaluate_main_world(&instance_id, &page_id, &expression, timeout)
+            } else {
+                mgr.evaluate(&instance_id, &page_id, &expression, timeout)
+            };
+            respond(result.map(|result| json!({"result": result})))
+        },
         DaemonRequest::Click { instance_id, page_id, x, y } => respond(mgr.click(&instance_id, &page_id, x, y).map(|()| json!({"clicked": true, "x": x, "y": y}))),
         DaemonRequest::ClickSelector { instance_id, page_id, selector, .. } => respond(mgr.click_selector(&instance_id, &page_id, &selector, timeout).map(|(x,y)| json!({"clicked": true, "selector": selector, "x": x, "y": y}))),
         DaemonRequest::Screenshot { instance_id, page_id, format, quality, path, selector, clip, .. } => respond(mgr.screenshot(&instance_id, &page_id, format.as_deref(), quality, path.as_deref(), selector.as_deref(), clip, timeout).map(|(bytes, path, rect)| json!({"bytes": bytes.len(), "path": path, "clip": {"x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height}}))),

@@ -65,6 +65,7 @@ fn main() {
             instance_id,
             page_id,
             expression,
+            main_world,
             timeout,
         } => {
             run_client(
@@ -73,6 +74,7 @@ fn main() {
                     instance_id,
                     page_id,
                     expression,
+                    main_world,
                     timeout_secs: timeout,
                 },
                 cli.json,

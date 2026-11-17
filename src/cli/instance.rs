@@ -334,6 +334,19 @@ impl Instance {
         self.eval_checked(page_id, expression, timeout)
     }
 
+    /// Evaluate a synchronous expression in the page's main world.
+    pub fn evaluate_main_world(
+        &self,
+        page_id: &str,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
+        self.page(page_id)?
+            .main_frame
+            .evaluate_main_world(expression, timeout)
+            .map_err(|e| format!("evaluate failed: {e}"))
+    }
+
     // -----------------------------------------------------------------------
     // Shared evaluate helpers
     // -----------------------------------------------------------------------
@@ -1215,6 +1228,19 @@ impl InstanceManager {
     ) -> Result<serde_json::Value, String> {
         self.with_instance(instance_id, |inst, _| {
             inst.evaluate(page_id, expression, timeout)
+        })
+    }
+
+    /// Evaluate a synchronous expression in the page's main world.
+    pub fn evaluate_main_world(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
+        self.with_instance(instance_id, |inst, _| {
+            inst.evaluate_main_world(page_id, expression, timeout)
         })
     }
 

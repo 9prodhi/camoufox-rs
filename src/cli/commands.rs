@@ -74,6 +74,9 @@ pub enum Command {
         page_id: String,
         /// JavaScript expression to evaluate.
         expression: String,
+        /// Run in the page's main world so page-defined globals are visible (sync expressions only; detectable by the page; blocked by strict CSP)
+        #[arg(long)]
+        main_world: bool,
         /// Timeout in seconds for waiting for execution context.
         #[arg(long, default_value = "30")]
         timeout: u64,

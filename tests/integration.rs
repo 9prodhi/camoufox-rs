@@ -669,6 +669,35 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
 #[test]
 #[ignore]
 #[cfg(feature = "cli")]
+fn evaluate_main_world_reads_page_globals() {
+    use camoufox::cli::instance::InstanceManager;
+
+    let mut manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch(Some(true), Some(&camoufox_bin()))
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+    let navigation = manager.navigate(
+        &instance_id,
+        &page_id,
+        "data:text/html,<script>window.__app%20=%20%7Bn:%2042%7D</script>",
+        timeout,
+        Some("load"),
+    );
+    let isolated = manager.evaluate(&instance_id, &page_id, "typeof window.__app", timeout);
+    let main_world = manager.evaluate_main_world(&instance_id, &page_id, "window.__app.n", timeout);
+
+    // Stop before asserting so failures do not leak the browser.
+    let _ = manager.stop(&instance_id);
+    navigation.expect("navigate to app-state page failed");
+    assert_eq!(isolated.expect("isolated evaluate failed"), "undefined");
+    assert_eq!(main_world.expect("main-world evaluate failed"), 42);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
 fn reading_commands_extract_text_html_links_and_metadata() {
     // Covers the Tier-1 reading commands added to the daemon:
     //   InstanceManager::{text, html, links, data, url}

@@ -82,6 +82,7 @@ daemon-scoped). Add `--json` to any command for machine-readable output.
 | `data <inst> <page> [--og] [--jsonld] [--meta]` | Structured metadata. No flags = all three groups |
 | `url <inst> <page>` | Current URL (stdout) and title (stderr) |
 | `evaluate <inst> <page> '<js>'` | Run arbitrary JavaScript, prints the result |
+| `evaluate --main-world <inst> <page> '<js>'` | Read app state from page globals; sync expressions only, detectable by the page, blocked by strict CSP |
 
 `data` groups: `--og` covers `og:` / `twitter:` / `article:` / `fb:` / `al:`
 properties, `--jsonld` parses every `application/ld+json` block into real JSON,

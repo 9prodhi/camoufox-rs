@@ -130,10 +130,7 @@ fn user_agent_env(executable: &Path, inherited_env_keys: &[String]) -> HashMap<S
 /// escapes U+2028/U+2029, which are legal in JSON strings but terminate a
 /// line in (pre-ES2019) JavaScript source.
 fn js_literal(s: &str) -> String {
-    serde_json::Value::String(s.to_owned())
-        .to_string()
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
+    crate::api::main_frame::escape_js_json_literal(s)
 }
 
 /// Map a key name to the `(code, key, key_code)` triple Juggler expects.

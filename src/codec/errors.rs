@@ -9,6 +9,8 @@ pub enum CodecError {
     InvalidJson(serde_json::Error),
     /// I/O error during read or write.
     Io(std::io::Error),
+    /// Frame exceeded the maximum allowed size.
+    FrameTooLarge { limit: usize, len: usize },
 }
 
 impl fmt::Display for CodecError {
@@ -17,6 +19,12 @@ impl fmt::Display for CodecError {
             Self::InvalidUtf8(e) => write!(f, "invalid UTF-8: {e}"),
             Self::InvalidJson(e) => write!(f, "invalid JSON: {e}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::FrameTooLarge { limit, len } => {
+                write!(
+                    f,
+                    "frame too large: {len} bytes exceeds limit of {limit} bytes"
+                )
+            }
         }
     }
 }
@@ -27,6 +35,7 @@ impl std::error::Error for CodecError {
             Self::InvalidUtf8(e) => Some(e),
             Self::InvalidJson(e) => Some(e),
             Self::Io(e) => Some(e),
+            Self::FrameTooLarge { .. } => None,
         }
     }
 }

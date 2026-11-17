@@ -489,9 +489,8 @@ impl BrowserContext {
         // Download options
         if let Some(ref dl) = options.download_options {
             let mut dl_obj = json!({});
-            if let Some(ref behavior) = dl.behavior {
-                dl_obj["behavior"] = json!(behavior);
-            }
+            let behavior = dl.behavior.as_deref().unwrap_or("cancel");
+            dl_obj["behavior"] = json!(behavior);
             if let Some(ref dir) = dl.downloads_dir {
                 dl_obj["downloadsDir"] = json!(dir);
             }

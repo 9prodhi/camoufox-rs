@@ -28,7 +28,7 @@ pub struct Request {
 
 /// An incoming message from the browser. Could be a response or an event.
 /// We parse into this raw form first, then discriminate.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RawMessage {
     #[serde(default)]
     pub id: Option<MessageId>,

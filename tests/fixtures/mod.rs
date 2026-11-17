@@ -411,8 +411,8 @@ impl Drop for StatusServer {
 
 /// A single-port HTTP server that serves a page with a full-viewport
 /// `#target` div and a capture-phase click listener pre-armed in the page.
-/// The listener records the most recent click into `window.__click_result`
-/// as `{ trusted, x, y, tag, id }`.
+/// The listener records `{ trusted, x, y, tag, id }` in a DOM dataset too,
+/// so evaluation in an isolated world can read it.
 ///
 /// Used by the trusted-click integration test
 /// (`click_command_dispatches_trusted_event_at_coordinates`) to prove the
@@ -460,6 +460,7 @@ impl ClickServer {
       tag: e.target.tagName,
       id: e.target.id
     };
+    document.documentElement.dataset.clickResult = JSON.stringify(window.__click_result);
   }, true);
 </script>
 </body>

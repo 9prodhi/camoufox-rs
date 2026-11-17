@@ -70,6 +70,7 @@ fn create_pipe() -> Result<(OwnedFd, OwnedFd), ProcessError> {
 /// - `ProcessError::Io` if pipe creation fails.
 /// - `ProcessError::SpawnFailed` if `Command::spawn` fails.
 pub fn spawn(config: &LaunchConfig) -> Result<LaunchedProcess, ProcessError> {
+    config.validate().map_err(std::io::Error::other)?;
     #[cfg(target_os = "linux")]
     {
         // PDEATHSIG tracks the spawning THREAD, not just the process. Daemon
@@ -97,20 +98,14 @@ pub fn spawn(config: &LaunchConfig) -> Result<LaunchedProcess, ProcessError> {
             Ok(tx)
         });
         let spawner = spawner.as_ref().map_err(|e| {
-            ProcessError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.clone()))
+            ProcessError::Io(std::io::Error::other(e.clone()))
         })?;
         let (tx, rx) = mpsc::channel();
         spawner.send((config.clone(), tx)).map_err(|e| {
-            ProcessError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
+            ProcessError::Io(std::io::Error::other(e.to_string()))
         })?;
         rx.recv().map_err(|e| {
-            ProcessError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
+            ProcessError::Io(std::io::Error::other(e.to_string()))
         })?
     }
     #[cfg(not(target_os = "linux"))]

@@ -20,4 +20,4 @@
 
 pub mod protocol_log;
 
-pub use protocol_log::{log_incoming, log_outgoing, ProtocolLogger};
+pub use protocol_log::{log_incoming, log_incoming_message, log_outgoing, ProtocolLogger};

@@ -384,10 +384,10 @@ CAMOUFOX_BIN=/path/to/camoufox cargo test --test integration -- --ignored --test
 Use `log` + `env_logger` filters to inspect protocol behavior:
 
 ```bash
-RUST_LOG=camoufox=trace cargo test
+RUST_LOG=camoufox::protocol=trace cargo test
 ```
 
-`obs::ProtocolLogger` formats command, response, and event traces with bounded payload previews.
+Protocol traffic is traced at `camoufox::protocol=trace` with bounded payload previews.
 
 ## Known Limitations
 

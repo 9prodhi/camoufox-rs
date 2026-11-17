@@ -56,6 +56,8 @@ pub enum DaemonRequest {
         instance_id: String,
         page_id: String,
         expression: String,
+        #[serde(default)]
+        main_world: bool,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
     },
@@ -373,6 +375,51 @@ impl DaemonResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn evaluate_main_world_round_trip_and_legacy_default() {
+        for main_world in [false, true] {
+            let payload = json!({
+                "method": "Evaluate",
+                "params": {
+                    "instance_id": "i", "page_id": "p1",
+                    "expression": "window.__app.n", "timeout_secs": 10,
+                    "main_world": main_world
+                }
+            });
+            let request: DaemonRequest = serde_json::from_value(payload.clone()).unwrap();
+            assert!(
+                matches!(request, DaemonRequest::Evaluate { main_world: flag, .. } if flag == main_world)
+            );
+            assert_eq!(serde_json::to_value(&request).unwrap(), payload);
+        }
+
+        let request: DaemonRequest = serde_json::from_value(json!({
+            "method": "Evaluate",
+            "params": {
+                "instance_id": "i", "page_id": "p1", "expression": "1"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            DaemonRequest::Evaluate {
+                main_world: false,
+                timeout_secs: 30,
+                ..
+            }
+        ));
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(serialized["params"]["main_world"], false);
+        let round_trip: DaemonRequest = serde_json::from_value(serialized).unwrap();
+        assert!(matches!(
+            round_trip,
+            DaemonRequest::Evaluate {
+                main_world: false,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn client_timeout_budget_per_request_type() {

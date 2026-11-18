@@ -8,7 +8,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -156,6 +156,7 @@ pub fn serve_on(
         .map_err(|e| e.to_string())?
         .as_pathname()
         .map(Path::to_owned);
+    let shutdown_waiters = Arc::new(Mutex::new(Vec::<UnixStream>::new()));
     let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let result = loop {
         if stop.load(Ordering::Acquire) {
@@ -168,8 +169,9 @@ pub fn serve_on(
                 }
                 let manager = Arc::clone(&manager);
                 let stop = Arc::clone(&stop);
+                let waiters = Arc::clone(&shutdown_waiters);
                 workers.push(std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, &manager, &stop) {
+                    if let Err(e) = handle_connection(stream, &manager, &stop, &waiters) {
                         log::warn!("connection error: {e}");
                     }
                 }));
@@ -190,15 +192,27 @@ pub fn serve_on(
         }
     };
     drop(listener);
-    // Join in-flight launches before draining the map, so they cannot insert
-    // an orphaned browser after shutdown_all has finished.
+    manager.begin_shutdown();
+    manager.close_all_connections();
     for worker in workers {
         let _ = worker.join();
     }
     manager.shutdown_all();
-    if let Some(path) = path {
-        unlink_socket(&path)?;
+    // Always answer waiting `shutdown` callers, even if unlinking fails.
+    let unlinked = match path {
+        Some(path) => unlink_socket(&path),
+        None => Ok(()),
+    };
+    for mut writer in shutdown_waiters
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain(..)
+    {
+        let _ = serde_json::to_writer(&mut writer, &DaemonResponse::ok_empty());
+        let _ = writer.write_all(b"\n");
+        let _ = writer.flush();
     }
+    unlinked?;
     result
 }
 
@@ -228,6 +242,7 @@ fn handle_connection(
     stream: UnixStream,
     manager: &InstanceManager,
     stop: &AtomicBool,
+    waiters: &Mutex<Vec<UnixStream>>,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -245,12 +260,20 @@ fn handle_connection(
         }
         Ok(_) => match serde_json::from_str::<DaemonRequest>(&line) {
             Ok(request) => {
-                let shutdown = matches!(request, DaemonRequest::Shutdown);
-                let response = dispatch(request, manager);
-                if shutdown && response.ok {
+                if matches!(request, DaemonRequest::Shutdown) {
+                    waiters
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(writer);
+                    manager.begin_shutdown();
                     stop.store(true, Ordering::Release);
+                    return Ok(());
                 }
-                response
+                if stop.load(Ordering::Acquire) {
+                    DaemonResponse::err("daemon shutting down")
+                } else {
+                    dispatch_guarded(request, manager)
+                }
             }
             Err(e) => DaemonResponse::err(format!("invalid request: {e}")),
         },
@@ -269,6 +292,13 @@ fn respond<T: Serialize>(result: Result<T, String>) -> DaemonResponse {
         },
         Err(e) => DaemonResponse::err(e),
     }
+}
+
+fn dispatch_guarded(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
+    if mgr.is_closing() && !matches!(request, DaemonRequest::Shutdown) {
+        return DaemonResponse::err("daemon shutting down");
+    }
+    dispatch(request, mgr)
 }
 
 fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
@@ -387,9 +417,19 @@ mod tests {
     }
 
     #[test]
+    fn requests_during_shutdown_are_refused() {
+        let manager = InstanceManager::new();
+        manager.begin_shutdown();
+        let response = dispatch_guarded(DaemonRequest::List, &manager);
+        assert!(!response.ok);
+        assert!(format!("{response:?}").contains("daemon shutting down"));
+    }
+
+    #[test]
     fn shutdown_stops_and_unlinks() {
         let mut daemon = TestDaemon::start();
         assert!(daemon.request(DaemonRequest::Shutdown).ok);
+        assert!(!daemon.path.exists(), "socket must be gone before reply");
         daemon.join();
         assert!(!daemon.path.exists());
     }

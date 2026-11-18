@@ -4,13 +4,11 @@
 //! section 13):
 //!
 //! 1. Client sends `Browser.close` (id = -9999).
-//! 2. Browser disposes sessions, shuts down the pipe transport, quits.
+//! 2. Camoufox 158 ignores Browser.close while a context exists; closing the
+//!    write end delivers EOF on fd 3 and makes the browser quit.
 //! 3. Client waits for the process to exit within `close_timeout`.
 //! 4. If the process does not exit in time, it is killed with `SIGKILL`.
 //!
-//! Alternatively, closing the parent's write end of the command pipe
-//! (dropping `command_pipe`) causes the child's reader thread to see EOF,
-//! which triggers the same shutdown flow on the browser side.
 
 use crate::process::ProcessError;
 
@@ -26,8 +24,7 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Gracefully shut down the browser process.
 ///
 /// The caller should have already:
-/// 1. Sent `Browser.close` via the transport, **or**
-/// 2. Dropped the `command_pipe` to trigger an EOF-based shutdown.
+/// Sent `Browser.close` and closed the command pipe to trigger EOF.
 ///
 /// This function polls `child.try_wait()` in a loop until the process exits
 /// or the timeout expires. If the timeout expires, the process is killed

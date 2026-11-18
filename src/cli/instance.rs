@@ -10,7 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -656,6 +656,7 @@ impl Instance {
                 // Any other error (an in-flight navigation tears down the
                 // execution context) is transient; keep polling until the
                 // deadline rather than failing immediately.
+                Err(e) if self.browser.connection().rejects_sends() => return Err(e),
                 Err(e) if std::time::Instant::now() >= deadline => return Err(e),
                 Err(_) => {}
             }
@@ -1043,7 +1044,7 @@ impl Instance {
         ids
     }
 
-    /// Shut down this instance.
+    /// Shut down this instance. Browser.close is followed by pipe EOF, which makes Camoufox exit.
     pub fn stop(self) -> Result<(), String> {
         let Instance {
             browser,
@@ -1065,10 +1066,22 @@ impl Instance {
 // InstanceManager
 // ---------------------------------------------------------------------------
 
+/// One daemon-managed instance. Everything that must be reachable WITHOUT
+/// taking the per-instance mutex (so it can interrupt a running command)
+/// lives beside `managed`, not inside it.
+#[derive(Clone)]
+struct InstanceEntry {
+    managed: Arc<Mutex<ManagedInstance>>,
+    /// Closes the protocol connection: rejects in-flight requests and makes
+    /// Camoufox exit (pipe EOF). Used by stop/shutdown.
+    closer: Arc<Connection>,
+}
+
 /// Manages all browser instances for the daemon.
 #[derive(Default)]
 pub struct InstanceManager {
-    instances: Mutex<HashMap<String, Arc<Mutex<ManagedInstance>>>>,
+    instances: Mutex<HashMap<String, InstanceEntry>>,
+    closing: AtomicBool,
     counter: AtomicU64,
 }
 
@@ -1082,6 +1095,7 @@ impl InstanceManager {
         InstanceManager {
             instances: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -1103,6 +1117,9 @@ impl InstanceManager {
         &self,
         options: &LaunchOptions,
     ) -> Result<(String, Option<String>, u32), String> {
+        if self.is_closing() {
+            return Err("daemon shutting down".into());
+        }
         let instance_id = format!("{:08x}", self.counter.fetch_add(1, Ordering::Relaxed) + 1);
         let profile_dir =
             tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
@@ -1148,6 +1165,7 @@ impl InstanceManager {
             .new_context(options.context_options())
             .map_err(|e| format!("failed to create context: {e}"))?;
 
+        let closer = Arc::clone(browser.connection());
         let instance = Instance {
             instance_id: instance_id.clone(),
             browser,
@@ -1160,16 +1178,25 @@ impl InstanceManager {
             close_timeout: config.close_timeout,
         };
 
-        self.instances
+        let mut instances = self
+            .instances
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                instance_id.clone(),
-                Arc::new(Mutex::new(ManagedInstance {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_closing() {
+            drop(instances);
+            let _ = instance.stop();
+            return Err("daemon shutting down".into());
+        }
+        instances.insert(
+            instance_id.clone(),
+            InstanceEntry {
+                managed: Arc::new(Mutex::new(ManagedInstance {
                     instance: Some(instance),
                     context,
                 })),
-            );
+                closer,
+            },
+        );
 
         Ok((instance_id, version, pid))
     }
@@ -1182,7 +1209,7 @@ impl InstanceManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .map(|(id, inst)| (id.clone(), Arc::clone(inst)))
+            .map(|(id, e)| (id.clone(), Arc::clone(&e.managed)))
             .collect();
         for (id, entry) in entries {
             let entry = entry
@@ -1207,12 +1234,18 @@ impl InstanceManager {
 
     /// Stop an instance.
     pub fn stop(&self, instance_id: &str) -> Result<(), String> {
-        let entry = self
+        let InstanceEntry {
+            managed: entry,
+            closer,
+        } = self
             .instances
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(instance_id)
             .ok_or_else(|| Self::missing(instance_id))?;
+        // Interrupt any command running on this instance first, so the
+        // instance mutex below frees promptly.
+        let _ = closer.close();
         let inst = entry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1307,7 +1340,7 @@ impl InstanceManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(id)
-            .cloned()
+            .map(|e| Arc::clone(&e.managed))
             .ok_or_else(|| Self::missing(id))?;
         let mut entry = entry
             .lock()
@@ -1610,17 +1643,63 @@ impl InstanceManager {
             .len()
     }
 
-    /// Shut down all instances.
-    pub fn shutdown_all(&self) {
-        let ids: Vec<String> = self
+    pub(crate) fn begin_shutdown(&self) {
+        let _guard = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.closing.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn close_all_connections(&self) {
+        let closers: Vec<_> = self
             .instances
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .cloned()
+            .values()
+            .map(|e| Arc::clone(&e.closer))
             .collect();
-        for id in ids {
-            let _ = self.stop(&id);
+        for closer in closers {
+            let _ = closer.close();
+        }
+    }
+
+    /// Shut down all instances in parallel.
+    pub fn shutdown_all(&self) {
+        let entries: Vec<_> = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(_, entry)| entry)
+            .collect();
+        let workers: Vec<_> = entries
+            .into_iter()
+            .map(
+                |InstanceEntry {
+                     managed: entry,
+                     closer,
+                 }| {
+                    std::thread::spawn(move || {
+                        let _ = closer.close();
+                        let mut entry = entry
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(instance) = entry.instance.take() {
+                            let _ = instance.stop();
+                        }
+                    })
+                },
+            )
+            .collect();
+        for worker in workers {
+            if worker.join().is_err() {
+                log::warn!("instance shutdown worker panicked");
+            }
         }
     }
 }

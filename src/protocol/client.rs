@@ -285,6 +285,15 @@ impl Connection {
         guard.events.handler_count_for(session_key, method)
     }
 
+    /// Whether the connection is closing or closed.
+    pub fn rejects_sends(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state
+            .rejects_sends()
+    }
+
     /// Close the connection gracefully.
     ///
     /// Sends `Browser.close` with id=-9999 directly via the transport
@@ -321,9 +330,12 @@ impl Connection {
             .writer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writer.send(&value).map_err(ProtocolError::transport)?;
-
-        Ok(())
+        let result = writer.send(&value).map_err(ProtocolError::transport);
+        // Camoufox exits on EOF even when a browser context remains open.
+        let _ = writer.close();
+        drop(writer);
+        close_all_sessions(&self.inner);
+        result
     }
 
     /// Wait for the connection to fully close.
@@ -434,7 +446,7 @@ impl Session {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             // Pre-send check: connection state
-            if guard.state.is_closed() {
+            if guard.state.rejects_sends() {
                 return Err(ProtocolError::closed(Some(method.to_owned())));
             }
 
@@ -573,7 +585,7 @@ impl Session {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-            if guard.state.is_closed() {
+            if guard.state.rejects_sends() {
                 return Err(ProtocolError::closed(Some(method.to_owned())));
             }
 
@@ -1292,6 +1304,48 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind, ProtocolErrorKind::Crashed);
 
+        teardown(h);
+    }
+
+    #[test]
+    fn close_closes_writer_after_browser_close() {
+        let h = setup();
+        h.conn.close().unwrap();
+        assert_eq!(recv_out(&h.out_rx)["method"], "Browser.close");
+        assert!(h.conn.writer.lock().unwrap().is_closed());
+        teardown(h);
+    }
+
+    #[test]
+    fn close_rejects_in_flight_requests_promptly() {
+        let h = setup();
+        let session = h.conn.root_session();
+        let worker = thread::spawn(move || {
+            session.send_with_timeout("Browser.getInfo", json!({}), Duration::from_secs(2))
+        });
+        recv_out(&h.out_rx);
+        let start = std::time::Instant::now();
+        h.conn.close().unwrap();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().kind,
+            ProtocolErrorKind::Closed
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        teardown(h);
+    }
+
+    #[test]
+    fn send_after_close_is_rejected_as_closed() {
+        let h = setup();
+        h.conn.close().unwrap();
+        assert_eq!(
+            h.conn
+                .root_session()
+                .send("Browser.getInfo", json!({}))
+                .unwrap_err()
+                .kind,
+            ProtocolErrorKind::Closed
+        );
         teardown(h);
     }
 

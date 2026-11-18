@@ -299,6 +299,7 @@ impl DaemonRequest {
     pub fn timeout_secs(&self) -> u64 {
         match self {
             Self::Launch { .. } => 180,
+            Self::Shutdown => 20,
             Self::Navigate { timeout_secs, .. }
             | Self::Evaluate { timeout_secs, .. }
             | Self::ClickSelector { timeout_secs, .. }
@@ -456,7 +457,6 @@ mod tests {
         let default_methods = [
             "Ping",
             "List",
-            "Shutdown",
             "Stop",
             "NewPage",
             "Click",
@@ -477,6 +477,7 @@ mod tests {
             }).unwrap();
             assert_eq!(request.read_timeout().as_secs(), 90, "{method}");
         }
+        assert_eq!(DaemonRequest::Shutdown.read_timeout().as_secs(), 50);
         let launch = DaemonRequest::Launch {
             headless: None,
             executable: None,

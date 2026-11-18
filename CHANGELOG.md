@@ -79,6 +79,8 @@ All notable changes to camoufox-rs are documented here.
 
 ### Fixed
 
+- `stop` typically takes about 1 s instead of 10 s; `shutdown` waits for cleanup.
+
 - **Undefined behaviour in the connection.** `SplitTransport` handed `&mut PipeTransport`
   to the reader and writer threads at the same time (both wrote `closed`, and `close()` could
   free the writer mid-send). Replaced with an owned reader/writer split.

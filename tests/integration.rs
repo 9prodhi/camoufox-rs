@@ -1027,3 +1027,70 @@ fn wait_fails_fast_on_invalid_selector() {
          full 30s timeout. Took {elapsed:?}."
     );
 }
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn stop_returns_quickly_without_sigkill() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::BrowseServer::start();
+    let mut mgr = InstanceManager::new();
+    let (id, _, pid) = mgr.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = mgr.new_page(&id).unwrap();
+    mgr.navigate(
+        &id,
+        &page,
+        &server.url,
+        Duration::from_secs(20),
+        Some("load"),
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    mgr.stop(&id).unwrap();
+    let elapsed = start.elapsed();
+    eprintln!("stop elapsed: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(3));
+    assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0);
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn stop_interrupts_a_long_running_command() {
+    use camoufox::cli::instance::InstanceManager;
+    use std::sync::Arc;
+    let mut mgr = InstanceManager::new();
+    let (id, _, _) = mgr.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = mgr.new_page(&id).unwrap();
+    let mgr = Arc::new(mgr);
+    let (other, id2) = (Arc::clone(&mgr), id.clone());
+    let waiter = std::thread::spawn(move || {
+        other.wait_for_selector(&id2, &page, "#never-appears", Duration::from_secs(30))
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let start = std::time::Instant::now();
+    mgr.stop(&id).unwrap();
+    let elapsed = start.elapsed();
+    eprintln!("interrupting stop elapsed: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(3));
+    assert!(waiter.join().unwrap().is_err());
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn shutdown_all_three_instances_in_parallel() {
+    use camoufox::cli::instance::InstanceManager;
+    let mut mgr = InstanceManager::new();
+    let pids: Vec<_> = (0..3)
+        .map(|_| mgr.launch(Some(true), Some(&camoufox_bin())).unwrap().2)
+        .collect();
+    let start = std::time::Instant::now();
+    mgr.shutdown_all();
+    let elapsed = start.elapsed();
+    eprintln!("three-instance shutdown elapsed: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5));
+    for pid in pids {
+        assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0);
+    }
+}

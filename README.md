@@ -398,8 +398,8 @@ Protocol traffic is traced at `camoufox::protocol=trace` with bounded payload pr
 - Requests to the *same* instance are serialized: a long-polling command (e.g.
   `wait --timeout 60`) on one page blocks other commands for that instance until it returns.
   Other instances are unaffected.
-- `stop` / `shutdown` take up to the close timeout (10s) per browser: Camoufox 158 does not
-  act on `Browser.close`, so each browser is SIGKILLed once the timeout expires.
+- `stop` interrupts in-flight commands and typically takes about one second. `shutdown`
+  stops browsers in parallel and replies only after cleanup and socket removal.
 - `back` / `forward` are wired to `Page.goBack` / `Page.goForward` but are inert against the
   Camoufox builds tested here: pages created via `Browser.newPage` expose no session history
   (`history.length === 0`), so both always report "no history entry". Re-`navigate` instead.

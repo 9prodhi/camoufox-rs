@@ -6,6 +6,10 @@ use std::path::Path;
 
 use crate::cli::ipc::{DaemonRequest, DaemonResponse};
 
+fn daemon_not_running_message() -> String {
+    "daemon is not running (start with: camoufox serve)".to_string()
+}
+
 /// Send a request to the daemon and return the response.
 pub fn send_request(socket_path: &Path, request: &DaemonRequest) -> Result<DaemonResponse, String> {
     crate::cli::socket::check_socket_parent(socket_path, false)?;
@@ -13,7 +17,7 @@ pub fn send_request(socket_path: &Path, request: &DaemonRequest) -> Result<Daemo
         if e.kind() == std::io::ErrorKind::NotFound
             || e.kind() == std::io::ErrorKind::ConnectionRefused
         {
-            "daemon is not running (start with: camoufox serve --foreground)".to_string()
+            daemon_not_running_message()
         } else {
             format!("failed to connect to daemon: {e}")
         }
@@ -54,4 +58,14 @@ pub fn send_request(socket_path: &Path, request: &DaemonRequest) -> Result<Daemo
     }
 
     serde_json::from_str(&line).map_err(|e| format!("invalid response from daemon: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn not_running_hint_names_serve_without_foreground() {
+        let message = super::daemon_not_running_message();
+        assert!(message.contains("camoufox serve"));
+        assert!(!message.contains("--foreground"));
+    }
 }

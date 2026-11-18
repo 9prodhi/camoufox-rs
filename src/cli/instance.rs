@@ -242,6 +242,26 @@ pub struct ManagedMainFrame {
 // Instance
 // ---------------------------------------------------------------------------
 
+/// Every `camoufox launch` flag, in one place.
+///
+/// New launch flags add a field here (and on `DaemonRequest::Launch`), so
+/// `launch_with`'s signature never changes. Flags that configure the browser
+/// context are mapped in [`LaunchOptions::context_options`].
+#[derive(Debug, Clone, Default)]
+pub struct LaunchOptions {
+    /// `None` means headless.
+    pub headless: Option<bool>,
+    /// Camoufox executable; `None` uses the default install location.
+    pub executable: Option<String>,
+}
+
+impl LaunchOptions {
+    /// Browser-context options derived from the launch flags.
+    pub(crate) fn context_options(&self) -> ContextOptions {
+        ContextOptions::default()
+    }
+}
+
 /// A running Camoufox browser instance managed by the daemon.
 pub struct Instance {
     instance_id: String,
@@ -1072,21 +1092,26 @@ impl InstanceManager {
         headless: Option<bool>,
         executable: Option<&str>,
     ) -> Result<(String, Option<String>, u32), String> {
-        self.launch_shared(headless, executable)
+        self.launch_with(&LaunchOptions {
+            headless,
+            executable: executable.map(str::to_owned),
+        })
     }
 
-    pub(crate) fn launch_shared(
+    /// Launch a new browser instance from the full set of `launch` flags.
+    pub(crate) fn launch_with(
         &self,
-        headless: Option<bool>,
-        executable: Option<&str>,
+        options: &LaunchOptions,
     ) -> Result<(String, Option<String>, u32), String> {
         let instance_id = format!("{:08x}", self.counter.fetch_add(1, Ordering::Relaxed) + 1);
         let profile_dir =
             tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+        let headless = options.headless;
 
         let executable = PathBuf::from(
-            executable
-                .map(|s| s.to_owned())
+            options
+                .executable
+                .clone()
                 .unwrap_or_else(default_executable),
         );
         let inherited_env_keys: Vec<String> = std::env::vars_os()
@@ -1120,7 +1145,7 @@ impl InstanceManager {
 
         // Create a default context.
         let context = browser
-            .new_context(ContextOptions::default())
+            .new_context(options.context_options())
             .map_err(|e| format!("failed to create context: {e}"))?;
 
         let instance = Instance {
@@ -1607,6 +1632,14 @@ impl InstanceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_options_default_context_is_unchanged() {
+        let opts = LaunchOptions::default();
+        assert!(opts.headless.is_none());
+        assert!(!opts.context_options().bypass_csp);
+        assert!(opts.context_options().download_options.is_none());
+    }
 
     #[test]
     fn screenshot_runtime_path_and_private_permissions() {

@@ -484,6 +484,21 @@ mod tests {
         assert_eq!(launch.read_timeout().as_secs(), 210);
     }
 
+    /// Old clients send `Launch` with only headless/executable (or nothing).
+    /// Every launch flag added later must be `#[serde(default)]` so this
+    /// payload keeps parsing.
+    #[test]
+    fn launch_minimal_payload_still_parses() {
+        let request: DaemonRequest =
+            serde_json::from_value(json!({"method": "Launch", "params": {}})).unwrap();
+        assert!(matches!(request, DaemonRequest::Launch { .. }));
+        let request: DaemonRequest = serde_json::from_value(
+            json!({"method": "Launch", "params": {"headless": true, "executable": "/x"}}),
+        )
+        .unwrap();
+        assert!(matches!(request, DaemonRequest::Launch { .. }));
+    }
+
     /// `DaemonRequest::Cookies` serialises to the expected JSON shape and
     /// deserialises back to the same variant (round-trip).
     #[test]

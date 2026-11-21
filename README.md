@@ -444,23 +444,24 @@ Core layers (top to bottom):
 
 ## Testing
 
-Unit tests:
+Unit tests (`--all-features` is needed to build and test the CLI; plain
+`cargo test` covers only the library):
 
 ```bash
-cargo test
+cargo test --all-features
 ```
 
 Integration tests against a real Camoufox binary are ignored by default:
 
 ```bash
-cargo test --test integration -- --ignored --test-threads=1
+cargo test --all-features --test integration -- --ignored --test-threads=1
 ```
 
 Integration tests resolve the binary the same way as the daemon: `CAMOUFOX_BIN`,
 else `$HOME/.cache/camoufox/camoufox`. Override per run with:
 
 ```bash
-CAMOUFOX_BIN=/path/to/camoufox cargo test --test integration -- --ignored --test-threads=1
+CAMOUFOX_BIN=/path/to/camoufox cargo test --all-features --test integration -- --ignored --test-threads=1
 ```
 
 ## Observability
@@ -477,7 +478,12 @@ Protocol traffic is traced at `camoufox::protocol=trace` with bounded payload pr
 
 - Windows pipe transport is not implemented (`src/transport/pipe/windows.rs` hard errors at compile time)
 - API is synchronous/blocking today (no async runtime integration)
-- `MainFrame` is top-frame only; there is no public API for operating on sub-frames
+- Sub-frames are reached through `MainFrame` (`frames()`, `frame_ctx()`, `evaluate_in_frame()`)
+  and the CLI's `--frame`; there is no separate frame object type
+- Closed shadow roots cannot be pierced (` >>> ` reports them); rotated or skewed iframes are
+  not supported for pointer coordinates (translation and scale are)
+- `type --frame` / `press --frame` only type into a field that is currently focused inside the
+  frame; after touching the top-level page, click or fill inside the frame again
 - CLI daemon uses in-memory instance state only
 - Requests to the *same* instance are serialized: a long-polling command (e.g.
   `wait --timeout 60`) on one page blocks other commands for that instance until it returns.

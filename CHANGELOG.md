@@ -4,9 +4,11 @@ All notable changes to camoufox-rs are documented here.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-21
+
 ### Breaking changes
 
-This crate is pre-1.0 (currently 0.1.0).
+This crate is pre-1.0. Breaking changes in this release:
 
 - `ProtocolErrorKind` is now `#[non_exhaustive]`; downstream matches must include a wildcard arm.
 - This branch adds `DialogOpened`, `FrameDetached`, `ScriptException`, `NotIframe`, `FrameNotFound`, and `ShadowRoot` error kinds.
@@ -46,7 +48,7 @@ This crate is pre-1.0 (currently 0.1.0).
 
 - **Popups and site-opened tabs adoption (`tabs` and `BrowserContext::take_popups`)**:
   - Automatically track pages and popups opened by the site (`<a target="_blank">` or `window.open()`) via `PageRegistry`.
-  - Popups are classified immediately when `openerId` is present, or held during in-flight `new_page` calls to avoid races with user-created tabs.
+  - Popups are classified immediately when `openerId` is present, or held during in-flight `new_main_frame` calls to avoid races with user-created tabs.
   - The CLI automatically adopts newly opened popups on command entry (`with_instance`), assigning them `p<N>` page IDs and inheriting the instance's dialog policy.
   - `tabs` command output includes `"opener": <page_id or null>` to reflect opener relationships.
   - Closed or self-closing tabs (`window.close()` / `Browser.detachedFromTarget`) are removed from `tabs`, and targeted commands on closed pages return a clear error indicating the page was closed.
@@ -65,7 +67,8 @@ This crate is pre-1.0 (currently 0.1.0).
     a context-scoped `DownloadLog`. Condvar waiting runs outside the per-instance mutex so it
     never blocks concurrent commands on that instance.
   - `click` and `click_selector` responses include recent download events (`"downloads": [...]`),
-    enabling the two-step agent pattern `click <inst> <page> <sel> && downloads <inst> --wait 10`.
+    enabling agents to detect downloads immediately. `downloads <inst> --wait <secs>` waits for the
+    next sequence advance; callers should poll until state reaches `completed`, `failed`, or `canceled`.
 
 - **`launch --bypass-csp`**: Disables Content-Security-Policy for the browser context via
   `Browser.setBypassCSP`. Used when `--main-world` evaluation is needed on strict-CSP sites
@@ -111,7 +114,7 @@ This crate is pre-1.0 (currently 0.1.0).
   from JavaScript, the page sees `event.isTrusted === true`, so the click drives cross-origin
   and closed-shadow widgets (e.g. Cloudflare Turnstile) that synthetic JS
   `click()` / `dispatchEvent` cannot reach. `--json` returns
-  `{ "clicked": true, "x": <x>, "y": <y> }`. Covered by the
+  `{ "ok": true, "data": { "clicked": true, "x": <x>, "y": <y> } }`. Covered by the
   `click_command_dispatches_trusted_event_at_coordinates` integration test, which asserts the
   dispatched event arrives with `isTrusted === true` at the requested coordinates.
 

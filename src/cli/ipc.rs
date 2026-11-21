@@ -28,6 +28,8 @@ pub enum DaemonRequest {
         executable: Option<String>,
         #[serde(default)]
         downloads_dir: Option<std::path::PathBuf>,
+        #[serde(default)]
+        bypass_csp: bool,
     },
 
     /// List all running instances.
@@ -492,6 +494,7 @@ mod tests {
             headless: None,
             executable: None,
             downloads_dir: None,
+            bypass_csp: false,
         };
         assert_eq!(launch.read_timeout().as_secs(), 210);
     }

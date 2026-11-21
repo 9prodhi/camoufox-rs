@@ -37,6 +37,9 @@ pub enum Command {
         /// Directory to save downloads to (must be absolute; defaults to cancel).
         #[arg(long)]
         downloads_dir: Option<PathBuf>,
+        /// Disable page Content-Security-Policy (needed for --main-world on strict-CSP sites; detectable by pages)
+        #[arg(long)]
+        bypass_csp: bool,
     },
 
     /// List all running browser instances.

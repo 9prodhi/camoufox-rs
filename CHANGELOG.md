@@ -17,6 +17,9 @@ All notable changes to camoufox-rs are documented here.
   - `click` and `click_selector` responses include recent download events (`"downloads": [...]`),
     enabling the two-step agent pattern `click <inst> <page> <sel> && downloads <inst> --wait 10`.
 
+- **`launch --bypass-csp`**: Disables Content-Security-Policy for the browser context via
+  `Browser.setBypassCSP`. Used when `--main-world` evaluation is needed on strict-CSP sites
+  that prohibit inline scripts.
 - **Browsing command surface (20 new CLI subcommands)**: the CLI grew from 12 primitives to a
   full browsing/scraping surface. Every new command is a thin CLI/IPC wrapper over the existing
   `api` layer — no new protocol plumbing.
@@ -92,6 +95,15 @@ All notable changes to camoufox-rs are documented here.
 
 - `stop` typically takes about 1 s instead of 10 s; `shutdown` waits for cleanup.
 
+- **Page survives downloads without losing execution context (#5)**: Navigating to a URL that
+  produces a download (e.g. `Content-Disposition: attachment` returning `NavigationBecameDownload`)
+  or a same-document navigation no longer clears the page's execution context.
+  `ExecContextTracker` restores the pre-navigation context when navigation aborts or produces no new document.
+- **Main-world evaluation bridge v2 and CSP handling (#6)**: The bridge snippet no longer declares
+  lexical bindings in the page scope, preventing shadowing of page globals like `window.val`.
+  For nonce-protected pages, the bridge automatically borrows an in-DOM script's `nonce` attribute
+  (verified feasible on Camoufox 158). When blocked by strict CSP, evaluation returns a clear error
+  recommending `camoufox launch --bypass-csp`.
 - **Undefined behaviour in the connection.** `SplitTransport` handed `&mut PipeTransport`
   to the reader and writer threads at the same time (both wrote `closed`, and `close()` could
   free the writer mid-send). Replaced with an owned reader/writer split.

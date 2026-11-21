@@ -658,3 +658,130 @@ impl DownloadServer {
 impl Drop for DownloadServer {
     fn drop(&mut self) {}
 }
+
+// ---------------------------------------------------------------------------
+// CspServer — fixture for Content-Security-Policy tests
+// ---------------------------------------------------------------------------
+
+const CSP_STRICT_HTML: &str = include_str!("csp_strict.html");
+const CSP_INLINE_HTML: &str = include_str!("csp_inline.html");
+const CSP_NONCE_HTML: &str = include_str!("csp_nonce.html");
+
+/// A single-port HTTP server serving pages with varying Content-Security-Policy headers:
+/// - `/csp_strict.html` with CSP: `script-src 'self'`, plus `/csp_strict.js`
+/// - `/csp_inline.html` with CSP: `script-src 'self' 'unsafe-inline'`
+/// - `/csp_nonce.html` with CSP: `script-src 'nonce-n0nc3'`
+/// - `/val.html` with no CSP, sets `window.val = 7`
+pub struct CspServer {
+    pub base_url: String,
+    _server: Arc<Server>,
+}
+
+impl CspServer {
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").expect("bind csp server"));
+        let port = server.server_addr().to_ip().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let server_clone = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in server_clone.incoming_requests() {
+                let path = req.url().to_owned();
+                let (status, headers, body) = match path.as_str() {
+                    "/csp_strict.html" => (
+                        200,
+                        vec![
+                            Header::from_bytes(
+                                &b"Content-Type"[..],
+                                &b"text/html; charset=utf-8"[..],
+                            )
+                            .unwrap(),
+                            Header::from_bytes(
+                                &b"Content-Security-Policy"[..],
+                                &b"script-src 'self'"[..],
+                            )
+                            .unwrap(),
+                        ],
+                        CSP_STRICT_HTML.as_bytes().to_vec(),
+                    ),
+                    "/csp_strict.js" => (
+                        200,
+                        vec![Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"application/javascript"[..],
+                        )
+                        .unwrap()],
+                        b"window.answer = 42;".to_vec(),
+                    ),
+                    "/csp_inline.html" => (
+                        200,
+                        vec![
+                            Header::from_bytes(
+                                &b"Content-Type"[..],
+                                &b"text/html; charset=utf-8"[..],
+                            )
+                            .unwrap(),
+                            Header::from_bytes(
+                                &b"Content-Security-Policy"[..],
+                                &b"script-src 'self' 'unsafe-inline'"[..],
+                            )
+                            .unwrap(),
+                        ],
+                        CSP_INLINE_HTML.as_bytes().to_vec(),
+                    ),
+                    "/csp_nonce.html" => (
+                        200,
+                        vec![
+                            Header::from_bytes(
+                                &b"Content-Type"[..],
+                                &b"text/html; charset=utf-8"[..],
+                            )
+                            .unwrap(),
+                            Header::from_bytes(
+                                &b"Content-Security-Policy"[..],
+                                &b"script-src 'nonce-n0nc3'"[..],
+                            )
+                            .unwrap(),
+                        ],
+                        CSP_NONCE_HTML.as_bytes().to_vec(),
+                    ),
+                    "/val.html" => (
+                        200,
+                        vec![Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"text/html; charset=utf-8"[..],
+                        )
+                        .unwrap()],
+                        b"<!DOCTYPE html><html><head><script>window.val = 7;</script></head><body>val</body></html>".to_vec(),
+                    ),
+                    _ => (
+                        404,
+                        vec![Header::from_bytes(&b"Content-Type"[..], &b"text/plain"[..]).unwrap()],
+                        b"not found".to_vec(),
+                    ),
+                };
+                let resp = Response::new(
+                    status.into(),
+                    headers,
+                    Cursor::new(body.clone()),
+                    Some(body.len()),
+                    None,
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        CspServer {
+            base_url,
+            _server: server,
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+}
+
+impl Drop for CspServer {
+    fn drop(&mut self) {}
+}

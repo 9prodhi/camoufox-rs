@@ -15,8 +15,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
 use crate::api::browser::Session;
+use crate::api::exec_ctx::ExecContextTracker;
 use crate::protocol::client::Connection;
-use crate::protocol::errors::{DownloadInfo, ProtocolError};
+use crate::protocol::errors::{DownloadInfo, ProtocolError, ProtocolErrorKind};
 use crate::protocol::events::HandlerId;
 
 /// Upper bound (ms) on how long `navigate` spins waiting for the main-document
@@ -363,7 +364,7 @@ pub struct MainFrame {
     /// Latest known main-world execution context ID for this frame.
     /// Updated by a `Runtime.executionContextCreated` listener registered
     /// in `BrowserContext::new_main_frame`, filtered on `auxData.frameId`.
-    execution_context_id: Arc<Mutex<Option<String>>>,
+    execution_context_id: Arc<ExecContextTracker>,
     /// Shared connection — used for `on_event` subscriptions (e.g. lifecycle wait).
     connection: Arc<Connection>,
     /// RAII guards for event subscriptions owned by this frame (e.g. executionContextCreated/Destroyed).
@@ -376,7 +377,7 @@ impl MainFrame {
         session: Session,
         target_id: String,
         frame_id: String,
-        execution_context_id: Arc<Mutex<Option<String>>>,
+        execution_context_id: Arc<ExecContextTracker>,
         connection: Arc<Connection>,
         context_guards: Vec<SubscriptionGuard>,
     ) -> Self {
@@ -402,8 +403,8 @@ impl MainFrame {
 
     /// Shared handle to the cached execution context id. Updated by the
     /// listener registered in `BrowserContext::new_main_frame`.
-    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
-    pub(crate) fn execution_context_handle(&self) -> Arc<Mutex<Option<String>>> {
+    #[allow(dead_code)]
+    pub(crate) fn execution_context_handle(&self) -> Arc<ExecContextTracker> {
         Arc::clone(&self.execution_context_id)
     }
 
@@ -905,68 +906,17 @@ impl MainFrame {
             params["referer"] = json!(referer);
         }
 
-        let result = self.session().send_navigate_with_timeout(
-            "Page.navigate",
-            params,
-            &self.frame_id,
-            timeout,
-        )?;
+        let nav_token = self.execution_context_id.begin_navigation();
 
-        // If Browser.downloadCreated arrived before/with ack, short-circuit immediately.
-        if let Some(info) = download_state.lock().unwrap().info.clone() {
-            return Err(ProtocolError::navigation_became_download(
-                Some("Page.navigate".into()),
-                info,
-            ));
-        }
+        let navigate_inner = || -> Result<NavigateOutcome, ProtocolError> {
+            let result = self.session().send_navigate_with_timeout(
+                "Page.navigate",
+                params,
+                &self.frame_id,
+                timeout,
+            )?;
 
-        let nav_id = result
-            .get("navigationId")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned());
-
-        // Publish the nav_id so the requestWillBeSent handler can validate
-        // any speculatively accepted request.
-        *expected_nav_id.lock().unwrap() = nav_id.clone();
-
-        // Cross-document navigation invalidates the pre-nav exec context.
-        // Clear the cache so subsequent evaluate() calls wait for the new
-        // document's main-world context.
-        if nav_id.is_some() {
-            *self.execution_context_id.lock().unwrap() = None;
-        }
-
-        // If a lifecycle event was requested, block until it fires or a downloadCreated
-        // event short-circuits the wait — but only for the time remaining against
-        // the single navigate deadline.
-        if let Some(event_name) = lifecycle_event {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            self.wait_for_lifecycle_internal(event_name, remaining, Some(&download_state))?;
-        }
-
-        // Poll briefly for the status code. The response typically arrives
-        // near-instantly after the navigate ack (or during the lifecycle wait).
-        // Cap at 500 ms so we don't meaningfully delay callers without
-        // --wait-until when Network events don't flow.
-        //
-        // Redirect-aware: a 3xx status or in-flight redirect continuation waits
-        // up to MAX_REDIRECT_WAIT_MS for the final (non-3xx) status, breaking
-        // immediately as soon as the final status arrives.
-        //
-        // Download-aware: if the main-document response specifies an attachment,
-        // we wait for Browser.downloadCreated (bounded by remaining deadline,
-        // up to MAX_ATTACHMENT_WAIT_MS). Non-download responses return as fast
-        // as before.
-        const MAX_STATUS_WAIT: Duration = Duration::from_millis(MAX_STATUS_WAIT_MS);
-        const MAX_ATTACHMENT_WAIT: Duration = Duration::from_millis(MAX_ATTACHMENT_WAIT_MS);
-        const MAX_REDIRECT_WAIT: Duration = Duration::from_millis(MAX_REDIRECT_WAIT_MS);
-        let status_cap = Instant::now() + MAX_STATUS_WAIT;
-        let is_final = |s: Option<u16>| matches!(s, Some(code) if !(300..400).contains(&code));
-        let mut attachment_deadline: Option<Instant> = None;
-        let mut redirect_deadline: Option<Instant> = None;
-
-        let status_code = loop {
+            // If Browser.downloadCreated arrived before/with ack, short-circuit immediately.
             if let Some(info) = download_state.lock().unwrap().info.clone() {
                 return Err(ProtocolError::navigation_became_download(
                     Some("Page.navigate".into()),
@@ -974,45 +924,115 @@ impl MainFrame {
                 ));
             }
 
-            let (status, is_attachment, redirect_in_flight) = {
-                let st = net_state.lock().unwrap();
-                (st.status, st.is_attachment, st.redirect_in_flight)
+            let nav_id = result
+                .get("navigationId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_owned());
+
+            // Publish the nav_id so the requestWillBeSent handler can validate
+            // any speculatively accepted request.
+            *expected_nav_id.lock().unwrap() = nav_id.clone();
+
+            // If a lifecycle event was requested, block until it fires or a downloadCreated
+            // event short-circuits the wait — but only for the time remaining against
+            // the single navigate deadline.
+            if let Some(event_name) = lifecycle_event {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                self.wait_for_lifecycle_internal(event_name, remaining, Some(&download_state))?;
+            }
+
+            // Poll briefly for the status code. The response typically arrives
+            // near-instantly after the navigate ack (or during the lifecycle wait).
+            // Cap at 500 ms so we don't meaningfully delay callers without
+            // --wait-until when Network events don't flow.
+            //
+            // Redirect-aware: a 3xx status or in-flight redirect continuation waits
+            // up to MAX_REDIRECT_WAIT_MS for the final (non-3xx) status, breaking
+            // immediately as soon as the final status arrives.
+            //
+            // Download-aware: if the main-document response specifies an attachment,
+            // we wait for Browser.downloadCreated (bounded by remaining deadline,
+            // up to MAX_ATTACHMENT_WAIT_MS). Non-download responses return as fast
+            // as before.
+            const MAX_STATUS_WAIT: Duration = Duration::from_millis(MAX_STATUS_WAIT_MS);
+            const MAX_ATTACHMENT_WAIT: Duration = Duration::from_millis(MAX_ATTACHMENT_WAIT_MS);
+            const MAX_REDIRECT_WAIT: Duration = Duration::from_millis(MAX_REDIRECT_WAIT_MS);
+            let status_cap = Instant::now() + MAX_STATUS_WAIT;
+            let is_final = |s: Option<u16>| matches!(s, Some(code) if !(300..400).contains(&code));
+            let mut attachment_deadline: Option<Instant> = None;
+            let mut redirect_deadline: Option<Instant> = None;
+
+            let status_code = loop {
+                if let Some(info) = download_state.lock().unwrap().info.clone() {
+                    return Err(ProtocolError::navigation_became_download(
+                        Some("Page.navigate".into()),
+                        info,
+                    ));
+                }
+
+                let (status, is_attachment, redirect_in_flight) = {
+                    let st = net_state.lock().unwrap();
+                    (st.status, st.is_attachment, st.redirect_in_flight)
+                };
+
+                if is_attachment {
+                    let dl_deadline = *attachment_deadline.get_or_insert_with(|| {
+                        (Instant::now() + MAX_ATTACHMENT_WAIT).min(deadline)
+                    });
+                    if Instant::now() >= dl_deadline {
+                        break status;
+                    }
+                } else if is_final(status) {
+                    break status;
+                } else if redirect_in_flight {
+                    let r_deadline = *redirect_deadline
+                        .get_or_insert_with(|| (Instant::now() + MAX_REDIRECT_WAIT).min(deadline));
+                    if Instant::now() >= r_deadline {
+                        break status;
+                    }
+                } else if Instant::now() >= status_cap.min(deadline) {
+                    // Return whatever we have (or None if no network events flowed).
+                    break status;
+                }
+                std::thread::sleep(Duration::from_millis(5));
             };
 
-            if is_attachment {
-                let dl_deadline = *attachment_deadline
-                    .get_or_insert_with(|| (Instant::now() + MAX_ATTACHMENT_WAIT).min(deadline));
-                if Instant::now() >= dl_deadline {
-                    break status;
-                }
-            } else if is_final(status) {
-                break status;
-            } else if redirect_in_flight {
-                let r_deadline = *redirect_deadline
-                    .get_or_insert_with(|| (Instant::now() + MAX_REDIRECT_WAIT).min(deadline));
-                if Instant::now() >= r_deadline {
-                    break status;
-                }
-            } else if Instant::now() >= status_cap.min(deadline) {
-                // Return whatever we have (or None if no network events flowed).
-                break status;
+            if let Some(info) = download_state.lock().unwrap().info.clone() {
+                return Err(ProtocolError::navigation_became_download(
+                    Some("Page.navigate".into()),
+                    info,
+                ));
             }
-            std::thread::sleep(Duration::from_millis(5));
+
+            Ok(NavigateOutcome {
+                nav_id,
+                status_code,
+            })
         };
 
-        if let Some(info) = download_state.lock().unwrap().info.clone() {
-            return Err(ProtocolError::navigation_became_download(
-                Some("Page.navigate".into()),
-                info,
-            ));
+        let res = navigate_inner();
+
+        match &res {
+            Ok(outcome) if outcome.nav_id.is_none() => {
+                self.execution_context_id.abort_navigation(nav_token);
+            }
+            Err(e)
+                if matches!(
+                    e.kind,
+                    ProtocolErrorKind::NavigationBecameDownload
+                        | ProtocolErrorKind::Timeout
+                        | ProtocolErrorKind::Response
+                ) =>
+            {
+                self.execution_context_id.abort_navigation(nav_token);
+            }
+            _ => {}
         }
 
         // _guard_dl, _guard_rws, and _guard_rr drop here — all handlers are
         // deregistered on every exit path (success, error, timeout, panic).
-        Ok(NavigateOutcome {
-            nav_id,
-            status_code,
-        })
+        res
     }
 
     /// Reload the page.
@@ -1484,11 +1504,13 @@ impl MainFrame {
 
             // Acquire a usable execution context, skipping any known-bad one.
             let exec_ctx = loop {
-                let cur = self.execution_context_id.lock().unwrap().clone();
+                let cur = self.execution_context_id.current();
                 match cur {
                     Some(c) if bad_ctx.as_ref() != Some(&c) => break c,
                     _ => {
-                        *self.execution_context_id.lock().unwrap() = None;
+                        if let Some(ref c) = cur {
+                            self.execution_context_id.invalidate(c);
+                        }
                         if Instant::now() >= deadline {
                             return Err(ProtocolError::timeout_msg(
                                 "Runtime.evaluate",
@@ -1583,7 +1605,7 @@ impl MainFrame {
             Some(serde_json::Value::Null) | None => {
                 return Err(ProtocolError::response_msg(
                     "Runtime.evaluate",
-                    "main-world script did not run (CSP or JavaScript disabled?)",
+                    "main-world script was blocked (likely the page's Content-Security-Policy); relaunch with `camoufox launch --bypass-csp`",
                 ));
             }
             Some(other) => {
@@ -2043,19 +2065,16 @@ fn build_evaluate_main_world_snippet(expression: &str, token: &str) -> String {
     format!(
         "(() => {{\
            const token = {token_literal};\
+           const src = {expr_literal};\
+           let direct = true;\
+           try {{ new Function(\"return (\" + src + \"\\n)\"); }} catch (_) {{ direct = false; }}\
+           const body = direct \
+             ? \"(function(){{try{{document.documentElement.dataset[\" + JSON.stringify(token) + \"]=JSON.stringify({{ok:true,value:(function(){{return (\" + src + \"\\n)}})()??null}})}}catch(e){{document.documentElement.dataset[\" + JSON.stringify(token) + \"]=JSON.stringify({{ok:false,error:String(e)}})}}}})()\" \
+             : \"(function(){{try{{document.documentElement.dataset[\" + JSON.stringify(token) + \"]=JSON.stringify({{ok:true,value:(0, eval)(\" + JSON.stringify(src) + \")??null}})}}catch(e){{document.documentElement.dataset[\" + JSON.stringify(token) + \"]=JSON.stringify({{ok:false,error:String(e)}})}}}})()\"; \
            const script = document.createElement(\"script\");\
-           script.textContent = \"(() => {{ \
-             let out; \
-             try {{ \
-               const val = (0, eval)(\" + JSON.stringify({expr_literal}).replace(/\\u2028/g, \"\\\\u2028\").replace(/\\u2029/g, \"\\\\u2029\") + \"); \
-               out = JSON.stringify({{ ok: true, value: val === undefined ? null : val }}); \
-             }} catch (e) {{ \
-               out = JSON.stringify({{ ok: false, error: String(e) }}); \
-             }} \
-             try {{ \
-               document.documentElement.dataset[\" + JSON.stringify(token) + \"] = out; \
-             }} catch (_) {{}} \
-           }})();\";\
+           const nonceSrc = document.querySelector(\"script[nonce]\");\
+           if (nonceSrc && nonceSrc.nonce) script.nonce = nonceSrc.nonce;\
+           script.textContent = body;\
            const parent = document.head || document.documentElement;\
            if (!parent) return null;\
            parent.appendChild(script);\
@@ -2190,6 +2209,77 @@ mod tests {
         ));
     }
 
+    fn extract_page_script_for_test(s: &str) -> String {
+        if let Some(rest) = s.split("script.textContent = \"").nth(1) {
+            if let Some(end) = rest.find("\";") {
+                return rest[..end].to_string();
+            }
+        }
+        if let Some(rest) = s.split("const body = direct ? ").nth(1) {
+            if let Some(end) = rest.find("; const script") {
+                return rest[..end].to_string();
+            }
+        }
+        String::new()
+    }
+
+    #[test]
+    fn bridge_snippet_declares_no_page_scope_bindings() {
+        let s = build_evaluate_main_world_snippet("window.val", "tok");
+        let page_script = extract_page_script_for_test(&s);
+        for kw in ["const ", "let ", "var "] {
+            assert!(
+                !page_script.contains(kw),
+                "page script declares `{kw}`: {page_script}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_uses_direct_form_for_expressions_and_eval_for_statements() {
+        let s = build_evaluate_main_world_snippet("1 + 1", "tok");
+        assert!(
+            s.contains("new Function"),
+            "isolated-world pre-parse must decide the form"
+        );
+    }
+
+    #[test]
+    fn bridge_null_result_reports_csp_hint() {
+        let h = build_mock_frame("page-csp", "frame-csp");
+        h.frame
+            .execution_context_handle()
+            .on_created("ctx-1".into());
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let id = sent["id"].as_i64().unwrap();
+            in_tx
+                .send(RawMessage {
+                    id: Some(id),
+                    method: None,
+                    params: None,
+                    result: Some(serde_json::json!({
+                        "result": { "type": "object", "value": serde_json::Value::Null }
+                    })),
+                    error: None,
+                    session_id: Some("page-csp".into()),
+                })
+                .unwrap();
+        });
+        let err = h
+            .frame
+            .evaluate_main_world("1 + 1", Duration::from_secs(5))
+            .unwrap_err();
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+        assert!(
+            err.to_string().contains("--bypass-csp"),
+            "error must mention --bypass-csp, got: {err}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Regression: `navigate` must honor its `timeout: Duration` parameter.
     //
@@ -2285,7 +2375,7 @@ mod tests {
         let conn = Connection::new(Box::new(transport));
         let conn_arc = StdArc::new(conn);
         let session = conn_arc.root_session(); // root session is fine for this test
-        let exec_ctx = StdArc::new(Mutex::new(None));
+        let exec_ctx = StdArc::new(ExecContextTracker::new());
         let main_frame = MainFrame::new(
             session,
             "target-test".to_owned(),
@@ -2441,7 +2531,7 @@ mod tests {
         let page_session = conn.create_session(session_key.to_owned());
         let conn_arc = StdArc::new(conn);
 
-        let exec_ctx = StdArc::new(Mutex::new(None::<String>));
+        let exec_ctx = StdArc::new(ExecContextTracker::new());
         let frame = MainFrame::new(
             page_session,
             "target-test".to_owned(),
@@ -4088,5 +4178,72 @@ mod tests {
 
         let outcome = result.expect("navigate must succeed");
         assert_eq!(outcome.status_code, Some(200));
+    }
+
+    #[test]
+    fn navigate_download_restores_previous_context() {
+        let h = build_mock_frame("page-r", "frame-r");
+        h.frame
+            .execution_context_handle()
+            .on_created("ctx-old".into());
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let id = sent["id"].as_i64().unwrap();
+            in_tx.send(navigate_success_response(id, "page-r")).unwrap();
+            in_tx
+                .send(download_created_msg("frame-r", "https://e.x/f.pdf", "u1"))
+                .unwrap();
+        });
+        let err = h
+            .frame
+            .navigate(
+                "https://e.x/f.pdf",
+                Default::default(),
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+        assert_eq!(err.kind, ProtocolErrorKind::NavigationBecameDownload);
+        assert_eq!(
+            h.frame.execution_context_handle().current().as_deref(),
+            Some("ctx-old")
+        );
+    }
+
+    #[test]
+    fn same_document_navigation_restores_previous_context() {
+        // Page.navigate ack WITHOUT navigationId (hash change): current must be restored.
+        let h = build_mock_frame("page-s", "frame-s");
+        h.frame
+            .execution_context_handle()
+            .on_created("ctx-old".into());
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let id = sent["id"].as_i64().unwrap();
+            in_tx
+                .send(RawMessage {
+                    id: Some(id),
+                    method: None,
+                    params: None,
+                    result: Some(serde_json::json!({})),
+                    error: None,
+                    session_id: Some("page-s".into()),
+                })
+                .unwrap();
+        });
+        h.frame
+            .navigate("https://e.x/#a", Default::default(), Duration::from_secs(5))
+            .unwrap();
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+        assert_eq!(
+            h.frame.execution_context_handle().current().as_deref(),
+            Some("ctx-old")
+        );
     }
 }

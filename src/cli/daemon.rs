@@ -312,11 +312,13 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
             headless,
             executable,
             downloads_dir,
+            bypass_csp,
         } => respond(
             mgr.launch_with(&LaunchOptions {
                 headless,
                 executable,
                 downloads_dir,
+                bypass_csp,
             })
             .map(|(instance_id, version, pid)| {
                 json!({"instance_id": instance_id, "version": version, "pid": pid})

@@ -21,10 +21,15 @@ fn main() {
             }
         }
 
-        Command::Launch { headed, executable } => {
+        Command::Launch {
+            headed,
+            executable,
+            downloads_dir,
+        } => {
             let request = DaemonRequest::Launch {
                 headless: Some(!headed),
                 executable,
+                downloads_dir,
             };
             run_client(&sock, &request, cli.json);
         }
@@ -522,6 +527,17 @@ fn main() {
                 &DaemonRequest::CloseTab {
                     instance_id,
                     page_id,
+                },
+                cli.json,
+            );
+        }
+
+        Command::Downloads { instance_id, wait } => {
+            run_client(
+                &sock,
+                &DaemonRequest::Downloads {
+                    instance_id,
+                    wait_secs: wait,
                 },
                 cli.json,
             );

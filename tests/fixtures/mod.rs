@@ -579,3 +579,82 @@ impl BrowseServer {
 impl Drop for BrowseServer {
     fn drop(&mut self) {}
 }
+
+/// A single-port HTTP server for download testing.
+///
+/// Serves:
+/// - `/download.html` (or any non-PDF route): `<a id="dl" href="/report.pdf">Download</a>`
+/// - `/report.pdf`: PDF bytes served with `Content-Disposition: attachment; filename="../evil.pdf"`
+#[cfg(feature = "cli")]
+pub struct DownloadServer {
+    pub base_url: String,
+    pub pdf_bytes: Vec<u8>,
+    _server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl DownloadServer {
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").expect("bind download server"));
+        let port = server.server_addr().to_ip().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        const PDF_BYTES: &[u8] = b"%PDF-1.4\n%report-content-12345\n%%EOF\n";
+        const HTML: &[u8] = br#"<!DOCTYPE html>
+<html>
+<head><title>Download Test</title></head>
+<body>
+  <a id="dl" href="/report.pdf">Download</a>
+</body>
+</html>"#;
+
+        let server_clone = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in server_clone.incoming_requests() {
+                let url = req.url().to_owned();
+                if url.starts_with("/report.pdf") {
+                    let resp = Response::new(
+                        200.into(),
+                        vec![
+                            Header::from_bytes(&b"Content-Type"[..], &b"application/pdf"[..])
+                                .unwrap(),
+                            Header::from_bytes(
+                                &b"Content-Disposition"[..],
+                                &b"attachment; filename=\"../evil.pdf\""[..],
+                            )
+                            .unwrap(),
+                        ],
+                        Cursor::new(PDF_BYTES.to_vec()),
+                        Some(PDF_BYTES.len()),
+                        None,
+                    );
+                    let _ = req.respond(resp);
+                } else {
+                    let resp = Response::new(
+                        200.into(),
+                        vec![Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"text/html; charset=utf-8"[..],
+                        )
+                        .unwrap()],
+                        Cursor::new(HTML.to_vec()),
+                        Some(HTML.len()),
+                        None,
+                    );
+                    let _ = req.respond(resp);
+                }
+            }
+        });
+
+        DownloadServer {
+            base_url,
+            pdf_bytes: PDF_BYTES.to_vec(),
+            _server: server,
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+impl Drop for DownloadServer {
+    fn drop(&mut self) {}
+}

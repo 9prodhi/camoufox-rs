@@ -9,9 +9,22 @@ This crate implements the full stack needed to automate a Camoufox browser proce
 - Library crate with a synchronous API for Juggler domains (`Browser`, `MainFrame`, `Network`, `Runtime`, `Heap`)
 - Optional CLI (`--features cli`) with a Unix socket daemon for multi-instance management
 - Unix implementation (process + fd pipe model): Linux and macOS. Windows is not supported.
-- Protocol reference docs in-repo:
-  - `docs/PROTOCOL.md`
-  - `docs/UNDERSTANDING.md`
+## Documentation
+
+The project's documentation follows the [Diataxis](https://diataxis.fr/) framework:
+
+| Category | Document | Description |
+|---|---|---|
+| **Tutorial** | [Getting Started](docs/tutorial-getting-started.md) | Hands-on step-by-step introduction from installation to scraping |
+| **How-To** | [CLI Daemon & Management](docs/howto-cli-daemon.md) | Managing the daemon, multiple browser instances, and scraping flows |
+| **How-To** | [Iframes and Shadow DOM](docs/howto-iframes-and-shadow-dom.md) | Navigating nested frames and piercing shadow DOM with `>>>` |
+| **How-To** | [Downloads and Dialogs](docs/howto-downloads-and-dialogs.md) | Safe file downloads, the click-then-poll download pattern, and handling JS dialogs |
+| **How-To** | [Library Usage Guide](docs/howto-library-usage.md) | Using `camoufox-rs` as a Rust library crate in your application |
+| **Reference** | [CLI Reference](docs/reference-cli.md) | Exhaustive command reference for all 33 CLI subcommands |
+| **Reference** | [Library API Reference](docs/reference-library-api.md) | Complete crate and module API reference |
+| **Reference** | [Juggler Protocol Reference](docs/PROTOCOL.md) | Wire-level Juggler protocol specification |
+| **Explanation** | [Architecture & Design](docs/explanation-architecture.md) | Pipe transport, security model, coordinate spaces, and process lifecycle |
+| **Explanation** | [Protocol & Transport Internals](docs/UNDERSTANDING.md) | Deep-dive on Juggler framing, pipe IPC, and session multiplexing |
 
 ## Requirements
 
@@ -107,7 +120,7 @@ cargo run --features cli --bin camoufox -- navigate <instance_id> <page_id> http
 Export the session cookie jar:
 
 ```bash
-# Export all cookies for all instances (includes HttpOnly cookies):
+# Export all cookies for the specified instance (includes HttpOnly cookies):
 cargo run --features cli --bin camoufox -- cookies <instance_id>
 
 # --json returns full cookie objects (name, value, domain, path, httpOnly, secure, ...):
@@ -157,7 +170,7 @@ cargo run --features cli --bin camoufox -- wait <instance_id> <page_id> \
     --selector '#results' --timeout 15
 ```
 
-Interact with the page (all input is trusted browser-level input):
+Interact with the page (`click`, `hover`, `press`, `type`, and the typing phase of `fill` dispatch trusted browser-level input events; `select`, `scroll`, and `fill`'s clear step use JavaScript):
 
 ```bash
 # Click by CSS selector — resolves the element, scrolls it into view, clicks its centre:
@@ -254,9 +267,11 @@ Manage downloads:
 # Launch with an absolute download directory (defaults to cancel if omitted):
 cargo run --features cli --bin camoufox -- launch --downloads-dir /path/to/downloads
 
-# Two-step agent pattern: click a download link, then wait for the download to finish:
+# Click a download link, then wait/poll for download lifecycle events:
 cargo run --features cli --bin camoufox -- click <instance_id> <page_id> '#download-link'
 cargo run --features cli --bin camoufox -- downloads <instance_id> --wait 10
+# Note: --wait wakes on the next event advance; poll until state is completed, failed, or canceled.
+# Click responses also automatically carry a "downloads" list if triggered during the click.
 
 # Inspect the download log for an instance:
 cargo run --features cli --bin camoufox -- downloads <instance_id>
@@ -315,12 +330,12 @@ The low-level lifecycle is:
 
 1. Build `LaunchConfig`
 2. Spawn process (`process::unix::spawn`)
-3. Wait readiness sentinel on stderr
+3. Wait readiness sentinel on stdout or stderr
 4. Build `PipeTransport`
 5. Build `Connection` + root session
 6. `Browser::connect(...)`
 
-```rust
+```rust,no_run
 use std::path::PathBuf;
 
 use camoufox::api::{Browser, BrowserOptions, ContextOptions};
@@ -373,7 +388,9 @@ top frame:
 - **Layer 2** — accept only the top frame's `Page.frameAttached` (empty `parentFrameId`)
 - **Layer 3** — accept only the main-world `Runtime.executionContextCreated` whose `auxData.frameId` matches the top frame
 
-```rust
+```rust,no_run
+# fn doc_test(browser: &camoufox::api::Browser) -> Result<(), Box<dyn std::error::Error>> {
+use camoufox::api::ContextOptions;
 use std::time::Duration;
 
 // ...continuing from the bootstrap example, after `Browser::connect`:
@@ -382,21 +399,22 @@ let context = browser.new_context(ContextOptions::default())?;
 // One call — no manual attachedToTarget / frameAttached / executionContext wiring:
 let main_frame = context.new_main_frame()?;
 
-// navigate(url, NavigateOptions, timeout) -> NavigateOutcome { nav_id, status_code }.
-// status_code is the final main-document HTTP status after following redirects.
-let outcome = main_frame.navigate("https://example.com", Default::default(), Duration::from_secs(30))?;
+// navigate(url, NavigateOptions, timeout) -> NavigateOutcome (nav_id and status_code)
+let outcome: camoufox::api::main_frame::NavigateOutcome = main_frame.navigate("https://example.com", Default::default(), Duration::from_secs(30))?;
 println!("status: {:?}", outcome.status_code);
 
-// evaluate(expr, timeout) — the cached execution context is maintained internally,
-// so no execution-context id is threaded through. It runs in an isolated world:
-// DOM access works, page-defined JS globals are not visible.
-let title = main_frame.evaluate("document.title", Duration::from_secs(15))?;
+// evaluate(expr, timeout) runs in the isolated world and returns the raw
+// Runtime.evaluate envelope: read result.value and check exceptionDetails.
+let raw: serde_json::Value = main_frame.evaluate("document.title", Duration::from_secs(15))?;
+let title = raw["result"]["value"].as_str().unwrap_or_default();
 println!("title: {title}");
 
-// evaluate_main_world runs a synchronous expression in the page's own world via an
-// injected <script> (observable by the page; blocked by strict CSP) and returns the
-// plain JSON value.
-let app_state = main_frame.evaluate_main_world("window.__NEXT_DATA__.page", Duration::from_secs(15))?;
+// evaluate_main_world runs a synchronous expression in the page's own world
+// and returns the plain JSON value (no envelope)
+let app_state: serde_json::Value = main_frame.evaluate_main_world("window.location.href", Duration::from_secs(15))?;
+println!("state: {app_state}");
+# Ok(())
+# }
 ```
 
 A complete, runnable version is in [`examples/web_browse.rs`](examples/web_browse.rs):
@@ -409,8 +427,8 @@ End-to-end wiring is also exercised in `tests/integration.rs` and `src/cli/insta
 
 ### Reliability
 
-- Every protocol request is bounded — `Client::send` enforces a default 60s
-  deadline, and `navigate` / `evaluate` / `screenshot` accept an explicit
+- Every protocol request is bounded — `Session::send` enforces a default deadline
+  (60s), and commands like `navigate` / `evaluate` / `wait` accept an explicit
   `timeout` (CLI: `--timeout <seconds>`), so a stuck call can no longer hang the
   daemon.
 - Navigations that the browser diverts into a download (e.g. a
@@ -461,7 +479,7 @@ Integration tests resolve the binary the same way as the daemon: `CAMOUFOX_BIN`,
 else `$HOME/.cache/camoufox/camoufox`. Override per run with:
 
 ```bash
-CAMOUFOX_BIN=/path/to/camoufox cargo test --all-features --test integration -- --ignored --test-threads=1
+CAMOUFOX_BIN="/path/to/camoufox" cargo test --all-features --test integration -- --ignored --test-threads=1
 ```
 
 ## Observability
@@ -478,7 +496,7 @@ Protocol traffic is traced at `camoufox::protocol=trace` with bounded payload pr
 
 - Windows pipe transport is not implemented (`src/transport/pipe/windows.rs` hard errors at compile time)
 - API is synchronous/blocking today (no async runtime integration)
-- Sub-frames are reached through `MainFrame` (`frames()`, `frame_ctx()`, `evaluate_in_frame()`)
+- Sub-frames are reached through `MainFrame` (`frames()`, `has_frame()`, `resolve_child_frame()`, `evaluate_in_frame()`)
   and the CLI's `--frame`; there is no separate frame object type
 - Closed shadow roots cannot be pierced (` >>> ` reports them); rotated or skewed iframes are
   not supported for pointer coordinates (translation and scale are)

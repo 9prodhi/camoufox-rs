@@ -27,6 +27,8 @@ use crate::protocol::errors::ProtocolError;
 /// configuration commands for a context are sent in parallel.
 #[derive(Debug, Clone, Default)]
 pub struct ContextOptions {
+    /// Policy for JavaScript dialogs on newly created pages.
+    pub dialog_policy: crate::api::DialogPolicy,
     /// Override the user-agent string for this context.
     pub user_agent: Option<String>,
 
@@ -251,6 +253,7 @@ pub struct BrowserContext {
     session: Session,
     /// Shared connection reference.
     connection: Arc<Connection>,
+    dialog_policy: Mutex<crate::api::DialogPolicy>,
 }
 
 /// A `Runtime.executionContextCreated` event captured by the Layer-3
@@ -280,7 +283,16 @@ impl BrowserContext {
             context_id,
             session: session.clone(),
             connection,
+            dialog_policy: Mutex::new(crate::api::DialogPolicy::Manual),
         }
+    }
+
+    /// Set the policy used for newly created pages.
+    pub fn set_dialog_policy(&self, policy: crate::api::DialogPolicy) {
+        *self
+            .dialog_policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
     }
 
     /// Returns the context ID assigned by the browser.
@@ -317,6 +329,7 @@ impl BrowserContext {
     /// Returns the first [`ProtocolError`] encountered. Subsequent commands
     /// are not sent after a failure.
     pub fn configure(&self, options: &ContextOptions) -> Result<(), ProtocolError> {
+        self.set_dialog_policy(options.dialog_policy);
         let s = self.session();
 
         // Viewport
@@ -930,6 +943,10 @@ impl BrowserContext {
             exec_ctx,
             Arc::clone(&self.connection),
             vec![destroyed_guard, created_guard],
+            *self
+                .dialog_policy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         ))
     }
 
@@ -1326,8 +1343,8 @@ mod tests {
             .expect("new_main_frame should succeed");
         assert_eq!(
             conn.handler_count(),
-            2,
-            "MainFrame should retain exactly 2 execution context handlers"
+            4,
+            "MainFrame should retain execution context and dialog handlers"
         );
 
         drop(main_frame);

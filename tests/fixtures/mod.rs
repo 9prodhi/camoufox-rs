@@ -579,3 +579,34 @@ impl BrowseServer {
 impl Drop for BrowseServer {
     fn drop(&mut self) {}
 }
+
+#[cfg(feature = "cli")]
+pub struct DialogServer {
+    pub url: String,
+    _server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl DialogServer {
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let url = format!(
+            "http://127.0.0.1:{}/",
+            server.server_addr().to_ip().unwrap().port()
+        );
+        let worker = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in worker.incoming_requests() {
+                let response = Response::from_string(include_str!("dialogs.html")).with_header(
+                    Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(response);
+            }
+        });
+        Self {
+            url,
+            _server: server,
+        }
+    }
+}

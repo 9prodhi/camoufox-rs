@@ -168,6 +168,16 @@ impl Connection {
         }
     }
 
+    /// Obtain a handle without creating or reviving a session.
+    pub(crate) fn session_handle(&self, session_id: String) -> Session {
+        Session {
+            session_key: session_id.clone(),
+            session_id: Some(session_id),
+            inner: Arc::clone(&self.inner),
+            writer: Arc::clone(&self.writer),
+        }
+    }
+
     /// Create a page session.
     ///
     /// Call when `Browser.attachedToTarget` event arrives with the
@@ -189,6 +199,21 @@ impl Connection {
             session_key,
             inner: Arc::clone(&self.inner),
             writer: Arc::clone(&self.writer),
+        }
+    }
+
+    /// Reject in-flight requests belonging to a single session.
+    pub(crate) fn reject_session_pending(
+        &self,
+        session_key: &str,
+        make: impl Fn(&str) -> ProtocolError,
+    ) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(session) = guard.sessions.get_mut(session_key) {
+            session.pending.reject_all_with(make);
         }
     }
 
@@ -1162,6 +1187,37 @@ mod tests {
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn reject_session_pending_only_hits_that_session() {
+        let h = setup();
+        let a = h.conn.create_session("A".into());
+        let b = h.conn.create_session("B".into());
+        let ha = thread::spawn(move || {
+            a.send_with_timeout("Runtime.evaluate", json!({}), Duration::from_secs(5))
+        });
+        let hb = thread::spawn(move || {
+            b.send_with_timeout("Runtime.evaluate", json!({}), Duration::from_millis(300))
+        });
+        recv_out(&h.out_rx);
+        recv_out(&h.out_rx);
+        h.conn.reject_session_pending("A", |m| {
+            ProtocolError::new(
+                ProtocolErrorKind::DialogOpened,
+                Some(m.to_owned()),
+                "dialog",
+            )
+        });
+        assert_eq!(
+            ha.join().unwrap().unwrap_err().kind,
+            ProtocolErrorKind::DialogOpened
+        );
+        assert_eq!(
+            hb.join().unwrap().unwrap_err().kind,
+            ProtocolErrorKind::Timeout
+        );
+        teardown(h);
+    }
 
     #[test]
     fn root_session_send_and_receive() {

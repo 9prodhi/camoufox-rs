@@ -21,12 +21,39 @@ fn main() {
             }
         }
 
-        Command::Launch { headed, executable } => {
+        Command::Launch {
+            headed,
+            executable,
+            dialogs,
+        } => {
             let request = DaemonRequest::Launch {
                 headless: Some(!headed),
                 executable,
+                dialogs: dialogs.into(),
             };
             run_client(&sock, &request, cli.json);
+        }
+
+        Command::Dialog {
+            instance_id,
+            page_id,
+            action,
+            text,
+        } => {
+            let action = match action {
+                camoufox::cli::commands::DialogAction::Accept => "accept",
+                camoufox::cli::commands::DialogAction::Dismiss => "dismiss",
+            };
+            run_client(
+                &sock,
+                &DaemonRequest::Dialog {
+                    instance_id,
+                    page_id,
+                    action: action.into(),
+                    text,
+                },
+                cli.json,
+            );
         }
 
         Command::List => {

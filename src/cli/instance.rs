@@ -20,9 +20,12 @@ use serde_json::json;
 use crate::api::main_frame::{
     KeyEventParams, MouseEventParams, NavigateOptions, NavigateOutcome, Rect, ScreenshotOptions,
 };
-use crate::api::{Browser, BrowserOptions, ContextOptions, CookieOptions, MainFrame};
+use crate::api::{
+    Browser, BrowserOptions, ContextOptions, CookieOptions, DialogInfo, DialogPolicy, MainFrame,
+};
 use crate::config::LaunchConfig;
 use crate::protocol::client::Connection;
+use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 use crate::transport::pipe::PipeTransport;
 
 fn screenshot_path(
@@ -253,12 +256,37 @@ pub struct LaunchOptions {
     pub headless: Option<bool>,
     /// Camoufox executable; `None` uses the default install location.
     pub executable: Option<String>,
+    /// Policy for JavaScript dialogs.
+    pub dialogs: DialogPolicy,
 }
 
 impl LaunchOptions {
     /// Browser-context options derived from the launch flags.
     pub(crate) fn context_options(&self) -> ContextOptions {
-        ContextOptions::default()
+        ContextOptions {
+            dialog_policy: self.dialogs,
+            ..Default::default()
+        }
+    }
+}
+
+/// Result of a trusted user interaction.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct InteractionOutcome {
+    /// Dialog opened by the interaction, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialog: Option<DialogInfo>,
+}
+
+fn interaction_error(error: ProtocolError, operation: &str) -> Result<InteractionOutcome, String> {
+    if error.kind == ProtocolErrorKind::DialogOpened {
+        let dialog = error
+            .data
+            .as_deref()
+            .and_then(|data| serde_json::from_str(data).ok());
+        Ok(InteractionOutcome { dialog })
+    } else {
+        Err(format!("{operation} failed: {error}"))
     }
 }
 
@@ -276,13 +304,22 @@ pub struct Instance {
 }
 
 impl Instance {
-    fn page(&self, id: &str) -> Result<&ManagedMainFrame, String> {
+    fn page_any(&self, id: &str) -> Result<&ManagedMainFrame, String> {
         self.pages
             .get(id)
             .ok_or_else(|| format!("page {id} not found"))
     }
 
+    fn page(&self, id: &str) -> Result<&ManagedMainFrame, String> {
+        let page = self.page_any(id)?;
+        if let Some(info) = page.main_frame.pending_dialog() {
+            return Err(format!("page {id} has an open {} dialog: {:?} — run `camoufox dialog {} {id} accept|dismiss [--text T]`", info.kind, info.message, self.instance_id));
+        }
+        Ok(page)
+    }
+
     fn page_mut(&mut self, id: &str) -> Result<&mut ManagedMainFrame, String> {
+        self.page(id)?;
         self.pages
             .get_mut(id)
             .ok_or_else(|| format!("page {id} not found"))
@@ -640,6 +677,8 @@ impl Instance {
         // Each poll gets the remaining budget so an unresponsive page can't
         // stretch the overall wait past `timeout` by more than one poll.
         loop {
+            // A dialog interrupts this wait rather than being treated as a transient navigation.
+            self.page(page_id)?;
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let poll_budget = remaining.max(Duration::from_secs(1));
             match self.eval_checked(page_id, &expr, poll_budget) {
@@ -712,11 +751,11 @@ impl Instance {
         page_id: &str,
         selector: &str,
         timeout: Duration,
-    ) -> Result<(i32, i32), String> {
+    ) -> Result<(i32, i32, InteractionOutcome), String> {
         let (rect, _, _) = self.element_rect(page_id, selector, timeout)?;
         let (x, y) = element_center(&rect);
-        self.click(page_id, x, y)?;
-        Ok((x, y))
+        let outcome = self.click(page_id, x, y)?;
+        Ok((x, y, outcome))
     }
 
     /// Move the mouse over the element matching `selector` without clicking.
@@ -782,7 +821,7 @@ impl Instance {
     }
 
     /// Press a named key (keydown followed by keyup).
-    pub fn press(&self, page_id: &str, key: &str) -> Result<(), String> {
+    pub fn press(&self, page_id: &str, key: &str) -> Result<InteractionOutcome, String> {
         let (code, key_name, key_code) = key_descriptor(key)?;
         let mp = self.page(page_id)?;
 
@@ -797,13 +836,15 @@ impl Instance {
             text: None,
         };
 
-        mp.main_frame
-            .dispatch_key_event(make("keydown"))
-            .map_err(|e| format!("press (keydown) failed: {e}"))?;
-        mp.main_frame
-            .dispatch_key_event(make("keyup"))
-            .map_err(|e| format!("press (keyup) failed: {e}"))?;
-        Ok(())
+        if let Err(e) = mp.main_frame.dispatch_key_event(make("keydown")) {
+            return interaction_error(e, "press (keydown)");
+        }
+        if let Err(e) = mp.main_frame.dispatch_key_event(make("keyup")) {
+            return interaction_error(e, "press (keyup)");
+        }
+        Ok(InteractionOutcome {
+            dialog: mp.main_frame.pending_dialog(),
+        })
     }
 
     /// Choose an option in a `<select>` by value, label, or visible text.
@@ -882,9 +923,19 @@ impl Instance {
     pub fn tabs(&self, timeout: Duration) -> Vec<serde_json::Value> {
         self.page_ids()
             .into_iter()
-            .map(|page_id| match self.url(&page_id, timeout) {
-                Ok((url, title)) => json!({"page_id": page_id, "url": url, "title": title}),
-                Err(_) => json!({"page_id": page_id, "url": null, "title": null}),
+            .map(|page_id| {
+                let dialog = self
+                    .page_any(&page_id)
+                    .ok()
+                    .and_then(|p| p.main_frame.pending_dialog());
+                let mut tab = match self.url(&page_id, timeout) {
+                    Ok((url, title)) => json!({"page_id": page_id, "url": url, "title": title}),
+                    Err(_) => json!({"page_id": page_id, "url": null, "title": null}),
+                };
+                if let Some(dialog) = dialog {
+                    tab["dialog"] = json!(dialog);
+                }
+                tab
             })
             .collect()
     }
@@ -904,7 +955,7 @@ impl Instance {
     /// viewport coordinates (x, y). Trusted browser-level input, so it drives
     /// cross-origin / closed-shadow widgets (e.g. Cloudflare Turnstile) that
     /// synthetic JS events cannot reach.
-    pub fn click(&self, page_id: &str, x: i32, y: i32) -> Result<(), String> {
+    pub fn click(&self, page_id: &str, x: i32, y: i32) -> Result<InteractionOutcome, String> {
         let mp = self.page(page_id)?;
 
         let mv = MouseEventParams {
@@ -916,9 +967,9 @@ impl Instance {
             modifiers: 0,
             click_count: None,
         };
-        mp.main_frame
-            .dispatch_mouse_event(mv)
-            .map_err(|e| format!("click (move) failed: {e}"))?;
+        if let Err(e) = mp.main_frame.dispatch_mouse_event(mv) {
+            return interaction_error(e, "click (move)");
+        }
 
         let down = MouseEventParams {
             r#type: "mousedown".to_string(),
@@ -929,9 +980,9 @@ impl Instance {
             modifiers: 0,
             click_count: Some(1),
         };
-        mp.main_frame
-            .dispatch_mouse_event(down)
-            .map_err(|e| format!("click (down) failed: {e}"))?;
+        if let Err(e) = mp.main_frame.dispatch_mouse_event(down) {
+            return interaction_error(e, "click (down)");
+        }
 
         let up = MouseEventParams {
             r#type: "mouseup".to_string(),
@@ -942,11 +993,13 @@ impl Instance {
             modifiers: 0,
             click_count: Some(1),
         };
-        mp.main_frame
-            .dispatch_mouse_event(up)
-            .map_err(|e| format!("click (up) failed: {e}"))?;
+        if let Err(e) = mp.main_frame.dispatch_mouse_event(up) {
+            return interaction_error(e, "click (up)");
+        }
 
-        Ok(())
+        Ok(InteractionOutcome {
+            dialog: mp.main_frame.pending_dialog(),
+        })
     }
 
     /// Take a screenshot of a page.
@@ -971,7 +1024,7 @@ impl Instance {
         clip: Option<[f64; 4]>,
         timeout: Duration,
     ) -> Result<(Vec<u8>, String, Rect), String> {
-        let mp = self.page(page_id)?;
+        let mp = self.page_any(page_id)?;
 
         let rect = match (clip, selector) {
             (Some([x, y, width, height]), _) => Rect {
@@ -1095,11 +1148,12 @@ impl InstanceManager {
         self.launch_with(&LaunchOptions {
             headless,
             executable: executable.map(str::to_owned),
+            ..Default::default()
         })
     }
 
     /// Launch a new browser instance from the full set of `launch` flags.
-    pub(crate) fn launch_with(
+    pub fn launch_with(
         &self,
         options: &LaunchOptions,
     ) -> Result<(String, Option<String>, u32), String> {
@@ -1270,7 +1324,13 @@ impl InstanceManager {
     }
 
     /// Dispatch a trusted left-click at viewport coordinates (x, y).
-    pub fn click(&self, instance_id: &str, page_id: &str, x: i32, y: i32) -> Result<(), String> {
+    pub fn click(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        x: i32,
+        y: i32,
+    ) -> Result<InteractionOutcome, String> {
         self.with_instance(instance_id, |inst, _| inst.click(page_id, x, y))
     }
 
@@ -1496,7 +1556,7 @@ impl InstanceManager {
         page_id: &str,
         selector: &str,
         timeout: Duration,
-    ) -> Result<(i32, i32), String> {
+    ) -> Result<(i32, i32, InteractionOutcome), String> {
         self.with_instance(instance_id, |inst, _| {
             inst.click_selector(page_id, selector, timeout)
         })
@@ -1535,7 +1595,12 @@ impl InstanceManager {
     }
 
     /// Press a named key.
-    pub fn press(&self, instance_id: &str, page_id: &str, key: &str) -> Result<(), String> {
+    pub fn press(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        key: &str,
+    ) -> Result<InteractionOutcome, String> {
         self.with_instance(instance_id, |inst, _| inst.press(page_id, key))
     }
 
@@ -1577,6 +1642,25 @@ impl InstanceManager {
         timeout: Duration,
     ) -> Result<Vec<serde_json::Value>, String> {
         self.with_instance(instance_id, |inst, _| Ok(inst.tabs(timeout)))
+    }
+
+    /// Accept or dismiss the pending dialog on a page.
+    pub fn dialog(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        accept: bool,
+        text: Option<&str>,
+    ) -> Result<DialogInfo, String> {
+        self.with_instance(instance_id, |inst, _| {
+            let page = inst.page_any(page_id)?;
+            let info = page
+                .main_frame
+                .pending_dialog()
+                .ok_or_else(|| format!("no dialog is open on page {page_id}"))?;
+            page.main_frame.handle_dialog(&info.id, accept, text);
+            Ok(info)
+        })
     }
 
     /// Close a page.

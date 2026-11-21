@@ -4,10 +4,34 @@ use std::fmt;
 use std::time::Duration;
 
 /// The type of protocol error, matching Playwright's ProtocolError.type values.
+///
+/// Downstream callers must leave room for future error kinds:
+/// ```compile_fail,E0004
+/// use camoufox::protocol::errors::ProtocolErrorKind;
+/// use ProtocolErrorKind::*;
+/// fn exhaustive(kind: ProtocolErrorKind) {
+///     match kind {
+///         Response | FrameDetached | ScriptException | NotIframe | FrameNotFound
+///         | ShadowRoot | Closed | Crashed | DialogOpened | Transport | Timeout
+///         | NavigationBecameDownload => (),
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProtocolErrorKind {
     /// Protocol error from the server (response had `error` field).
     Response,
+    /// An explicitly scoped frame is no longer tracked.
+    FrameDetached,
+    /// JavaScript threw while evaluating an expression.
+    ScriptException,
+    /// A selector matched an element that is not an iframe.
+    NotIframe,
+    /// No element currently matches a frame selector.
+    FrameNotFound,
+    /// A shadow host has no accessible open root yet.
+    ShadowRoot,
     /// Session or connection was closed.
     Closed,
     /// Page crashed.
@@ -162,6 +186,12 @@ impl ProtocolError {
     /// Build a `Timeout` error with a specific method and plain message string.
     pub fn timeout_msg(method: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(ProtocolErrorKind::Timeout, Some(method.into()), message)
+    }
+}
+
+impl From<ProtocolError> for String {
+    fn from(error: ProtocolError) -> Self {
+        error.message
     }
 }
 

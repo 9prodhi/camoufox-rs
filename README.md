@@ -175,6 +175,59 @@ cargo run --features cli --bin camoufox -- press <instance_id> <page_id> Enter
 # Also available: type <text>, hover <selector>, select <selector> <value>, scroll [selector]
 ```
 
+### Iframe and Shadow-DOM Scoping
+
+After upgrading, restart any running daemon: `camoufox shutdown`, then
+`camoufox serve`. An older daemon ignores `--frame`, even when the client is new.
+
+Scope commands to iframes with `--frame <selector>` (repeatable for nested iframes):
+
+```bash
+# Scope text extraction to an iframe:
+cargo run --features cli --bin camoufox -- text <instance_id> <page_id> --frame '#ad-frame'
+
+# Scope click to a nested iframe (accumulating frame coordinate offsets):
+cargo run --features cli --bin camoufox -- click <instance_id> <page_id> '#btn' \
+    --frame '#outer-frame' --frame '#inner-frame'
+
+# Supported across 11 commands: text, html, links, click, fill, type, press, hover, select, wait, evaluate.
+```
+
+Clicks and hovers scroll ancestor frames and the target into view before measuring
+coordinates. Axis-aligned positive CSS scaling, borders, and padding are supported,
+including nested frames; rotated or skewed iframes are unsupported.
+
+`wait` follows late-created/replaced iframes and late-attached open shadow roots.
+Closed roots cannot be pierced in Camoufox's isolated world; an absent root cannot
+reliably be distinguished from a closed one. Other commands report that the host
+has no open shadow root. `type` and `press` also accept `--timeout` (seconds),
+including the client socket budget. With `--frame`, they focus each ancestor
+iframe, then the target window, and dispatch input only if a field is **currently
+focused** there. If the active element is absent, `body`, or `documentElement`,
+they fail with `--frame <sel>: nothing is focused inside the frame; click or fill
+an element inside it first`.
+
+There is no remembered focus target and no focus-listener or blur-hook
+instrumentation. After interacting with the top-level page, an agent must
+**click or fill inside the iframe again** before using `type --frame` or
+`press --frame`. Give the **full** `--frame` chain down to the frame that holds
+the field (for a field in a nested iframe, pass both the outer and the inner
+`--frame`): the chain is focused before the check, so a partial chain fails and
+moves focus out of the inner frame. Plain `type` and `press` still type into
+whatever is focused.
+
+Pierce open shadow-DOM boundaries using the ` >>> ` combinator in any selector.
+Operators inside CSS quotes, brackets, parentheses, or escapes remain ordinary CSS.
+All matching hosts are searched depth-first in document order:
+
+```bash
+# Click a button inside an open shadow root:
+cargo run --features cli --bin camoufox -- click <instance_id> <page_id> 'custom-element >>> button.action'
+
+# Deeply nested shadow roots:
+cargo run --features cli --bin camoufox -- text <instance_id> <page_id> --selector 'host-a >>> host-b >>> span.label'
+```
+
 Take a screenshot:
 
 ```bash

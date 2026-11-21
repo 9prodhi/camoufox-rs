@@ -33,3 +33,4 @@ pub use main_frame::{
     KeyEventParams, MainFrame, MouseEventParams, NavigateOptions, Rect, ScreenshotOptions,
     WheelEventParams,
 };
+pub mod selectors;

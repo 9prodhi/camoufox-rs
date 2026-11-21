@@ -127,6 +127,9 @@ pub enum Command {
         /// Timeout in seconds for waiting for execution context.
         #[arg(long, default_value = "30")]
         timeout: u64,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
     },
 
     /// Click an element by CSS selector, or at viewport coordinates (x, y).
@@ -146,6 +149,9 @@ pub enum Command {
         /// Timeout in seconds for waiting for execution context.
         #[arg(long, default_value = "30")]
         timeout: u64,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
     },
 
     /// Take a screenshot of a page.
@@ -201,6 +207,9 @@ pub enum Command {
         /// Timeout in seconds for waiting for execution context.
         #[arg(long, default_value = "30")]
         timeout: u64,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
     },
 
     /// Print page HTML: `outerHTML` of a selector, or the whole document.
@@ -215,6 +224,9 @@ pub enum Command {
         /// Timeout in seconds for waiting for execution context.
         #[arg(long, default_value = "30")]
         timeout: u64,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
     },
 
     /// List every `<a href>` on the page as `text → href`.
@@ -229,6 +241,9 @@ pub enum Command {
         /// Timeout in seconds for waiting for execution context.
         #[arg(long, default_value = "30")]
         timeout: u64,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
     },
 
     /// Extract structured page metadata (Open Graph / JSON-LD / meta tags).
@@ -303,6 +318,9 @@ pub enum Command {
         /// Give up after this many seconds.
         #[arg(long, default_value = "10")]
         timeout: u64,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
     },
 
     // -----------------------------------------------------------------------
@@ -364,6 +382,9 @@ pub enum Command {
         /// Timeout in seconds for waiting for execution context.
         #[arg(long, default_value = "30")]
         timeout: u64,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
     },
 
     /// Type text into whatever element currently has focus.
@@ -374,6 +395,12 @@ pub enum Command {
         page_id: String,
         /// Text to insert.
         text: String,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
+        /// Overall command timeout in seconds.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
     },
 
     /// Press a named key (Enter, Tab, Escape, ArrowDown, a, 1, …).
@@ -384,6 +411,12 @@ pub enum Command {
         page_id: String,
         /// Key name.
         key: String,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
+        /// Overall command timeout in seconds.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
     },
 
     /// Move the mouse over the element matching a selector (no click).
@@ -397,6 +430,9 @@ pub enum Command {
         /// Timeout in seconds for waiting for execution context.
         #[arg(long, default_value = "30")]
         timeout: u64,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
     },
 
     /// Choose an option in a `<select>` by value, label, or visible text.
@@ -412,6 +448,9 @@ pub enum Command {
         /// Timeout in seconds for waiting for execution context.
         #[arg(long, default_value = "30")]
         timeout: u64,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
     },
 
     /// Scroll an element into view, or scroll to the bottom of the page.

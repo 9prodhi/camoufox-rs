@@ -98,6 +98,7 @@ fn main() {
             expression,
             main_world,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -107,6 +108,7 @@ fn main() {
                     expression,
                     main_world,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -121,6 +123,7 @@ fn main() {
             target,
             y,
             timeout,
+            frames,
         } => {
             let request = match y {
                 Some(y) => match target.parse::<i32>() {
@@ -143,6 +146,7 @@ fn main() {
                     page_id,
                     selector: target,
                     timeout_secs: timeout,
+                    frames,
                 },
             };
             run_client(&sock, &request, cli.json);
@@ -203,6 +207,7 @@ fn main() {
             page_id,
             selector,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -211,6 +216,7 @@ fn main() {
                     page_id,
                     selector,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -221,6 +227,7 @@ fn main() {
             page_id,
             selector,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -229,6 +236,7 @@ fn main() {
                     page_id,
                     selector,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -239,6 +247,7 @@ fn main() {
             page_id,
             selector,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -247,6 +256,7 @@ fn main() {
                     page_id,
                     selector,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -340,6 +350,7 @@ fn main() {
             page_id,
             selector,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -348,6 +359,7 @@ fn main() {
                     page_id,
                     selector,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -425,6 +437,7 @@ fn main() {
             selector,
             value,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -434,6 +447,7 @@ fn main() {
                     selector,
                     value,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -443,6 +457,8 @@ fn main() {
             instance_id,
             page_id,
             text,
+            frames,
+            timeout,
         } => {
             run_client(
                 &sock,
@@ -450,6 +466,8 @@ fn main() {
                     instance_id,
                     page_id,
                     text,
+                    frames,
+                    timeout_secs: timeout,
                 },
                 cli.json,
             );
@@ -459,6 +477,8 @@ fn main() {
             instance_id,
             page_id,
             key,
+            frames,
+            timeout,
         } => {
             run_client(
                 &sock,
@@ -466,6 +486,8 @@ fn main() {
                     instance_id,
                     page_id,
                     key,
+                    frames,
+                    timeout_secs: timeout,
                 },
                 cli.json,
             );
@@ -476,6 +498,7 @@ fn main() {
             page_id,
             selector,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -484,6 +507,7 @@ fn main() {
                     page_id,
                     selector,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -495,6 +519,7 @@ fn main() {
             selector,
             value,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -504,6 +529,7 @@ fn main() {
                     selector,
                     value,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -731,5 +757,110 @@ mod tests {
         assert!(parse_clip("1,2,x,4").unwrap_err().contains("not a number"));
         assert!(parse_clip("0,0,0,100").unwrap_err().contains("positive"));
         assert!(parse_clip("0,0,100,-1").unwrap_err().contains("positive"));
+    }
+
+    #[test]
+    fn cli_parses_repeatable_frame_flag_for_all_commands() {
+        let test_cases = [
+            (
+                vec![
+                    "camoufox", "text", "inst1", "p1", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "text",
+            ),
+            (
+                vec![
+                    "camoufox", "html", "inst1", "p1", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "html",
+            ),
+            (
+                vec![
+                    "camoufox", "links", "inst1", "p1", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "links",
+            ),
+            (
+                vec![
+                    "camoufox", "click", "inst1", "p1", "button", "--frame", "#f1", "--frame",
+                    "#f2",
+                ],
+                "click",
+            ),
+            (
+                vec![
+                    "camoufox", "fill", "inst1", "p1", "input", "val", "--frame", "#f1", "--frame",
+                    "#f2",
+                ],
+                "fill",
+            ),
+            (
+                vec![
+                    "camoufox", "type", "inst1", "p1", "hello", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "type",
+            ),
+            (
+                vec![
+                    "camoufox", "press", "inst1", "p1", "Enter", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "press",
+            ),
+            (
+                vec![
+                    "camoufox", "hover", "inst1", "p1", "a", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "hover",
+            ),
+            (
+                vec![
+                    "camoufox", "select", "inst1", "p1", "select", "opt", "--frame", "#f1",
+                    "--frame", "#f2",
+                ],
+                "select",
+            ),
+            (
+                vec![
+                    "camoufox",
+                    "wait",
+                    "inst1",
+                    "p1",
+                    "--selector",
+                    "div",
+                    "--frame",
+                    "#f1",
+                    "--frame",
+                    "#f2",
+                ],
+                "wait",
+            ),
+            (
+                vec![
+                    "camoufox", "evaluate", "inst1", "p1", "1+1", "--frame", "#f1", "--frame",
+                    "#f2",
+                ],
+                "evaluate",
+            ),
+        ];
+
+        for (args, name) in test_cases {
+            let cli =
+                Cli::try_parse_from(args).unwrap_or_else(|e| panic!("failed to parse {name}: {e}"));
+            let frames = match cli.command {
+                Command::Text { frames, .. }
+                | Command::Html { frames, .. }
+                | Command::Links { frames, .. }
+                | Command::Click { frames, .. }
+                | Command::Fill { frames, .. }
+                | Command::Type { frames, .. }
+                | Command::Press { frames, .. }
+                | Command::Hover { frames, .. }
+                | Command::Select { frames, .. }
+                | Command::Wait { frames, .. }
+                | Command::Evaluate { frames, .. } => frames,
+                _ => panic!("unexpected command variant for {name}"),
+            };
+            assert_eq!(frames, vec!["#f1", "#f2"], "frames for {name}");
+        }
     }
 }

@@ -4,6 +4,16 @@ All notable changes to camoufox-rs are documented here.
 
 ## [Unreleased]
 
+### Breaking changes
+
+This crate is pre-1.0 (currently 0.1.0).
+
+- `ProtocolErrorKind` is now `#[non_exhaustive]`; downstream matches must include a wildcard arm.
+- This branch adds `DialogOpened`, `FrameDetached`, `ScriptException`, `NotIframe`, `FrameNotFound`, and `ShadowRoot` error kinds.
+- Selector-capable `InstanceManager` methods now take a `frames: &[String]` parameter (use `&[]` for the main frame).
+- Public `Instance::insert_text` and `Instance::press` now take both `frames: &[String]` and `timeout: Duration` parameters.
+- `From<ProtocolError> for String` is now implemented; it returns the plain error message, without the diagnostic `Kind (Method)` display prefix.
+
 ### Behaviour changes
 
 - Every `BrowserContext` installs persistent root handlers; each page installs six session handlers until detach. Root handlers live as long as the context or any of its `MainFrame`s.
@@ -12,8 +22,27 @@ All notable changes to camoufox-rs are documented here.
 - A no-opener page attaching after a failed `Browser.newPage` window has fully closed is still adopted as a popup; this is the residual limit of window-based tracking.
 - `MainFrame::frame_id()` now returns a live `String`, following main-frame replacement.
 - Crashed pages remain listed and commands report "crashed", rather than "was closed".
+- Plain evaluate transport errors are now `evaluate failed: <message>`, without the diagnostic `Timeout (Runtime.evaluate):` kind/method prefix.
+- Frame focus memory has been removed entirely: no focus listeners, remembered elements, randomized focus-state globals, or blur hooks are installed. Scoped type/press require a currently focused field; after interacting with the top-level page, agents must click or fill inside the frame again. Blurring a field, including a main-world blur followed by outside focus in the same tick, never resurrects it.
+- Plain press errors retain their keydown/keyup operation prefixes; dialogs opening mid-wait retain the actionable dialog command hint. Child-frame context acquisition notices connection closure promptly.
 
 ### Added
+
+- **Iframe and Shadow-DOM scoping (`--frame` and ` >>> ` combinator)**:
+  - `--frame <iframe-selector>` flag (repeatable for nested iframes) added across 11 commands: `text`, `html`, `links`, `click`, `fill`, `type`, `press`, `hover`, `select`, `wait`, and `evaluate`.
+  - Frame resolution via `evaluate` in parent context, `Page.describeNode` to obtain `contentFrameId`, and bounded wait for the child frame's execution context.
+  - Click/hover scroll ancestors outermost-first and the target before measuring coordinates, including cross-origin and nested frames. Coordinates account for positive axis-aligned CSS scaling, borders, and padding; rotation/skew is unsupported.
+  - One timeout budget covers frame hops, describe/dispose, evaluation and input. `type`/`press` now accept `--timeout`; `fill` resolves its frame only once.
+  - `wait` retries missing/recreated frames and late-attached shadow roots, while invalid selectors and non-iframe matches fail immediately. Polls use the full remaining budget; deadline errors use one canonical message and retain the last transient frame failure.
+  - Main-frame evaluation follows the stable main-context tracker across frame-ID replacement; only explicit child scopes have detached-frame semantics. Detachment errors are typed rather than recognized by message substrings.
+  - Scoped type/press focus ancestor iframe elements outermost-first and then the target window. Any focus error aborts. Input is dispatched only to the current active element; null, body, or documentElement produces `--frame <sel>: nothing is focused inside the frame; click or fill an element inside it first`. No remembered element is refocused. Plain type/press still send input to whatever is focused, but now honour `--timeout` (default 30 s, previously the 60 s protocol default) and report errors without the `Kind (Method):` prefix; client socket budgets respect `--timeout`.
+  - Wait validates every CSS segment in one isolated main-frame evaluation before resolving any frame, including selectors behind missing frames. Existing dialogs and closed/crashed/unknown pages fail immediately; context acquisition stops promptly when the connection closes. Successful or terminal poll outcomes take precedence over deadline expiry.
+  - Shadow-query error markers carry a per-command random nonce; user exceptions containing the old marker text are not rewritten. CLI errors retain plain-command wording and use one selector prefix for scoped failures.
+  - CSS selector tokenization preserves comments and Unicode identifier whitespace. Frame resolution no longer measures unused geometry; click/hover reject hidden or zero-sized iframes.
+  - Non-Error JavaScript throws retain their values; protocol failures retain their actual method and detail. Restart running daemons after upgrading (`camoufox shutdown`, then `camoufox serve`) so the daemon understands frame scoping.
+  - Clear error reporting for missing iframe elements (`"--frame <sel>: no element matches"`), non-iframe targets (`"--frame <sel>: element is not an iframe"`), and execution context timeout (`"--frame <sel>: frame has no JavaScript context yet"`).
+  - Shadow-DOM piercing uses a CSS-aware tokenizer and searches every matching host depth-first. Closed roots and absent roots cannot reliably be distinguished in the isolated world; both report `element at segment N has no open shadow root (absent or closed; cannot pierce)` and are retryable in `wait`.
+  - IPC protocol compatibility: added `#[serde(default, skip_serializing_if = "Vec::is_empty")] frames: Vec<String>` to all affected `DaemonRequest` variants.
 
 - **Popups and site-opened tabs adoption (`tabs` and `BrowserContext::take_popups`)**:
   - Automatically track pages and popups opened by the site (`<a target="_blank">` or `window.open()`) via `PageRegistry`.

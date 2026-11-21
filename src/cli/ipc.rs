@@ -30,6 +30,17 @@ pub enum DaemonRequest {
         downloads_dir: Option<std::path::PathBuf>,
         #[serde(default)]
         bypass_csp: bool,
+        #[serde(default)]
+        dialogs: crate::api::DialogPolicy,
+    },
+
+    /// Accept or dismiss a page's open JavaScript dialog.
+    Dialog {
+        instance_id: String,
+        page_id: String,
+        action: String,
+        #[serde(default)]
+        text: Option<String>,
     },
 
     /// List all running instances.
@@ -495,6 +506,7 @@ mod tests {
             executable: None,
             downloads_dir: None,
             bypass_csp: false,
+            dialogs: Default::default(),
         };
         assert_eq!(launch.read_timeout().as_secs(), 210);
     }

@@ -20,6 +20,9 @@ All notable changes to camoufox-rs are documented here.
 - **`launch --bypass-csp`**: Disables Content-Security-Policy for the browser context via
   `Browser.setBypassCSP`. Used when `--main-world` evaluation is needed on strict-CSP sites
   that prohibit inline scripts.
+- JavaScript dialog tracking, manual `dialog` handling, and the launch
+  `--dialogs manual|accept|dismiss` policy.
+
 - **Browsing command surface (20 new CLI subcommands)**: the CLI grew from 12 primitives to a
   full browsing/scraping surface. Every new command is a thin CLI/IPC wrapper over the existing
   `api` layer — no new protocol plumbing.

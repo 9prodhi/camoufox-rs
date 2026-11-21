@@ -70,6 +70,18 @@ pub fn render(data: Option<&Value>) -> Rendered {
     // carries `url`/`title`, and a `select` result also carries a `text`.
     // -----------------------------------------------------------------------
 
+    if let Some(action) = data.get("dialog_action").and_then(Value::as_str) {
+        let dialog = &data["dialog"];
+        let kind = dialog["kind"].as_str().unwrap_or("dialog");
+        let message = dialog["message"].as_str().unwrap_or("");
+        let verb = if action == "accept" {
+            "accepted"
+        } else {
+            "dismissed"
+        };
+        return Rendered::out(format!("dialog {verb}: {kind} {message:?}"));
+    }
+
     // Structured metadata (`data --og/--jsonld/--meta`).
     if data.get("og").is_some() || data.get("jsonld").is_some() || data.get("meta").is_some() {
         return Rendered::out(pretty(data));

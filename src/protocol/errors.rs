@@ -12,6 +12,8 @@ pub enum ProtocolErrorKind {
     Closed,
     /// Page crashed.
     Crashed,
+    /// A JavaScript dialog opened on the page; the request was abandoned.
+    DialogOpened,
     /// Transport-level failure.
     Transport,
     /// The request was not answered before its deadline.
@@ -67,6 +69,17 @@ impl ProtocolError {
             source: None,
             download_info: None,
         }
+    }
+
+    /// Construct an error for a request interrupted by a JavaScript dialog.
+    pub fn dialog_opened(method: Option<String>, info: &crate::api::dialog::DialogInfo) -> Self {
+        let mut error = Self::new(
+            ProtocolErrorKind::DialogOpened,
+            method,
+            format!("open {} dialog: {:?}", info.kind, info.message),
+        );
+        error.data = serde_json::to_string(info).ok();
+        error
     }
 
     /// Build a `Closed` error with a specific method and custom message.

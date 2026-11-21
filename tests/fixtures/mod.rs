@@ -879,3 +879,168 @@ impl PopupServer {
         format!("{}{}", self.base_url, path)
     }
 }
+
+#[cfg(feature = "cli")]
+const FRAMES_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Frames Test</title></head>
+<body style="margin: 0; padding: 0;">
+  <iframe id="same-frame" src="/same-frame.html" style="margin-left: 20px; margin-top: 30px; border: 4px solid black; width: 300px; height: 200px;"></iframe>
+  <iframe id="cross-frame" src="__CROSS_URL__/cross-frame.html" style="margin-left: 50px; margin-top: 40px; border: 10px solid gray; width: 400px; height: 300px;"></iframe>
+  <iframe id="nested-outer" src="/nested-outer.html" style="margin-left: 10px; margin-top: 15px; border: 2px solid blue; width: 400px; height: 400px;"></iframe>
+  <div id="not-an-iframe">I am a div</div>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+const SAME_FRAME_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Same Frame</title></head>
+<body style="margin: 0; padding: 0;">
+  <h1>Same Origin Frame</h1>
+  <p id="msg">Hello from same origin</p>
+  <button id="same-btn" onclick="this.setAttribute('data-clicked', 'true')">Same Button</button>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+const NESTED_OUTER_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Nested Outer</title></head>
+<body style="margin: 0; padding: 0;">
+  <h2>Nested Outer</h2>
+  <iframe id="nested-inner" src="/nested-inner.html" style="margin-left: 25px; margin-top: 35px; border: 5px solid green; width: 300px; height: 200px;"></iframe>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+const NESTED_INNER_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Nested Inner</title></head>
+<body style="margin: 0; padding: 0;">
+  <h3>Nested Inner</h3>
+  <p id="nested-val">Deep Content</p>
+  <button id="nested-btn" style="width:16px;height:16px;padding:0;border:0" onclick="this.setAttribute('data-clicked', 'nested-yes')">Nested Button</button>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+const SHADOW_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Shadow DOM Test</title></head>
+<body style="margin: 0; padding: 0;">
+  <div id="open-host"></div>
+  <div id="closed-host"></div>
+  <script>
+    const openHost = document.getElementById('open-host');
+    const openRoot = openHost.attachShadow({ mode: 'open' });
+    openRoot.innerHTML = '<button id="open-btn" onclick="this.setAttribute(\'data-clicked\', \'open-yes\')">Open Shadow Button</button><span id="open-text">Inside Open Shadow</span>';
+
+    const closedHost = document.getElementById('closed-host');
+    const closedRoot = closedHost.attachShadow({ mode: 'closed' });
+    closedRoot.innerHTML = '<button id="closed-btn" onclick="this.setAttribute(\'data-clicked\', \'closed-yes\')">Closed Shadow Button</button><span id="closed-text">Inside Closed Shadow</span>';
+  </script>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+const CROSS_FRAME_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Cross Frame</title></head>
+<body style="margin: 0; padding: 0;">
+  <h1>Cross Origin Frame</h1>
+  <input id="cross-input" type="text" value="" style="margin-left: 10px; margin-top: 10px;" />
+  <button id="cross-btn" onclick="document.getElementById('cross-input').setAttribute('data-clicked', 'cross-yes')" style="margin-left: 10px; margin-top: 10px; width: 16px; height: 16px; padding:0;border:0;">Cross Button</button>
+  <p id="cross-text">Cross Origin Text</p>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+pub struct FramesServer {
+    pub main_url: String,
+    #[allow(dead_code)]
+    pub cross_url: String,
+    _main_server: Arc<Server>,
+    _cross_server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl FramesServer {
+    pub fn start() -> Self {
+        let main_server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let cross_server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+
+        let main_port = main_server.server_addr().to_ip().unwrap().port();
+        let cross_port = cross_server.server_addr().to_ip().unwrap().port();
+
+        let main_url = format!("http://127.0.0.1:{main_port}");
+        let cross_url = format!("http://127.0.0.1:{cross_port}");
+
+        let cross_url_clone = cross_url.clone();
+        let worker_main = Arc::clone(&main_server);
+        thread::spawn(move || {
+            for req in worker_main.incoming_requests() {
+                let path = req.url().to_owned();
+                let (status, body) = match path.as_str() {
+                    "/frames.html" => (
+                        200,
+                        FRAMES_HTML_TEMPLATE
+                            .replace("__CROSS_URL__", &cross_url_clone)
+                            .into_bytes(),
+                    ),
+                    "/same-frame.html" => (200, SAME_FRAME_HTML.as_bytes().to_vec()),
+                    "/nested-outer.html" => (200, NESTED_OUTER_HTML.as_bytes().to_vec()),
+                    "/nested-inner.html" => (200, NESTED_INNER_HTML.as_bytes().to_vec()),
+                    "/shadow.html" => (200, SHADOW_HTML.as_bytes().to_vec()),
+                    _ => (404, b"not found".to_vec()),
+                };
+                let resp = Response::new(
+                    status.into(),
+                    vec![Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    )
+                    .unwrap()],
+                    Cursor::new(body.clone()),
+                    Some(body.len()),
+                    None,
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        let worker_cross = Arc::clone(&cross_server);
+        thread::spawn(move || {
+            for req in worker_cross.incoming_requests() {
+                let path = req.url().to_owned();
+                let (status, body) = match path.as_str() {
+                    "/cross-frame.html" => (200, CROSS_FRAME_HTML.as_bytes().to_vec()),
+                    _ => (404, b"not found".to_vec()),
+                };
+                let resp = Response::new(
+                    status.into(),
+                    vec![Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    )
+                    .unwrap()],
+                    Cursor::new(body.clone()),
+                    Some(body.len()),
+                    None,
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        Self {
+            main_url,
+            cross_url,
+            _main_server: main_server,
+            _cross_server: cross_server,
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.main_url, path)
+    }
+}

@@ -2250,6 +2250,119 @@ mod tests {
         ));
     }
     #[test]
+    fn plain_evaluate_follows_main_frame_replacement_during_retry() {
+        let (transport, tx) = TestTransport::new();
+        let records = transport.records.clone();
+        let conn = Arc::new(Connection::new(Box::new(transport)));
+        let reg = PageRegistry::install(&conn, "ctx-1", DialogPolicy::Manual);
+        tx.send(attached_to_target_msg("s", "t", "ctx-1", None))
+            .unwrap();
+        tx.send(frame_attached_msg("s", "old", None)).unwrap();
+        tx.send(exec_context_created_msg("s", "old", "old-ctx", ""))
+            .unwrap();
+        let tracked = reg.claim("t", Duration::from_secs(2)).unwrap();
+        let mf = crate::api::MainFrame::from_tracked(tracked, conn.clone(), reg.clone()).unwrap();
+        sync_reader(&conn, &tx);
+        std::thread::scope(|scope| {
+            let evaluate = scope.spawn(|| mf.evaluate("42", Duration::from_secs(3)));
+            let next = |context: &str| {
+                assert!(wait_for(
+                    || records
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(v, _)| v["method"] == "Runtime.evaluate"
+                            && v["params"]["executionContextId"] == context),
+                    Duration::from_secs(2)
+                ));
+                records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(v, _)| {
+                        v["method"] == "Runtime.evaluate"
+                            && v["params"]["executionContextId"] == context
+                    })
+                    .unwrap()
+                    .0["id"]
+                    .as_i64()
+                    .unwrap()
+            };
+            let id = next("old-ctx");
+            tx.send(frame_detached_msg("s", "old")).unwrap();
+            tx.send(frame_attached_msg("s", "new", None)).unwrap();
+            tx.send(exec_context_created_msg("s", "new", "new-ctx", ""))
+                .unwrap();
+            tx.send(RawMessage {
+                id: Some(id),
+                method: None,
+                params: None,
+                result: None,
+                error: Some(crate::protocol::types::ErrorData {
+                    message: "Execution context was destroyed".into(),
+                    data: None,
+                }),
+                session_id: Some("s".into()),
+            })
+            .unwrap();
+            assert!(wait_for(
+                || evaluate.is_finished()
+                    || records
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(v, _)| v["method"] == "Runtime.evaluate"
+                            && v["params"]["executionContextId"] == "new-ctx"),
+                Duration::from_secs(2)
+            ));
+            if !evaluate.is_finished() {
+                let id = next("new-ctx");
+                tx.send(RawMessage {
+                    id: Some(id),
+                    method: None,
+                    params: None,
+                    result: Some(serde_json::json!({"result":{"value":42}})),
+                    error: None,
+                    session_id: Some("s".into()),
+                })
+                .unwrap();
+            }
+            assert_eq!(evaluate.join().unwrap().unwrap()["result"]["value"], 42);
+        });
+    }
+
+    #[test]
+    fn nested_frame_without_context_honors_remaining_budget() {
+        let (transport, tx) = TestTransport::new();
+        let conn = Arc::new(Connection::new(Box::new(transport)));
+        let reg = PageRegistry::install(&conn, "ctx-1", DialogPolicy::Manual);
+        tx.send(attached_to_target_msg("s", "t", "ctx-1", None))
+            .unwrap();
+        tx.send(frame_attached_msg("s", "main", None)).unwrap();
+        tx.send(frame_attached_msg("s", "outer", Some("main")))
+            .unwrap();
+        tx.send(frame_attached_msg("s", "inner", Some("outer")))
+            .unwrap();
+        let tracked = reg.claim("t", Duration::from_secs(2)).unwrap();
+        let mf = crate::api::MainFrame::from_tracked(tracked, conn.clone(), reg.clone()).unwrap();
+        sync_reader(&conn, &tx);
+        let started = Instant::now();
+        let err = mf
+            .evaluate_in_frame("inner", "1", Duration::from_secs(1))
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(2000),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.to_string()
+                .contains("timed out waiting for execution context"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn r1_failure_is_remembered_across_entire_window() {
         let (transport, tx) = TestTransport::new();
         let records = transport.records.clone();

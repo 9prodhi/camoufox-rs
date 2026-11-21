@@ -55,7 +55,7 @@ enum ReadResult {
 ///
 /// Spawns one background reader thread per available output stream (stdout and
 /// stderr). Each thread scans line by line for any banner in
-/// [`READINESS_SENTINELS`]. The first thread to see a banner reports `Ready`;
+/// `READINESS_SENTINELS`. The first thread to see a banner reports `Ready`;
 /// whichever stream it appeared on no longer matters. Uses a channel with a
 /// deadline to enforce the timeout.
 ///

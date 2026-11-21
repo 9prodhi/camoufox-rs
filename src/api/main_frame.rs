@@ -527,7 +527,7 @@ impl MainFrame {
     /// # Handler cleanup (no leak)
     ///
     /// The handler is registered via [`Connection::on_event`], which returns a
-    /// `HandlerId`. An RAII guard ([`SubscriptionGuard`]) deregisters the
+    /// `HandlerId`. An RAII guard (`SubscriptionGuard`) deregisters the
     /// handler via [`Connection::off_event`] on **every** exit path — success,
     /// timeout, error, or panic — so a `--wait-until` navigate never leaks a
     /// closure into the `EventRouter`.
@@ -711,7 +711,7 @@ impl MainFrame {
     /// remains, so navigate+wait can never exceed `timeout`. If the renderer
     /// never responds (e.g. the response was a download and no DOM was
     /// created), the call returns
-    /// [`ProtocolErrorKind::Timeout`](crate::protocol::errors::ProtocolErrorKind::Timeout)
+    /// [`ProtocolErrorKind::Timeout`]
     /// rather than hanging.
     ///
     /// Invalidates the cached execution context on cross-document navigation

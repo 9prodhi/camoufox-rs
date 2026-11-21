@@ -4,7 +4,28 @@ All notable changes to camoufox-rs are documented here.
 
 ## [Unreleased]
 
+### Behaviour changes
+
+- Every `BrowserContext` installs persistent root handlers; each page installs six session handlers until detach. Root handlers live as long as the context or any of its `MainFrame`s.
+- Targets without a `browserContextId` are ignored.
+- After a failed `Browser.newPage`, unclaimed no-opener pages attached during that in-flight window are closed.
+- A no-opener page attaching after a failed `Browser.newPage` window has fully closed is still adopted as a popup; this is the residual limit of window-based tracking.
+- `MainFrame::frame_id()` now returns a live `String`, following main-frame replacement.
+- Crashed pages remain listed and commands report "crashed", rather than "was closed".
+
 ### Added
+
+- **Popups and site-opened tabs adoption (`tabs` and `BrowserContext::take_popups`)**:
+  - Automatically track pages and popups opened by the site (`<a target="_blank">` or `window.open()`) via `PageRegistry`.
+  - Popups are classified immediately when `openerId` is present, or held during in-flight `new_page` calls to avoid races with user-created tabs.
+  - The CLI automatically adopts newly opened popups on command entry (`with_instance`), assigning them `p<N>` page IDs and inheriting the instance's dialog policy.
+  - `tabs` command output includes `"opener": <page_id or null>` to reflect opener relationships.
+  - Closed or self-closing tabs (`window.close()` / `Browser.detachedFromTarget`) are removed from `tabs`, and targeted commands on closed pages return a clear error indicating the page was closed.
+  - Per-session event handlers are registered dynamically upon target attachment and torn down cleanly on target detachment, preventing handler leaks.
+  - `Session::is_closed()` and `MainFrame::is_closed()` allow callers to inspect whether a page or session is closed or detached.
+  - `MainFrame` retains a strong `Arc<PageRegistry>` reference so execution context tracking continues to function if the parent `BrowserContext` is dropped.
+  - `MainFrame::frames()` and `MainFrame::has_frame()` allow querying tracked frames.
+  - `PageRegistry` isolates detachment tombstones per browser context, re-checks abandoned targets under lock to eliminate attach races, keeps a stable execution context tracker across main frame re-attachments, and suppresses late execution contexts for detached frames.
 
 - **Download log and file saving (`downloads` command and `--downloads-dir`)**:
   - `launch --downloads-dir <path>` configures a validated absolute directory where downloads

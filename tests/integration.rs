@@ -9,7 +9,9 @@
 
 use std::path::PathBuf;
 use std::process::Child;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "cli")]
+use std::time::Instant;
 
 use camoufox::api::{Browser, BrowserOptions, ContextOptions};
 use camoufox::config::LaunchConfig;
@@ -1667,5 +1669,206 @@ fn accept_policy_auto_handles() {
         tab.get("dialog").is_none(),
         "dialog is still pending: {tab}"
     );
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn target_blank_link_adopted_as_new_tab() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::PopupServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/popup.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    manager
+        .click_selector(&instance, &page, "#blank", timeout)
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut popup_id = None;
+    while std::time::Instant::now() < deadline {
+        let tabs = manager.tabs(&instance, timeout).unwrap();
+        if tabs.len() >= 2 {
+            for tab in &tabs {
+                let pid = tab["page_id"].as_str().unwrap();
+                let url = tab["url"].as_str().unwrap_or("");
+                if pid != page && url.ends_with("/main.html") {
+                    assert_eq!(tab["opener"].as_str(), Some(page.as_str()));
+                    popup_id = Some(pid.to_string());
+                    break;
+                }
+            }
+            if popup_id.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let p2 = popup_id.expect("popup tab was not adopted within 5s");
+    let text = manager.text(&instance, &p2, None, timeout).unwrap();
+    assert!(
+        text.contains("MAIN_SENTINEL_8f3a2b1c"),
+        "text on adopted popup should contain fixture marker: {text}"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn window_open_popup_adopted_and_evaluable() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::PopupServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/popup.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    manager
+        .click_selector(&instance, &page, "#open", timeout)
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut popup_id = None;
+    while std::time::Instant::now() < deadline {
+        let tabs = manager.tabs(&instance, timeout).unwrap();
+        if tabs.len() >= 2 {
+            for tab in &tabs {
+                let pid = tab["page_id"].as_str().unwrap();
+                if pid != page {
+                    assert_eq!(tab["opener"].as_str(), Some(page.as_str()));
+                    popup_id = Some(pid.to_string());
+                    break;
+                }
+            }
+            if popup_id.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let p2 = popup_id.expect("window.open popup was not adopted within 5s");
+    let val = manager
+        .evaluate(&instance, &p2, "1 + 1", timeout)
+        .expect("evaluate on window.open popup should succeed");
+    assert_eq!(val, 2);
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn self_closing_popup_disappears_from_tabs() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::PopupServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/popup.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    manager
+        .click_selector(&instance, &page, "#selfclose", timeout)
+        .unwrap();
+
+    // 1. First it should appear as a tab
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut popup_id = None;
+    while std::time::Instant::now() < deadline {
+        let tabs = manager.tabs(&instance, timeout).unwrap();
+        if tabs.len() >= 2 {
+            for tab in &tabs {
+                let pid = tab["page_id"].as_str().unwrap();
+                if pid != page {
+                    popup_id = Some(pid.to_string());
+                    break;
+                }
+            }
+            if popup_id.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let p2 = popup_id.expect("selfclose popup was not adopted");
+
+    // 2. The popup calls window.close() after 300 ms, so it should disappear from tabs
+    let close_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut closed = false;
+    while std::time::Instant::now() < close_deadline {
+        let tabs = manager.tabs(&instance, timeout).unwrap();
+        if tabs.iter().all(|tab| tab["page_id"] != p2) {
+            closed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(closed, "self-closing popup did not disappear from tabs");
+
+    // Also verify that accessing p2 returns "page p2 was closed" error
+    let err = manager.evaluate(&instance, &p2, "1", timeout).unwrap_err();
+    assert!(
+        err.contains("was closed"),
+        "expected 'page was closed' error, got: {err}"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn new_page_still_works_and_is_not_duplicated_as_popup() {
+    use camoufox::cli::instance::InstanceManager;
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let p1 = manager.new_page(&instance).unwrap();
+    assert_eq!(p1, "p1");
+
+    for i in 2..=6 {
+        let page = manager.new_page(&instance).unwrap();
+        assert_eq!(page, format!("p{i}"));
+    }
+
+    let tabs = manager.tabs(&instance, Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        tabs.len(),
+        6,
+        "tabs must have exactly 6 pages after 6x new_page: {tabs:?}"
+    );
+
     manager.stop(&instance).unwrap();
 }

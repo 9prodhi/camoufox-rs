@@ -663,8 +663,11 @@ impl Drop for DownloadServer {
 // CspServer — fixture for Content-Security-Policy tests
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "cli")]
 const CSP_STRICT_HTML: &str = include_str!("csp_strict.html");
+#[cfg(feature = "cli")]
 const CSP_INLINE_HTML: &str = include_str!("csp_inline.html");
+#[cfg(feature = "cli")]
 const CSP_NONCE_HTML: &str = include_str!("csp_nonce.html");
 
 /// A single-port HTTP server serving pages with varying Content-Security-Policy headers:
@@ -672,11 +675,13 @@ const CSP_NONCE_HTML: &str = include_str!("csp_nonce.html");
 /// - `/csp_inline.html` with CSP: `script-src 'self' 'unsafe-inline'`
 /// - `/csp_nonce.html` with CSP: `script-src 'nonce-n0nc3'`
 /// - `/val.html` with no CSP, sets `window.val = 7`
+#[cfg(feature = "cli")]
 pub struct CspServer {
     pub base_url: String,
     _server: Arc<Server>,
 }
 
+#[cfg(feature = "cli")]
 impl CspServer {
     pub fn start() -> Self {
         let server = Arc::new(Server::http("127.0.0.1:0").expect("bind csp server"));
@@ -782,6 +787,7 @@ impl CspServer {
     }
 }
 
+#[cfg(feature = "cli")]
 impl Drop for CspServer {
     fn drop(&mut self) {}
 }
@@ -814,5 +820,62 @@ impl DialogServer {
             url,
             _server: server,
         }
+    }
+}
+
+#[cfg(feature = "cli")]
+const POPUP_HTML: &str = include_str!("popup.html");
+#[cfg(feature = "cli")]
+const SELFCLOSE_HTML: &str = include_str!("selfclose.html");
+
+#[cfg(feature = "cli")]
+pub struct PopupServer {
+    pub base_url: String,
+    _server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl PopupServer {
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let worker = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in worker.incoming_requests() {
+                let path = req.url().to_owned();
+                let (status, body) = match path.as_str() {
+                    "/popup.html" => (200, POPUP_HTML.as_bytes().to_vec()),
+                    "/main.html" => (
+                        200,
+                        MAIN_HTML_TEMPLATE
+                            .replace("__IFRAME_URL__", "about:blank")
+                            .into_bytes(),
+                    ),
+                    "/selfclose.html" => (200, SELFCLOSE_HTML.as_bytes().to_vec()),
+                    _ => (404, b"not found".to_vec()),
+                };
+                let resp = Response::new(
+                    status.into(),
+                    vec![Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    )
+                    .unwrap()],
+                    Cursor::new(body.clone()),
+                    Some(body.len()),
+                    None,
+                );
+                let _ = req.respond(resp);
+            }
+        });
+        Self {
+            base_url,
+            _server: server,
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
     }
 }

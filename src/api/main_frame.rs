@@ -270,14 +270,6 @@ pub struct Point {
 // SubscriptionGuard
 // ---------------------------------------------------------------------------
 
-pub(crate) enum SubscriptionTarget {
-    SessionScoped {
-        session_key: String,
-        method: &'static str,
-    },
-    Global,
-}
-
 /// RAII guard that deregisters an event handler when dropped.
 ///
 /// Holding one of these guarantees the handler is removed from the connection's
@@ -286,9 +278,12 @@ pub(crate) enum SubscriptionTarget {
 /// can never leak a dead closure.
 pub(crate) struct SubscriptionGuard {
     connection: Arc<Connection>,
-    target: SubscriptionTarget,
+    session_key: String,
+    method: &'static str,
     id: HandlerId,
     active: bool,
+    #[cfg(test)]
+    pub(crate) on_drop: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl SubscriptionGuard {
@@ -300,27 +295,13 @@ impl SubscriptionGuard {
     ) -> Self {
         Self {
             connection,
-            target: SubscriptionTarget::SessionScoped {
-                session_key: session_key.into(),
-                method,
-            },
+            session_key: session_key.into(),
+            method,
             id,
             active: true,
+            #[cfg(test)]
+            on_drop: None,
         }
-    }
-
-    pub(crate) fn global(connection: Arc<Connection>, id: HandlerId) -> Self {
-        Self {
-            connection,
-            target: SubscriptionTarget::Global,
-            id,
-            active: true,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn disarm(&mut self) {
-        self.active = false;
     }
 }
 
@@ -329,17 +310,12 @@ impl Drop for SubscriptionGuard {
         if !self.active {
             return;
         }
-        match &self.target {
-            SubscriptionTarget::SessionScoped {
-                session_key,
-                method,
-            } => {
-                self.connection.off_event(session_key, method, self.id);
-            }
-            SubscriptionTarget::Global => {
-                self.connection.off_event_global(self.id);
-            }
+        #[cfg(test)]
+        if let Some(hook) = &self.on_drop {
+            hook();
         }
+        self.connection
+            .off_event(&self.session_key, self.method, self.id);
     }
 }
 
@@ -359,21 +335,25 @@ pub struct MainFrame {
     session: Session,
     /// Server-assigned target ID; the target has `type == "page"`.
     target_id: String,
-    /// Top frame ID, populated at construction time.
-    frame_id: String,
+    /// Opener target ID, if opened by another page.
+    opener_id: Option<String>,
+    /// Last observed top-frame ID, retained after page removal.
+    frame_id: Mutex<String>,
     /// Latest known main-world execution context ID for this frame.
     /// Updated by a `Runtime.executionContextCreated` listener registered
     /// in `BrowserContext::new_main_frame`, filtered on `auxData.frameId`.
     execution_context_id: Arc<ExecContextTracker>,
     /// Shared connection — used for `on_event` subscriptions (e.g. lifecycle wait).
     connection: Arc<Connection>,
+    registry: Arc<crate::api::page_registry::PageRegistry>,
     dialog: Arc<crate::api::dialog::DialogTracker>,
     /// RAII guards for event subscriptions owned by this frame (e.g. executionContextCreated/Destroyed).
     _context_guards: Vec<SubscriptionGuard>,
 }
 
 impl MainFrame {
-    /// Internal constructor used by `BrowserContext::new_main_frame`.
+    /// Internal constructor used by tests.
+    #[cfg(test)]
     pub(crate) fn new(
         session: Session,
         target_id: String,
@@ -383,17 +363,66 @@ impl MainFrame {
         mut context_guards: Vec<SubscriptionGuard>,
         dialog_policy: crate::api::dialog::DialogPolicy,
     ) -> Self {
+        let registry = crate::api::page_registry::PageRegistry::install(
+            &connection,
+            "test-context",
+            dialog_policy,
+        );
         let dialog = crate::api::dialog::DialogTracker::new(dialog_policy);
         context_guards.extend(dialog.install(&connection, &session));
         MainFrame {
             dialog,
             session,
             target_id,
-            frame_id,
+            opener_id: None,
+            frame_id: Mutex::new(frame_id),
             execution_context_id,
             connection,
+            registry,
             _context_guards: context_guards,
         }
+    }
+
+    /// Construct from a claimed or adopted [`TrackedPage`].
+    pub(crate) fn from_tracked(
+        tracked: crate::api::page_registry::TrackedPage,
+        connection: Arc<Connection>,
+        registry: Arc<crate::api::page_registry::PageRegistry>,
+    ) -> Result<Self, ProtocolError> {
+        let frame_id = tracked.main_frame_id.clone().ok_or_else(|| {
+            ProtocolError::closed_with("Page.frameAttached", "tracked page has no main frame")
+        })?;
+        Ok(MainFrame {
+            dialog: tracked.dialog,
+            session: tracked.session,
+            target_id: tracked.target_id,
+            opener_id: tracked.opener_id,
+            frame_id: Mutex::new(frame_id),
+            execution_context_id: tracked.main_ctx,
+            connection,
+            registry,
+            _context_guards: tracked.session_guards,
+        })
+    }
+
+    /// Check whether this page's session has been closed or detached.
+    pub fn is_closed(&self) -> bool {
+        self.session.is_closed()
+    }
+
+    /// Check whether a frame with the given ID exists on this page.
+    pub fn has_frame(&self, frame_id: &str) -> bool {
+        self.frame_ctx(frame_id).is_some()
+    }
+
+    /// Look up the execution context tracker for a specific frame of this page.
+    pub(crate) fn frame_ctx(&self, frame_id: &str) -> Option<Arc<ExecContextTracker>> {
+        self.registry.frame_ctx(self.session.key(), frame_id)
+    }
+
+    /// List frames for this page as `(frame_id, parent_id)` pairs.
+    pub fn frames(&self) -> Vec<(String, Option<String>)> {
+        self.registry.frames(self.session.key())
     }
 
     /// Currently open JavaScript dialog, if any.
@@ -416,9 +445,29 @@ impl MainFrame {
         &self.target_id
     }
 
-    /// Returns the top frame ID.
-    pub fn frame_id(&self) -> &str {
-        &self.frame_id
+    /// Returns the opener target ID for this page, if any.
+    pub fn opener_id(&self) -> Option<&str> {
+        self.opener_id.as_deref()
+    }
+
+    /// Returns the live top-frame ID, following replacement attachments.
+    /// During a detach/reattach gap this is the last attached main-frame ID;
+    /// after page removal the last observed ID is retained for diagnostics.
+    pub fn frame_id(&self) -> String {
+        let live = self.registry.main_frame_id(self.session.key());
+        let mut last = self
+            .frame_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(id) = live {
+            *last = id;
+        }
+        last.clone()
+    }
+
+    /// Whether the renderer crashed (distinct from a closed/detached page).
+    pub fn is_crashed(&self) -> bool {
+        self.session.is_crashed()
     }
 
     /// Shared handle to the cached execution context id. Updated by the
@@ -488,11 +537,13 @@ impl MainFrame {
         event_name: &str,
         timeout: Duration,
     ) -> Result<(), ProtocolError> {
-        self.wait_for_lifecycle_internal(event_name, timeout, None)
+        let frame_id = self.frame_id();
+        self.wait_for_lifecycle_internal(&frame_id, event_name, timeout, None)
     }
 
     fn wait_for_lifecycle_internal(
         &self,
+        frame_id: &str,
         event_name: &str,
         timeout: Duration,
         external_download_state: Option<&Arc<Mutex<DownloadState>>>,
@@ -510,7 +561,7 @@ impl MainFrame {
         }
 
         let (tx, rx) = mpsc::channel::<LifecycleSignal>();
-        let frame_id = self.frame_id.clone();
+        let frame_id = frame_id.to_owned();
         let expected_name = event_name.to_owned();
         let session_key = self.session.key().to_owned();
 
@@ -676,7 +727,7 @@ impl MainFrame {
         let deadline = Instant::now() + timeout;
 
         let session_key = self.session.key().to_owned();
-        let frame_id = self.frame_id.clone();
+        let frame_id = self.frame_id();
 
         // -----------------------------------------------------------------------
         // Download detection: Subscribe to Browser.downloadCreated on the ROOT
@@ -920,7 +971,7 @@ impl MainFrame {
 
         let mut params = json!({
             "url": url,
-            "frameId": self.frame_id,
+            "frameId": frame_id,
         });
         if let Some(ref referer) = options.referer {
             params["referer"] = json!(referer);
@@ -932,7 +983,7 @@ impl MainFrame {
             let result = self.session().send_navigate_with_timeout(
                 "Page.navigate",
                 params,
-                &self.frame_id,
+                &frame_id,
                 timeout,
             )?;
 
@@ -959,7 +1010,12 @@ impl MainFrame {
             // the single navigate deadline.
             if let Some(event_name) = lifecycle_event {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                self.wait_for_lifecycle_internal(event_name, remaining, Some(&download_state))?;
+                self.wait_for_lifecycle_internal(
+                    &frame_id,
+                    event_name,
+                    remaining,
+                    Some(&download_state),
+                )?;
             }
 
             // Poll briefly for the status code. The response typically arrives
@@ -1359,8 +1415,13 @@ impl MainFrame {
     ///
     /// # Errors
     ///
-    /// Returns a [`ProtocolError`] if the command fails.
+    /// Returns a [`ProtocolError`] if the command fails. For a crashed renderer,
+    /// sends a best-effort close without waiting for a response.
     pub fn close(&self) -> Result<(), ProtocolError> {
+        if self.is_crashed() {
+            self.session().close_page_best_effort();
+            return Ok(());
+        }
         self.session().send("Page.close", json!({}))?;
         Ok(())
     }
@@ -1999,7 +2060,7 @@ impl std::fmt::Debug for MainFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MainFrame")
             .field("target_id", &self.target_id)
-            .field("frame_id", &self.frame_id)
+            .field("frame_id", &self.frame_id())
             .finish_non_exhaustive()
     }
 }
@@ -4377,5 +4438,17 @@ mod tests {
             h.frame.execution_context_handle().current().as_deref(),
             Some("ctx-old")
         );
+    }
+    #[test]
+    fn s5_frame_identity_and_debug_recover_poisoned_cache() {
+        let h = build_mock_frame("s-poison", "f-poison");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _id = h.frame.frame_id.lock().unwrap();
+            panic!("poison frame identity cache");
+        }));
+        assert_eq!(h.frame.frame_id(), "f-poison");
+        let debug = format!("{:?}", h.frame);
+        assert!(debug.contains("frame_id: \"f-poison\""));
+        assert!(!debug.contains("Mutex"));
     }
 }

@@ -193,6 +193,8 @@ cargo run --features cli --bin camoufox -- tabs <instance_id>
 cargo run --features cli --bin camoufox -- close-tab <instance_id> <page_id>
 ```
 
+Tabs and popups opened by the site (e.g. via `<a target="_blank">` or `window.open()`) are automatically tracked and appear in `tabs` on subsequent commands, complete with an `"opener"` field pointing to the parent page. When a page closes itself (via `window.close()`) or is closed, it is cleanly removed from `tabs`, and any subsequent command targeting it reports that the page was closed.
+
 Manage downloads:
 
 ```bash

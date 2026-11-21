@@ -164,9 +164,9 @@ Parent accesses: `stdio[3]` (writable — commands out), `stdio[4]` (readable �
 
 ### Startup Detection
 
-- Watch **stderr** for substring: `"Juggler listening to the pipe"`
+- Watch **stdout and stderr** concurrently for sentinel substrings: `"Juggler listening to the pipe"` or `"Juggler pipe initialized"` (wording varies across Camoufox builds; see `src/process/readiness.rs`)
 - Default launch timeout: **180,000ms** (3 minutes), enforced by outer progress controller
-- If process exits before string appears: `"Failed to launch the browser process"` error
+- If process exits before string appears: process error with captured stderr
 - If timeout expires with process alive: abort launch, trigger close/kill cleanup
 
 ### Reader Implementation (Firefox Side)
@@ -178,7 +178,7 @@ Parent accesses: `stdio[3]` (writable — commands out), `stdio[4]` (readable �
 - **EINTR**: Retried automatically on Unix (`if (sizeRead < 0 && errno == EINTR) continue`)
 - **EOF**: `read()` returns 0 → dispatches `Disconnected` → triggers `Browser.close`
 - **Empty messages**: Two consecutive `\0` bytes are silently ignored (`if (end > start)` guard)
-- **No max message size**: Accumulation vector grows unboundedly
+- **No max message size**: Accumulation vector grows unboundedly in Firefox (note: the `camoufox-rs` client codec enforces a 256 MiB frame cap to guard against memory exhaustion)
 
 ### Writer Implementation (Firefox Side)
 
@@ -1926,7 +1926,7 @@ Chunk size: 2047 chars (Windows), 32767 chars (Unix). C++ `MaskConfig` reads at 
 
 ### Serialization Rules
 
-```rust
+```text
 // For Optional fields: skip if None (don't serialize as null)
 #[serde(skip_serializing_if = "Option::is_none")]
 pub field: Option<String>,
@@ -1938,7 +1938,7 @@ pub field: Option<String>,  // None → null, Some(v) → v
 
 ### Root vs Page Session Wire Format
 
-```rust
+```json
 // Root session: NO sessionId field
 {"id":1,"method":"Browser.enable","params":{}}
 

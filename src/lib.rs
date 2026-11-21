@@ -11,3 +11,23 @@ pub mod obs;
 
 #[cfg(feature = "cli")]
 pub mod cli;
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/howto-library-usage.md")]
+pub struct HowtoLibraryUsageDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/howto-downloads-and-dialogs.md")]
+pub struct HowtoDownloadsAndDialogsDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/tutorial-getting-started.md")]
+pub struct TutorialGettingStartedDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/reference-library-api.md")]
+pub struct ReferenceLibraryApiDoctests;

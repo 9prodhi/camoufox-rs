@@ -351,7 +351,7 @@ pub struct ManagedMainFrame {
 ///
 /// New launch flags add a field here (and on `DaemonRequest::Launch`), so
 /// `launch_with`'s signature never changes. Flags that configure the browser
-/// context are mapped in [`LaunchOptions::context_options`].
+/// context are mapped in `LaunchOptions::context_options`.
 #[derive(Debug, Clone, Default)]
 pub struct LaunchOptions {
     /// `None` means headless.

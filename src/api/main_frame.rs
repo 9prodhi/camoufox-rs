@@ -16,6 +16,7 @@ use serde_json::json;
 
 use crate::api::browser::Session;
 use crate::api::exec_ctx::ExecContextTracker;
+use crate::api::selectors::js_query;
 use crate::protocol::client::Connection;
 use crate::protocol::errors::{DownloadInfo, ProtocolError, ProtocolErrorKind};
 use crate::protocol::events::HandlerId;
@@ -417,7 +418,15 @@ impl MainFrame {
 
     /// Look up the execution context tracker for a specific frame of this page.
     pub(crate) fn frame_ctx(&self, frame_id: &str) -> Option<Arc<ExecContextTracker>> {
-        self.registry.frame_ctx(self.session.key(), frame_id)
+        self.registry
+            .frame_ctx(self.session.key(), frame_id)
+            .or_else(|| {
+                if frame_id == self.frame_id() {
+                    Some(Arc::clone(&self.execution_context_id))
+                } else {
+                    None
+                }
+            })
     }
 
     /// List frames for this page as `(frame_id, parent_id)` pairs.
@@ -1436,6 +1445,15 @@ impl MainFrame {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn dispatch_key_event(&self, params: KeyEventParams) -> Result<(), ProtocolError> {
+        self.dispatch_key_event_with_timeout(params, Duration::from_secs(60))
+    }
+
+    /// Dispatch input within an explicit command budget.
+    pub fn dispatch_key_event_with_timeout(
+        &self,
+        params: KeyEventParams,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
         let mut p = json!({
             "type": params.r#type,
             "keyCode": params.key_code,
@@ -1447,7 +1465,8 @@ impl MainFrame {
         if let Some(ref text) = params.text {
             p["text"] = json!(text);
         }
-        self.session().send("Page.dispatchKeyEvent", p)?;
+        self.session()
+            .send_with_timeout("Page.dispatchKeyEvent", p, timeout)?;
         Ok(())
     }
 
@@ -1457,8 +1476,17 @@ impl MainFrame {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn insert_text(&self, text: &str) -> Result<(), ProtocolError> {
+        self.insert_text_with_timeout(text, Duration::from_secs(60))
+    }
+
+    /// Insert text with an explicit command budget.
+    pub fn insert_text_with_timeout(
+        &self,
+        text: &str,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
         self.session()
-            .send("Page.insertText", json!({ "text": text }))?;
+            .send_with_timeout("Page.insertText", json!({ "text": text }), timeout)?;
         Ok(())
     }
 
@@ -1468,6 +1496,15 @@ impl MainFrame {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn dispatch_mouse_event(&self, params: MouseEventParams) -> Result<(), ProtocolError> {
+        self.dispatch_mouse_event_with_timeout(params, Duration::from_secs(60))
+    }
+
+    /// Dispatch input within an explicit command budget.
+    pub fn dispatch_mouse_event_with_timeout(
+        &self,
+        params: MouseEventParams,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
         let mut p = json!({
             "type": params.r#type,
             "button": params.button,
@@ -1479,7 +1516,8 @@ impl MainFrame {
         if let Some(cc) = params.click_count {
             p["clickCount"] = json!(cc);
         }
-        self.session().send("Page.dispatchMouseEvent", p)?;
+        self.session()
+            .send_with_timeout("Page.dispatchMouseEvent", p, timeout)?;
         Ok(())
     }
 
@@ -1576,69 +1614,7 @@ impl MainFrame {
         expression: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, ProtocolError> {
-        const MAX_RETRIES: u32 = 5;
-        let deadline = Instant::now() + timeout;
-        let mut bad_ctx: Option<String> = None;
-
-        for attempt in 0..=MAX_RETRIES {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-
-            // Acquire a usable execution context, skipping any known-bad one.
-            let exec_ctx = loop {
-                let cur = self.execution_context_id.current();
-                match cur {
-                    Some(c) if bad_ctx.as_ref() != Some(&c) => break c,
-                    _ => {
-                        if let Some(ref c) = cur {
-                            self.execution_context_id.invalidate(c);
-                        }
-                        if Instant::now() >= deadline {
-                            return Err(ProtocolError::timeout_msg(
-                                "Runtime.evaluate",
-                                "timed out waiting for execution context",
-                            ));
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                }
-            };
-
-            let now = Instant::now();
-            let remaining = deadline.saturating_duration_since(now);
-            if remaining.is_zero() {
-                break;
-            }
-
-            match self.session().send_with_timeout(
-                "Runtime.evaluate",
-                json!({
-                    "expression": expression,
-                    "returnByValue": true,
-                    "executionContextId": &exec_ctx,
-                }),
-                remaining,
-            ) {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    let msg = format!("{e}");
-                    let is_ctx_err = is_context_error(&msg);
-                    if attempt < MAX_RETRIES && is_ctx_err {
-                        bad_ctx = Some(exec_ctx);
-                        std::thread::sleep(Duration::from_millis(300));
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        Err(ProtocolError::timeout_msg(
-            "Runtime.evaluate",
-            format!("evaluate failed after {MAX_RETRIES} retries"),
-        ))
+        self.evaluate_raw(None, expression, true, timeout)
     }
 
     /// Evaluate a JavaScript expression in the page's MAIN world via an injected `<script>` bridge.
@@ -1672,9 +1648,144 @@ impl MainFrame {
         expression: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, ProtocolError> {
+        self.evaluate_main_world_scoped(None, expression, timeout)
+    }
+
+    pub(crate) fn evaluate_in_frame_raw(
+        &self,
+        frame_id: &str,
+        expression: &str,
+        return_by_value: bool,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.evaluate_raw(Some(frame_id), expression, return_by_value, timeout)
+    }
+
+    fn evaluate_raw(
+        &self,
+        frame_id: Option<&str>,
+        expression: &str,
+        return_by_value: bool,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        const MAX_RETRIES: u32 = 5;
+        let deadline = Instant::now() + timeout;
+        let mut bad_ctx: Option<String> = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            let exec_ctx = loop {
+                if self.connection.rejects_sends() || self.session().is_closed() {
+                    return Err(ProtocolError::closed(Some("Runtime.evaluate".into())));
+                }
+                let tracker = match frame_id {
+                    Some(id) => self.frame_ctx(id).ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorKind::FrameDetached,
+                            Some("Runtime.evaluate".into()),
+                            "frame was detached",
+                        )
+                    })?,
+                    None => Arc::clone(&self.execution_context_id),
+                };
+                let cur = tracker.current();
+                match cur {
+                    Some(c) if bad_ctx.as_ref() != Some(&c) => break c,
+                    _ => {
+                        if let Some(ref c) = cur {
+                            tracker.invalidate(c);
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(ProtocolError::timeout_msg(
+                                "Runtime.evaluate",
+                                "timed out waiting for execution context",
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(if frame_id.is_none() {
+                            100
+                        } else {
+                            50
+                        }));
+                    }
+                }
+            };
+
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                break;
+            }
+
+            match self.session().send_with_timeout(
+                "Runtime.evaluate",
+                json!({
+                    "expression": expression,
+                    "returnByValue": return_by_value,
+                    "executionContextId": &exec_ctx,
+                }),
+                remaining,
+            ) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let is_ctx_err = is_context_error(&msg);
+                    if attempt < MAX_RETRIES && is_ctx_err {
+                        bad_ctx = Some(exec_ctx);
+                        std::thread::sleep(Duration::from_millis(if frame_id.is_none() {
+                            300
+                        } else {
+                            150
+                        }));
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(ProtocolError::timeout_msg(
+            "Runtime.evaluate",
+            format!("evaluate failed after {MAX_RETRIES} retries"),
+        ))
+    }
+
+    /// Evaluate a JavaScript expression inside a specific frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProtocolError`] if waiting for the frame context times out or evaluation fails.
+    pub fn evaluate_in_frame(
+        &self,
+        frame_id: &str,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.evaluate_in_frame_raw(frame_id, expression, true, timeout)
+    }
+
+    /// Evaluate a JavaScript expression in a frame's MAIN world via an injected `<script>` bridge.
+    pub fn evaluate_main_world_in_frame(
+        &self,
+        frame_id: &str,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.evaluate_main_world_scoped(Some(frame_id), expression, timeout)
+    }
+
+    fn evaluate_main_world_scoped(
+        &self,
+        frame_id: Option<&str>,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
         let token = generate_main_world_token();
         let snippet = build_evaluate_main_world_snippet(expression, &token);
-        let raw = self.evaluate(&snippet, timeout)?;
+        let raw = self.evaluate_raw(frame_id, &snippet, true, timeout)?;
 
         let envelope_val = raw.pointer("/result/value").or_else(|| raw.get("value"));
 
@@ -1714,6 +1825,103 @@ impl MainFrame {
             .unwrap_or(serde_json::Value::Null);
 
         Ok(value)
+    }
+
+    /// Resolve a child frame matching `iframe_selector` inside `parent_frame_id`.
+    ///
+    /// Returns the child frame ID, without measuring geometry.
+    pub fn resolve_child_frame(
+        &self,
+        parent_frame_id: &str,
+        iframe_selector: &str,
+        timeout: Duration,
+    ) -> Result<String, ProtocolError> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = Instant::now() + timeout;
+        let q = js_query(iframe_selector);
+
+        let rem = deadline.saturating_duration_since(Instant::now());
+        let prefix = |mut e: ProtocolError| {
+            e.message = format!("--frame {iframe_selector}: {}", e.message);
+            e
+        };
+        let obj_raw = self
+            .evaluate_in_frame_raw(parent_frame_id, &q, false, rem)
+            .map_err(prefix)?;
+        if let Some(exc) = obj_raw.get("exceptionDetails") {
+            let error = crate::api::selectors::selector_exception(exc);
+            return Err(prefix(error));
+        }
+        let object_id = match obj_raw.pointer("/result/objectId").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::FrameNotFound,
+                    Some("Runtime.evaluate".into()),
+                    format!("--frame {iframe_selector}: no element matches"),
+                ));
+            }
+        };
+
+        let desc = self.session().send_with_timeout(
+            "Page.describeNode",
+            json!({"frameId": parent_frame_id, "objectId": object_id}),
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        // Release the remote handle. Juggler requires the owning context id;
+        // without it the call fails and the handle leaks in the page.
+        if let Some(ctx_id) = self.frame_ctx(parent_frame_id).and_then(|t| t.current()) {
+            let _ = self.session().send_with_timeout(
+                "Runtime.disposeObject",
+                json!({"executionContextId": ctx_id, "objectId": object_id}),
+                deadline.saturating_duration_since(Instant::now()),
+            );
+        }
+        let desc = desc.map_err(|mut e| {
+            e.message = format!("--frame {iframe_selector}: {}", e.message);
+            e
+        })?;
+
+        let child_frame_id = match desc.get("contentFrameId").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::NotIframe,
+                    Some("Page.describeNode".into()),
+                    format!("--frame {iframe_selector}: element is not an iframe"),
+                ));
+            }
+        };
+
+        // 3. Wait (bounded by remaining timeout) until child frame tracker has a current context
+        loop {
+            if self.connection.rejects_sends() || self.session().is_closed() {
+                return Err(ProtocolError::closed_with(
+                    "Runtime.evaluate",
+                    format!("--frame {iframe_selector}: Session closed"),
+                ));
+            }
+            if let Some(tracker) = self.frame_ctx(&child_frame_id) {
+                if tracker.current().is_some() {
+                    break;
+                }
+            } else {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::FrameDetached,
+                    Some("Runtime.evaluate".into()),
+                    format!("--frame {iframe_selector}: frame was detached"),
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(ProtocolError::timeout_msg(
+                    "Runtime.evaluate",
+                    format!("--frame {iframe_selector}: frame has no JavaScript context yet"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        Ok(child_frame_id)
     }
 
     /// Call a JavaScript function with arguments.
@@ -2120,7 +2328,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 
 /// Context error detection helper for evaluate retry logic (D10.2).
 pub(crate) fn is_context_error(msg: &str) -> bool {
-    msg.contains("execution context") || msg.contains("Failed to find")
+    msg.to_ascii_lowercase().contains("execution context") || msg.contains("Failed to find")
 }
 
 static MAIN_WORLD_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2633,6 +2841,87 @@ mod tests {
             in_tx,
             out_rx,
             closed,
+        }
+    }
+
+    #[test]
+    fn context_wait_returns_closed_promptly_when_connection_closes() {
+        let h = build_mock_frame("closing", "main");
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let evaluate = scope.spawn(|| h.frame.evaluate("1", Duration::from_secs(3)));
+            std::thread::sleep(Duration::from_millis(50));
+            h.conn.close().unwrap();
+            let error = evaluate.join().unwrap().unwrap_err();
+            assert_eq!(error.kind, ProtocolErrorKind::Closed, "{error}");
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+        });
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn frame_describe_failure_preserves_error_and_evaluate_method() {
+        for fail_evaluate in [false, true] {
+            let h = build_mock_frame("errors", "main");
+            h.frame.execution_context_handle().on_created("ctx".into());
+            let tx = h.in_tx.clone();
+            let rx = h.out_rx;
+            let responder = std::thread::spawn(move || loop {
+                let sent = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let method = sent["method"].as_str().unwrap();
+                let (result, error) = match method {
+                    "Runtime.evaluate" if fail_evaluate => {
+                        (Some(json!({"exceptionDetails":{"value":42}})), None)
+                    }
+                    "Runtime.evaluate" if sent["params"]["returnByValue"] == true => {
+                        (Some(json!({"result":{"value":[0,0,1,1]}})), None)
+                    }
+                    "Runtime.evaluate" => (Some(json!({"result":{"objectId":"obj"}})), None),
+                    "Page.describeNode" => (
+                        None,
+                        Some(crate::protocol::types::ErrorData {
+                            message: "session was closed".into(),
+                            data: None,
+                        }),
+                    ),
+                    "Runtime.disposeObject" => (Some(json!({})), None),
+                    _ => panic!("unexpected {method}"),
+                };
+                let done = fail_evaluate || method == "Runtime.disposeObject";
+                tx.send(RawMessage {
+                    id: sent["id"].as_i64(),
+                    method: None,
+                    params: None,
+                    result,
+                    error,
+                    session_id: Some("errors".into()),
+                })
+                .unwrap();
+                if done {
+                    break;
+                }
+            });
+            let err = h
+                .frame
+                .resolve_child_frame("main", "#frame", Duration::from_secs(2))
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("--frame #frame:"), "{msg}");
+            assert!(!msg.contains("not an iframe"), "{msg}");
+            if fail_evaluate {
+                assert!(
+                    msg.contains("Runtime.evaluate") && msg.contains("42"),
+                    "{msg}"
+                );
+            } else {
+                assert!(msg.contains("session was closed"), "{msg}");
+            }
+            responder.join().unwrap();
+            h.closed.store(true, Ordering::SeqCst);
         }
     }
 

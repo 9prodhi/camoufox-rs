@@ -367,6 +367,7 @@ pub struct MainFrame {
     execution_context_id: Arc<ExecContextTracker>,
     /// Shared connection — used for `on_event` subscriptions (e.g. lifecycle wait).
     connection: Arc<Connection>,
+    dialog: Arc<crate::api::dialog::DialogTracker>,
     /// RAII guards for event subscriptions owned by this frame (e.g. executionContextCreated/Destroyed).
     _context_guards: Vec<SubscriptionGuard>,
 }
@@ -379,9 +380,13 @@ impl MainFrame {
         frame_id: String,
         execution_context_id: Arc<ExecContextTracker>,
         connection: Arc<Connection>,
-        context_guards: Vec<SubscriptionGuard>,
+        mut context_guards: Vec<SubscriptionGuard>,
+        dialog_policy: crate::api::dialog::DialogPolicy,
     ) -> Self {
+        let dialog = crate::api::dialog::DialogTracker::new(dialog_policy);
+        context_guards.extend(dialog.install(&connection, &session));
         MainFrame {
+            dialog,
             session,
             target_id,
             frame_id,
@@ -389,6 +394,21 @@ impl MainFrame {
             connection,
             _context_guards: context_guards,
         }
+    }
+
+    /// Currently open JavaScript dialog, if any.
+    pub fn pending_dialog(&self) -> Option<crate::api::dialog::DialogInfo> {
+        self.dialog.pending()
+    }
+
+    /// Most recently closed JavaScript dialog, if any.
+    pub fn last_dialog(&self) -> Option<crate::api::dialog::DialogInfo> {
+        self.dialog.last()
+    }
+
+    /// Set the policy for subsequently opened dialogs.
+    pub fn set_dialog_policy(&self, policy: crate::api::dialog::DialogPolicy) {
+        self.dialog.set_policy(policy);
     }
 
     /// Returns the target ID for this page.
@@ -1023,6 +1043,7 @@ impl MainFrame {
                     ProtocolErrorKind::NavigationBecameDownload
                         | ProtocolErrorKind::Timeout
                         | ProtocolErrorKind::Response
+                        | ProtocolErrorKind::DialogOpened
                 ) =>
             {
                 self.execution_context_id.abort_navigation(nav_token);
@@ -1455,7 +1476,9 @@ impl MainFrame {
             if let Some(text) = prompt_text {
                 params["promptText"] = json!(text);
             }
-            s.send_may_fail("Page.handleDialog", params);
+            if s.send_may_fail("Page.handleDialog", params).is_some() {
+                self.dialog.clear(dialog_id);
+            }
         }
     }
 
@@ -2383,6 +2406,7 @@ mod tests {
             exec_ctx,
             StdArc::clone(&conn_arc),
             Vec::new(),
+            crate::api::DialogPolicy::Manual,
         );
 
         let start = Instant::now();
@@ -2539,6 +2563,7 @@ mod tests {
             StdArc::clone(&exec_ctx),
             StdArc::clone(&conn_arc),
             Vec::new(),
+            crate::api::DialogPolicy::Manual,
         );
 
         MockFrameHarness {
@@ -2548,6 +2573,113 @@ mod tests {
             out_rx,
             closed,
         }
+    }
+
+    fn dialog_event(method: &str, params: serde_json::Value) -> RawMessage {
+        RawMessage {
+            id: None,
+            method: Some(method.into()),
+            params: Some(params),
+            result: None,
+            error: None,
+            session_id: Some("page-d".into()),
+        }
+    }
+
+    #[test]
+    fn dialog_opened_sets_pending_and_rejects_in_flight() {
+        let h = build_mock_frame("page-d", "frame-d");
+        std::thread::scope(|s| {
+            let request = s.spawn(|| {
+                h.frame.navigate(
+                    "http://localhost/",
+                    Default::default(),
+                    Duration::from_secs(5),
+                )
+            });
+            h.out_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            h.in_tx
+                .send(dialog_event(
+                    "Page.dialogOpened",
+                    json!({"dialogId":"d1","type":"confirm","message":"Delete?"}),
+                ))
+                .unwrap();
+            let err = request.join().unwrap().unwrap_err();
+            assert_eq!(err.kind, ProtocolErrorKind::DialogOpened);
+            assert!(err.message.contains("Delete?"));
+        });
+        assert_eq!(h.frame.pending_dialog().unwrap().kind, "confirm");
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn dialog_closed_clears_pending() {
+        let h = build_mock_frame("page-d", "frame-d");
+        h.in_tx
+            .send(dialog_event(
+                "Page.dialogOpened",
+                json!({"dialogId":"d1","type":"alert","message":"hi"}),
+            ))
+            .unwrap();
+        h.in_tx
+            .send(dialog_event("Page.dialogClosed", json!({"dialogId":"d1"})))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while h.frame.last_dialog().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(h.frame.pending_dialog().is_none());
+        assert_eq!(h.frame.last_dialog().unwrap().id, "d1");
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn accept_policy_sends_handle_dialog_off_reader_thread() {
+        let h = build_mock_frame("page-d", "frame-d");
+        h.frame.set_dialog_policy(crate::api::DialogPolicy::Accept);
+        h.in_tx
+            .send(dialog_event(
+                "Page.dialogOpened",
+                json!({"dialogId":"d1","type":"prompt","message":"Name?","defaultValue":"Joe"}),
+            ))
+            .unwrap();
+        let sent = h.out_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(sent["method"], "Page.handleDialog");
+        assert_eq!(
+            sent["params"],
+            json!({"dialogId":"d1","accept":true,"promptText":"Joe"})
+        );
+        h.in_tx
+            .send(dialog_event("Page.dialogClosed", json!({"dialogId":"d1"})))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while h.frame.last_dialog().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(h.frame.last_dialog().unwrap().id, "d1");
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn dialog_listeners_removed_when_frame_dropped() {
+        let h = build_mock_frame("page-d", "frame-d");
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-d", "Page.dialogOpened"),
+            1
+        );
+        drop(h.frame);
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-d", "Page.dialogOpened"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-d", "Page.dialogClosed"),
+            0
+        );
+        h.closed.store(true, Ordering::SeqCst);
     }
 
     /// Helper: build a `Page.navigate` success response for a given request id.

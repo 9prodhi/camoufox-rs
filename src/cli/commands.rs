@@ -2,7 +2,32 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Action to take on an open JavaScript dialog.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum DialogAction {
+    Accept,
+    Dismiss,
+}
+
+/// Automatic JavaScript dialog handling.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum DialogMode {
+    Manual,
+    Accept,
+    Dismiss,
+}
+
+impl From<DialogMode> for crate::api::DialogPolicy {
+    fn from(value: DialogMode) -> Self {
+        match value {
+            DialogMode::Manual => Self::Manual,
+            DialogMode::Accept => Self::Accept,
+            DialogMode::Dismiss => Self::Dismiss,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "camoufox", about = "CLI for Camoufox browser automation")]
@@ -40,6 +65,19 @@ pub enum Command {
         /// Disable page Content-Security-Policy (needed for --main-world on strict-CSP sites; detectable by pages)
         #[arg(long)]
         bypass_csp: bool,
+        /// JavaScript dialog handling policy.
+        #[arg(long, value_enum, default_value = "manual")]
+        dialogs: DialogMode,
+    },
+
+    /// Accept or dismiss an open JavaScript dialog.
+    Dialog {
+        instance_id: String,
+        page_id: String,
+        #[arg(value_enum)]
+        action: DialogAction,
+        #[arg(long)]
+        text: Option<String>,
     },
 
     /// List all running browser instances.

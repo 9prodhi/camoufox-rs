@@ -278,7 +278,20 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
         DaemonRequest::Ping => DaemonResponse::ok(json!({"instance_count": mgr.instance_count()})),
         DaemonRequest::List => DaemonResponse::ok(json!({"instances": mgr.list()})),
         DaemonRequest::Shutdown => DaemonResponse::ok_empty(),
-        DaemonRequest::Launch { headless, executable } => respond(mgr.launch_with(&LaunchOptions { headless, executable }).map(|(instance_id, version, pid)| json!({"instance_id": instance_id, "version": version, "pid": pid}))),
+        DaemonRequest::Launch {
+            headless,
+            executable,
+            bypass_csp,
+        } => respond(
+            mgr.launch_with(&LaunchOptions {
+                headless,
+                executable,
+                bypass_csp,
+            })
+            .map(|(instance_id, version, pid)| {
+                json!({"instance_id": instance_id, "version": version, "pid": pid})
+            }),
+        ),
         DaemonRequest::Stop { instance_id } => respond(mgr.stop(&instance_id)),
         DaemonRequest::NewPage { instance_id } => respond(mgr.new_page(&instance_id).map(|page_id| json!({"page_id": page_id}))),
         DaemonRequest::Navigate { instance_id, page_id, url, wait_until, .. } => respond(mgr.navigate(&instance_id, &page_id, &url, timeout, wait_until.as_deref()).map(|o| json!({"navigation_id": o.nav_id, "status_code": o.status_code}))),

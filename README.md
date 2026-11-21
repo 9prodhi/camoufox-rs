@@ -77,7 +77,14 @@ cargo run --features cli --bin camoufox -- evaluate --main-world <instance_id> <
 ```
 
 `--main-world` injects a `<script>` into the page, so it accepts synchronous expressions only,
-the page can observe it, and a strict Content-Security-Policy blocks it (you get an error).
+the page can observe it, and a strict Content-Security-Policy blocks it (reporting a hint to relaunch with `--bypass-csp`).
+For pages with strict CSP that prohibit inline scripts without nonces, launch the browser instance with `--bypass-csp`:
+
+```bash
+cargo run --features cli --bin camoufox -- launch --bypass-csp
+```
+
+Note: `--bypass-csp` disables Content-Security-Policy at the browser context level and is detectable by pages. For nonce-protected pages, bridge v2 automatically borrows an existing script's nonce attribute from the DOM, allowing main-world evaluation to succeed without `--bypass-csp`.
 
 Navigate with wait-until and status_code:
 

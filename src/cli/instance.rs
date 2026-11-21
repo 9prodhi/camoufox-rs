@@ -4,7 +4,7 @@
 //! context, and pages. The `InstanceManager` provides the high-level
 //! operations that CLI commands map to.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -310,15 +310,40 @@ pub struct Instance {
     pub pid: u32,
     _profile_dir: tempfile::TempDir,
     pages: HashMap<String, ManagedMainFrame>,
+    closed_pages: HashSet<String>,
+    closed_pages_order: VecDeque<String>,
     page_counter: u32,
     close_timeout: Duration,
+    registry: Arc<crate::api::page_registry::PageRegistry>,
 }
 
 impl Instance {
+    fn record_closed_page(&mut self, id: String) {
+        if self.closed_pages.insert(id.clone()) {
+            self.closed_pages_order.push_back(id);
+            if self.closed_pages_order.len() > 1024 {
+                if let Some(old) = self.closed_pages_order.pop_front() {
+                    self.closed_pages.remove(&old);
+                }
+            }
+        }
+    }
+
     fn page_any(&self, id: &str) -> Result<&ManagedMainFrame, String> {
-        self.pages
+        if self.closed_pages.contains(id) {
+            return Err(format!("page {id} was closed"));
+        }
+        let mp = self
+            .pages
             .get(id)
-            .ok_or_else(|| format!("page {id} not found"))
+            .ok_or_else(|| format!("page {id} not found"))?;
+        if mp.main_frame.is_crashed() {
+            return Err(format!("page {id} crashed"));
+        }
+        if mp.main_frame.is_closed() || self.registry.is_detached(mp.main_frame.target_id()) {
+            return Err(format!("page {id} was closed"));
+        }
+        Ok(mp)
     }
 
     fn page(&self, id: &str) -> Result<&ManagedMainFrame, String> {
@@ -327,6 +352,34 @@ impl Instance {
             return Err(format!("page {id} has an open {} dialog: {:?} — run `camoufox dialog {} {id} accept|dismiss [--text T]`", info.kind, info.message, self.instance_id));
         }
         Ok(page)
+    }
+
+    /// Adopt any ready popups opened by this instance's pages.
+    pub fn adopt_popups(&mut self, context: &crate::api::BrowserContext) {
+        let mut closed_ids = Vec::new();
+        for (page_id, mp) in &self.pages {
+            if mp.main_frame.is_closed() || self.registry.is_detached(mp.main_frame.target_id()) {
+                closed_ids.push(page_id.clone());
+            }
+        }
+        for id in closed_ids {
+            self.pages.remove(&id);
+            self.record_closed_page(id);
+        }
+
+        let policy = context.dialog_policy();
+        for main_frame in context.take_popups() {
+            main_frame.set_dialog_policy(policy);
+            self.page_counter += 1;
+            let page_id = format!("p{}", self.page_counter);
+            self.pages.insert(
+                page_id,
+                ManagedMainFrame {
+                    main_frame,
+                    headers: Vec::new(),
+                },
+            );
+        }
     }
 
     fn page_mut(&mut self, id: &str) -> Result<&mut ManagedMainFrame, String> {
@@ -339,7 +392,10 @@ impl Instance {
     /// Look up the CLI page ID (e.g. "p1") whose main frame target ID matches `target_id`.
     pub fn page_id_for_target(&self, target_id: &str) -> Option<String> {
         self.pages.iter().find_map(|(page_id, mp)| {
-            if mp.main_frame.target_id() == target_id {
+            if mp.main_frame.target_id() == target_id
+                && !mp.main_frame.is_closed()
+                && !self.registry.is_detached(target_id)
+            {
                 Some(page_id.clone())
             } else {
                 None
@@ -944,14 +1000,23 @@ impl Instance {
         self.page_ids()
             .into_iter()
             .map(|page_id| {
-                let dialog = self
-                    .page_any(&page_id)
-                    .ok()
-                    .and_then(|p| p.main_frame.pending_dialog());
+                // Metadata remains available even when page_any rejects commands
+                // because the renderer crashed.
+                let mp = self.pages.get(&page_id);
+                let dialog = mp.as_ref().and_then(|p| p.main_frame.pending_dialog());
+                let opener = mp.as_ref().and_then(|p| {
+                    p.main_frame
+                        .opener_id()
+                        .and_then(|tid| self.page_id_for_target(tid))
+                });
                 let mut tab = match self.url(&page_id, timeout) {
                     Ok((url, title)) => json!({"page_id": page_id, "url": url, "title": title}),
                     Err(_) => json!({"page_id": page_id, "url": null, "title": null}),
                 };
+                tab["opener"] = json!(opener);
+                if mp.is_some_and(|p| p.main_frame.is_crashed()) {
+                    tab["crashed"] = json!(true);
+                }
                 if let Some(dialog) = dialog {
                     tab["dialog"] = json!(dialog);
                 }
@@ -962,10 +1027,21 @@ impl Instance {
 
     /// Close a page and forget it.
     pub fn close_tab(&mut self, page_id: &str) -> Result<(), String> {
+        if self.closed_pages.contains(page_id) {
+            return Err(format!("page {page_id} was closed"));
+        }
         let mp = self
             .pages
             .remove(page_id)
             .ok_or_else(|| format!("page {page_id} not found"))?;
+        self.record_closed_page(page_id.to_string());
+        if mp.main_frame.is_crashed() {
+            let _ = mp.main_frame.close();
+            return Ok(());
+        }
+        if mp.main_frame.is_closed() || self.registry.is_detached(mp.main_frame.target_id()) {
+            return Err(format!("page {page_id} was closed"));
+        }
         mp.main_frame
             .close()
             .map_err(|e| format!("close tab failed: {e}"))
@@ -1109,9 +1185,16 @@ impl Instance {
         Ok((bytes, out_path, rect))
     }
 
-    /// Get page IDs.
+    /// Get page IDs for active (non-detached) pages.
     pub fn page_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.pages.keys().cloned().collect();
+        let mut ids: Vec<String> = self
+            .pages
+            .iter()
+            .filter(|(_, mp)| {
+                !mp.main_frame.is_closed() && !self.registry.is_detached(mp.main_frame.target_id())
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
         ids.sort();
         ids
     }
@@ -1288,8 +1371,11 @@ impl InstanceManager {
             pid,
             _profile_dir: profile_dir,
             pages: HashMap::new(),
+            closed_pages: HashSet::new(),
+            closed_pages_order: VecDeque::new(),
             page_counter: 0,
             close_timeout: config.close_timeout,
+            registry: Arc::clone(context.registry()),
         };
 
         let mut instances = self
@@ -1471,7 +1557,9 @@ impl InstanceManager {
         let ManagedInstance {
             instance, context, ..
         } = &mut *entry;
-        f(instance.as_mut().ok_or_else(|| Self::missing(id))?, context)
+        let inst = instance.as_mut().ok_or_else(|| Self::missing(id))?;
+        inst.adopt_popups(context);
+        f(inst, context)
     }
 
     /// Access the download log for an instance without locking the instance.
@@ -2169,5 +2257,132 @@ mod tests {
         assert!(res
             .unwrap_err()
             .contains("--downloads-dir must be an absolute path"));
+    }
+    #[test]
+    fn s6_crashed_tab_is_listed_and_close_succeeds_best_effort() {
+        use crate::protocol::RawMessage;
+        use crate::transport::errors::TransportError;
+        use crate::transport::{Transport, TransportReader, TransportWriter};
+        use std::sync::mpsc;
+
+        struct Writer {
+            incoming: Option<mpsc::Sender<RawMessage>>,
+            records: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+        impl TransportWriter for Writer {
+            fn send(&mut self, value: &serde_json::Value) -> Result<(), TransportError> {
+                self.records.lock().unwrap().push(value.clone());
+                // Bootstrap responses; crashed-page close deliberately gets none.
+                if value["method"] != "Page.close" {
+                    self.incoming
+                        .as_ref()
+                        .unwrap()
+                        .send(RawMessage {
+                            id: value["id"].as_i64(),
+                            result: Some(json!({})),
+                            method: None,
+                            params: None,
+                            error: None,
+                            session_id: None,
+                        })
+                        .unwrap();
+                }
+                Ok(())
+            }
+            fn close(&mut self) -> Result<(), TransportError> {
+                self.incoming.take();
+                Ok(())
+            }
+            fn is_closed(&self) -> bool {
+                self.incoming.is_none()
+            }
+        }
+        struct Reader(mpsc::Receiver<RawMessage>);
+        impl TransportReader for Reader {
+            fn receive(&mut self) -> Result<RawMessage, TransportError> {
+                self.0.recv().map_err(|_| TransportError::Closed)
+            }
+            fn is_closed(&self) -> bool {
+                false
+            }
+        }
+        struct MockTransport(Writer, Reader);
+        impl Transport for MockTransport {
+            fn into_split(self: Box<Self>) -> (Box<dyn TransportWriter>, Box<dyn TransportReader>) {
+                (Box::new(self.0), Box::new(self.1))
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let connection = Connection::new(Box::new(MockTransport(
+            Writer {
+                incoming: Some(tx.clone()),
+                records: records.clone(),
+            },
+            Reader(rx),
+        )));
+        let root = connection.root_session();
+        let browser = Browser::connect(connection, root, BrowserOptions::default()).unwrap();
+        let conn = browser.connection().clone();
+        let context =
+            crate::api::BrowserContext::new("ctx".into(), &conn.root_session(), conn.clone());
+        tx.send(RawMessage { id: None, method: Some("Browser.attachedToTarget".into()), params: Some(json!({ "sessionId": "s", "targetInfo": { "type": "page", "targetId": "t", "browserContextId": "ctx" } })), result: None, error: None, session_id: None }).unwrap();
+        tx.send(RawMessage {
+            id: None,
+            method: Some("Page.frameAttached".into()),
+            params: Some(json!({ "frameId": "f" })),
+            result: None,
+            error: None,
+            session_id: Some("s".into()),
+        })
+        .unwrap();
+        let page = context
+            .registry()
+            .claim("t", Duration::from_secs(2))
+            .unwrap();
+        let main_frame =
+            MainFrame::from_tracked(page, conn.clone(), context.registry().clone()).unwrap();
+        conn.create_session("s".into()).mark_crashed();
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        let mut instance = Instance {
+            instance_id: "test".into(),
+            browser,
+            child,
+            version: None,
+            pid: 0,
+            _profile_dir: tempfile::tempdir().unwrap(),
+            pages: HashMap::from([(
+                "p1".into(),
+                ManagedMainFrame {
+                    main_frame,
+                    headers: Vec::new(),
+                },
+            )]),
+            closed_pages: HashSet::new(),
+            closed_pages_order: VecDeque::new(),
+            page_counter: 1,
+            close_timeout: Duration::from_millis(100),
+            registry: context.registry().clone(),
+        };
+        instance.adopt_popups(&context);
+        assert_eq!(instance.page_ids(), vec!["p1"]);
+        assert_eq!(instance.page_any("p1").err().unwrap(), "page p1 crashed");
+        let tabs = instance.tabs(Duration::from_millis(100));
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0]["crashed"], true);
+        assert!(tabs[0]["url"].is_null());
+        assert!(instance.close_tab("p1").is_ok());
+        assert!(instance.page_ids().is_empty());
+        assert_eq!(instance.page_any("p1").err().unwrap(), "page p1 was closed");
+        assert!(records
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["method"] == "Page.close" && v["sessionId"] == "s"));
+        drop(instance);
+        drop(context);
+        drop(tx);
+        drop(conn);
     }
 }

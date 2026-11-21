@@ -6,15 +6,14 @@
 //! [`Browser::new_context`](crate::api::browser::Browser::new_context)
 //! and destroyed via [`BrowserContext::close`].
 
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::api::browser::{Connection, ProxyConfig, Session};
-use crate::api::exec_ctx::ExecContextTracker;
-use crate::api::main_frame::{MainFrame, SubscriptionGuard};
+use crate::api::main_frame::MainFrame;
 use crate::protocol::errors::ProtocolError;
 
 // ---------------------------------------------------------------------------
@@ -254,24 +253,7 @@ pub struct BrowserContext {
     session: Session,
     /// Shared connection reference.
     connection: Arc<Connection>,
-    dialog_policy: Mutex<crate::api::DialogPolicy>,
-}
-
-/// A `Runtime.executionContextCreated` event captured by the Layer-3
-/// listener before `session_id` and/or `frame_id` are known.
-///
-/// Used by `BrowserContext::new_main_frame` to close the
-/// `frameAttached`/`executionContextCreated` event-ordering race: while the
-/// listener cannot yet filter (because the IDs to filter on are not yet
-/// resolved), it appends candidate events here. After Layer 2 resolves,
-/// the main function drains this buffer under the same lock the listener
-/// uses, applies the final filter, and updates the cached exec-ctx with
-/// the last matching entry.
-struct BufferedContext {
-    session_id: String,
-    frame_id: String,
-    exec_ctx_id: String,
-    is_main_world: bool,
+    registry: Arc<crate::api::page_registry::PageRegistry>,
 }
 
 impl BrowserContext {
@@ -280,20 +262,49 @@ impl BrowserContext {
     /// This is an internal constructor. External users should use
     /// [`Browser::new_context`](crate::api::browser::Browser::new_context).
     pub(crate) fn new(context_id: String, session: &Session, connection: Arc<Connection>) -> Self {
+        let registry = crate::api::page_registry::PageRegistry::install(
+            &connection,
+            &context_id,
+            crate::api::DialogPolicy::Manual,
+        );
         BrowserContext {
             context_id,
             session: session.clone(),
             connection,
-            dialog_policy: Mutex::new(crate::api::DialogPolicy::Manual),
+            registry,
         }
+    }
+
+    /// Access the persistent page registry for this context.
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) fn registry(&self) -> &Arc<crate::api::page_registry::PageRegistry> {
+        &self.registry
+    }
+
+    /// Current dialog policy.
+    pub fn dialog_policy(&self) -> crate::api::DialogPolicy {
+        self.registry.dialog_policy()
     }
 
     /// Set the policy used for newly created pages.
     pub fn set_dialog_policy(&self, policy: crate::api::DialogPolicy) {
-        *self
-            .dialog_policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
+        self.registry.set_dialog_policy(policy);
+    }
+
+    /// Return all popups opened by pages in this context.
+    pub fn take_popups(&self) -> Vec<MainFrame> {
+        self.registry
+            .take_popups()
+            .into_iter()
+            .filter_map(|tracked| {
+                MainFrame::from_tracked(
+                    tracked,
+                    Arc::clone(&self.connection),
+                    Arc::clone(&self.registry),
+                )
+                .ok()
+            })
+            .collect()
     }
 
     /// Returns the context ID assigned by the browser.
@@ -563,8 +574,7 @@ impl BrowserContext {
         Ok(())
     }
 
-    /// Timeout for waiting on `Browser.attachedToTarget` (Layer 1) and on
-    /// the main frame's `Page.frameAttached` event (Layer 2).
+    /// Timeout for waiting on target attach and main frame attach.
     #[cfg(not(test))]
     const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
     #[cfg(test)]
@@ -572,375 +582,51 @@ impl BrowserContext {
 
     /// Create a new page and return a fully-wired [`MainFrame`].
     ///
-    /// Sends `Browser.newPage`, waits for a `Browser.attachedToTarget` event
-    /// **filtered to `targetInfo.type == "page"`** (Layer 1 fix), waits for a
-    /// `Page.frameAttached` event on the new session whose `parentFrameId`
-    /// is empty/absent (Layer 2 fix — hybrid fallback because
-    /// `Page.getFrameTree` is not supported in this Camoufox build), and
-    /// subscribes a `Runtime.executionContextCreated` listener **filtered to
-    /// `auxData.frameId == frame_id` and `auxData.name == ""`** (Layer 3 fix).
-    /// Together these make it structurally impossible for the returned
-    /// `MainFrame` to refer to a sub-frame.
-    ///
-    /// All three listeners are registered BEFORE `Browser.newPage` is sent
-    /// so no protocol events can be missed. The Layer-3 listener buffers
-    /// `Runtime.executionContextCreated` events until both `session_id`
-    /// (Layer 1) and `frame_id` (Layer 2) are known, then filters and
-    /// either drops them or promotes the last matching one into the cache.
-    ///
-    /// # Errors
-    ///
-    /// - `"timeout waiting for type=='page' attach …"` — `ATTACH_TIMEOUT`
-    ///   elapsed and no matching `Browser.attachedToTarget` was seen. The
-    ///   error message lists any skipped attaches (up to 16) for triage.
-    /// - `"timeout waiting for main frame attach …"` — `ATTACH_TIMEOUT`
-    ///   elapsed and no `Page.frameAttached` with `parentFrameId` absent
-    ///   was seen on the page session.
-    #[allow(clippy::type_complexity)]
+    /// Marks that a page creation is in flight, sends `Browser.newPage`,
+    /// claims the target from the registry (waiting for its main frame attach),
+    /// and constructs the `MainFrame`.
     pub fn new_main_frame(&self) -> Result<MainFrame, ProtocolError> {
-        const MAX_SKIPPED_ATTACHES: usize = 16;
-        let conn = &self.connection;
-
-        // === Layer 1 fix: only signal on type == "page" attaches. ===
-        //
-        // Listener registered BEFORE Browser.newPage to avoid missing the
-        // event. Skipped attaches go into a bounded Vec for the timeout
-        // diagnostic.
-        let (attach_tx, attach_rx) = mpsc::channel::<(String, String)>();
-        let skipped: Arc<Mutex<Vec<(String, Option<String>)>>> =
-            Arc::new(Mutex::new(Vec::with_capacity(MAX_SKIPPED_ATTACHES)));
-        let skipped_clone = Arc::clone(&skipped);
-        let attach_id = conn.on_event(
-            "",
-            "Browser.attachedToTarget",
-            Arc::new(move |event| {
-                let ti = event.params.get("targetInfo");
-                let t_type = ti
-                    .and_then(|v| v.get("type"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let t_url = ti
-                    .and_then(|v| v.get("url"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_owned());
-
-                if t_type == "page" {
-                    let session_id = event
-                        .params
-                        .get("sessionId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    let target_id = ti
-                        .and_then(|v| v.get("targetId"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    let _ = attach_tx.send((session_id, target_id));
-                } else {
-                    let mut s = skipped_clone
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if s.len() < MAX_SKIPPED_ATTACHES {
-                        s.push((t_type.to_owned(), t_url));
-                    }
-                }
-            }),
-        );
-        let _attach_guard = SubscriptionGuard::session(
-            Arc::clone(&self.connection),
-            "",
-            "Browser.attachedToTarget",
-            attach_id,
-        );
-
-        // === Layer 2 fix (hybrid fallback): listen for Page.frameAttached
-        // with no parentFrameId. ===
-        //
-        // Registered BEFORE Browser.newPage. Filtered on receive by
-        // session_id (we don't know the session_id yet at register time).
-        let (frame_tx, frame_rx) = mpsc::channel::<(String, String)>(); // (sid, frame_id)
-        let frame_handler_id = conn.on_event_global(Arc::new(move |event| {
-            if event.method != "Page.frameAttached" {
-                return;
-            }
-            let parent = event
-                .params
-                .get("parentFrameId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !parent.is_empty() {
-                return; // sub-frame; skip
-            }
-            let sid = event.session_id.as_deref().unwrap_or("").to_owned();
-            let fid = event
-                .params
-                .get("frameId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            if !fid.is_empty() {
-                let _ = frame_tx.send((sid, fid));
-            }
-        }));
-        let _frame_guard =
-            SubscriptionGuard::global(Arc::clone(&self.connection), frame_handler_id);
-
-        // === Layer 3 fix: event-buffering listener for
-        // Runtime.executionContextCreated, registered BEFORE Browser.newPage.
-        //
-        // Camoufox/Juggler does NOT formally guarantee event ordering across
-        // `Page.frameAttached` and `Runtime.executionContextCreated`. If the
-        // top-frame exec context arrives before frameAttached, a listener
-        // installed only after Layer 2 resolves would miss it and a caller
-        // doing `evaluate()` without navigating first would hang.
-        //
-        // Strategy: register one global listener up front. While
-        // session_id/frame_id are unknown, buffer candidate events. Once
-        // session_id and frame_id are known, filter directly and update
-        // `exec_ctx` like the old single-filter listener did.
-        //
-        // CRITICAL — deadlock avoidance. Both this listener and the main
-        // function MUST acquire shared mutexes in the same order:
-        //   buffer -> session_id_holder -> frame_id_holder -> exec_ctx
-        let session_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let frame_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let exec_buffer: Arc<Mutex<Vec<BufferedContext>>> = Arc::new(Mutex::new(Vec::new()));
-        let exec_ctx = Arc::new(ExecContextTracker::new());
-
-        // Also register a sibling listener for Runtime.executionContextDestroyed
-        // that clears the cache when the cached context is destroyed. Without
-        // this, evaluate() in this Camoufox version succeeds-with-empty on a
-        // destroyed-but-still-valid stale context (e.g. about:blank just before
-        // a navigation completes), defeating the lazy retry path.
-        let exec_ctx_for_destroyed = Arc::clone(&exec_ctx);
-        let session_holder_for_destroyed = Arc::clone(&session_id_holder);
-        let destroyed_id = conn.on_event_global(Arc::new(move |event| {
-            if event.method != "Runtime.executionContextDestroyed" {
-                return;
-            }
-            let event_sid = event.session_id.as_deref().unwrap_or("");
-            // Only react once we know our session.
-            let our_sid = match session_holder_for_destroyed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-            {
-                Some(s) => s,
-                None => return,
-            };
-            if event_sid != our_sid {
-                return;
-            }
-            let dead = event
-                .params
-                .get("executionContextId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if dead.is_empty() {
-                return;
-            }
-            exec_ctx_for_destroyed.on_destroyed(dead);
-        }));
-        let destroyed_guard = SubscriptionGuard::global(Arc::clone(&self.connection), destroyed_id);
-
-        let session_holder_for_listener = Arc::clone(&session_id_holder);
-        let frame_holder_for_listener = Arc::clone(&frame_id_holder);
-        let buffer_for_listener = Arc::clone(&exec_buffer);
-        let exec_ctx_for_listener = Arc::clone(&exec_ctx);
-        let created_id = conn.on_event_global(Arc::new(move |event| {
-            if event.method != "Runtime.executionContextCreated" {
-                return;
-            }
-            let event_sid = event.session_id.as_deref().unwrap_or("").to_owned();
-            let aux = event.params.get("auxData");
-            let event_fid = aux
-                .and_then(|a| a.get("frameId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let is_main_world = aux
-                .and_then(|a| a.get("name"))
-                .and_then(|n| n.as_str())
-                .map(|n| n.is_empty())
-                .unwrap_or(true);
-            let ctx_id = match event
-                .params
-                .get("executionContextId")
-                .and_then(|v| v.as_str())
-            {
-                Some(s) if !s.is_empty() => s.to_owned(),
-                _ => return,
-            };
-
-            // Lock order: buffer -> session_id_holder -> frame_id_holder
-            //   -> exec_ctx.
-            let mut buf = buffer_for_listener
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let known_sid = session_holder_for_listener
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let known_fid = frame_holder_for_listener
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-
-            match (known_sid, known_fid) {
-                (None, _) => {
-                    // Don't know our session yet — buffer and filter later.
-                    buf.push(BufferedContext {
-                        session_id: event_sid,
-                        frame_id: event_fid,
-                        exec_ctx_id: ctx_id,
-                        is_main_world,
-                    });
-                }
-                (Some(sid), _) if sid != event_sid => {
-                    // Other session — noise; drop.
-                }
-                (Some(_), None) => {
-                    // Our session, frame_id not known yet — buffer.
-                    buf.push(BufferedContext {
-                        session_id: event_sid,
-                        frame_id: event_fid,
-                        exec_ctx_id: ctx_id,
-                        is_main_world,
-                    });
-                }
-                (Some(_), Some(fid)) => {
-                    // Both known — apply final filter directly.
-                    if event_fid == fid && is_main_world {
-                        exec_ctx_for_listener.on_created(ctx_id);
-                    }
-                }
-            }
-        }));
-        let created_guard = SubscriptionGuard::global(Arc::clone(&self.connection), created_id);
-
-        // === Send Browser.newPage. ===
-        let result = self.session().send(
+        let mut inflight = self.registry.begin_new_page();
+        let result = match self.session().send(
             "Browser.newPage",
             json!({ "browserContextId": self.context_id }),
-        )?;
-        let expected_target_id = result
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                inflight.mark_failed();
+                return Err(e);
+            }
+        };
+        let target_id = match result
             .get("targetId")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-
-        // === Wait for the page-typed attachedToTarget. ===
-        let deadline = Instant::now() + Self::ATTACH_TIMEOUT;
-        let (session_id, _target_id) = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                let snapshot = skipped.lock().unwrap().clone();
-                let summary: Vec<String> = snapshot
-                    .iter()
-                    .map(|(k, u)| match u {
-                        Some(u) => format!("{{type:'{k}', url:'{u}'}}"),
-                        None => format!("{{type:'{k}'}}"),
-                    })
-                    .collect();
-                let msg = format!(
-                    "timeout waiting for type=='page' attach after {}s; saw {} skipped: [{}]",
-                    Self::ATTACH_TIMEOUT.as_secs(),
-                    snapshot.len(),
-                    summary.join(", "),
-                );
-                return Err(ProtocolError::closed_with("Browser.attachedToTarget", msg));
-            }
-            match attach_rx.recv_timeout(remaining) {
-                Ok((sid, tid))
-                    if !sid.is_empty()
-                        && (expected_target_id.is_empty() || tid == expected_target_id) =>
-                {
-                    break (sid, tid)
-                }
-                Ok(_) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(ProtocolError::closed_with(
-                        "Browser.attachedToTarget",
-                        "attach channel disconnected",
-                    ));
-                }
-            }
-        };
-
-        // === Layer 1 -> Layer 3: publish session_id to the listener.
-        //
-        // Lock order: buffer -> session_id_holder. We don't drain here;
-        // session-only filtering is the listener's responsibility from now
-        // on. We hold the buffer lock to avoid TOCTOU with the listener.
+            .filter(|s| !s.is_empty())
         {
-            let _buf = exec_buffer.lock().unwrap();
-            *session_id_holder.lock().unwrap() = Some(session_id.clone());
-        }
-
-        // === Build the page session. ===
-        let page_session = conn.create_session(session_id.clone());
-
-        // === Layer 2 fix: wait for the top-frame Page.frameAttached. ===
-        let frame_deadline = Instant::now() + Self::ATTACH_TIMEOUT;
-        let frame_id = loop {
-            let remaining = frame_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            Some(tid) => tid.to_owned(),
+            None => {
+                inflight.mark_failed();
                 return Err(ProtocolError::closed_with(
-                    "Page.frameAttached",
-                    format!(
-                        "timeout waiting for main frame attach (no parentFrameId) after {}s",
-                        Self::ATTACH_TIMEOUT.as_secs(),
-                    ),
+                    "Browser.newPage",
+                    "missing or empty targetId in Browser.newPage response",
                 ));
             }
-            match frame_rx.recv_timeout(remaining) {
-                Ok((sid, fid)) if sid == session_id && !fid.is_empty() => break fid,
-                Ok(_) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(ProtocolError::closed_with(
-                        "Page.frameAttached",
-                        "frame channel disconnected",
-                    ));
-                }
-            }
         };
 
-        // === Layer 2 -> Layer 3: publish frame_id and drain the buffer
-        // atomically.
-        //
-        // Lock order: buffer -> session_id_holder -> frame_id_holder ->
-        // exec_ctx. Acquiring the buffer lock first ensures no listener
-        // invocation can interleave between buffer-check and frame_id set.
-        // The LAST matching entry wins (matches the old listener's
-        // "last writer" semantics), and all matching entries are recorded live.
-        {
-            let mut buf = exec_buffer.lock().unwrap();
-            *frame_id_holder.lock().unwrap() = Some(frame_id.clone());
-            for entry in buf.drain(..) {
-                if entry.session_id == session_id
-                    && entry.frame_id == frame_id
-                    && entry.is_main_world
-                {
-                    exec_ctx.on_created(entry.exec_ctx_id);
-                }
+        match self.registry.claim(&target_id, Self::ATTACH_TIMEOUT) {
+            Ok(tracked) => {
+                drop(inflight);
+                MainFrame::from_tracked(
+                    tracked,
+                    Arc::clone(&self.connection),
+                    Arc::clone(&self.registry),
+                )
+            }
+            Err(e) => {
+                self.registry.abandon_target(&target_id);
+                drop(inflight);
+                Err(e)
             }
         }
-
-        Ok(MainFrame::new(
-            page_session,
-            expected_target_id,
-            frame_id,
-            exec_ctx,
-            Arc::clone(&self.connection),
-            vec![destroyed_guard, created_guard],
-            *self
-                .dialog_policy
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        ))
     }
 
     /// Set cookies for this context.
@@ -1242,7 +928,11 @@ mod tests {
         let root_session = conn.root_session();
         let context = BrowserContext::new("ctx-test".into(), &root_session, Arc::clone(&conn));
 
-        assert_eq!(conn.handler_count(), 0);
+        let baseline = conn.handler_count();
+        assert_eq!(
+            baseline, 2,
+            "2 persistent root handlers installed by PageRegistry"
+        );
 
         // 1. Timeout path: Browser.newPage responds, but attach event never comes
         let in_tx_clone = in_tx.clone();
@@ -1271,12 +961,12 @@ mod tests {
         assert!(err.message.contains("timeout"));
         assert_eq!(
             conn.handler_count(),
-            0,
-            "handler count must return to 0 after new_main_frame timeout"
+            baseline,
+            "handler count must return to baseline after new_main_frame timeout"
         );
         let out_rx = responder1.join().unwrap();
 
-        // 2. Success path: MainFrame constructed, retains 2 exec-ctx handlers, drops to 0 on drop
+        // 2. Success path: MainFrame retains six session handlers until drop.
         let in_tx_clone2 = in_tx.clone();
         let responder2 = thread::spawn(move || {
             let req = out_rx
@@ -1305,6 +995,7 @@ mod tests {
                         "targetInfo": {
                             "type": "page",
                             "targetId": "target-2",
+                            "browserContextId": "ctx-test",
                         }
                     })),
                     result: None,
@@ -1336,20 +1027,49 @@ mod tests {
             .expect("new_main_frame should succeed");
         assert_eq!(
             conn.handler_count(),
-            4,
-            "MainFrame should retain execution context and dialog handlers"
+            baseline + 6,
+            "MainFrame should retain exactly 6 session handlers (frames, contexts, dialogs)"
         );
+
+        // Claim wakes as soon as frameAttached updates state. Ensure that
+        // handler has released its temporary registry upgrade before asserting
+        // synchronous destruction below (the reader may own the last Arc).
+        let (idle_tx, idle_rx) = mpsc::channel();
+        let idle_id = conn.on_event(
+            "",
+            "Test.idle",
+            Arc::new(move |_| {
+                idle_tx.send(()).unwrap();
+            }),
+        );
+        in_tx
+            .send(RawMessage {
+                id: None,
+                method: Some("Test.idle".into()),
+                params: Some(json!({})),
+                result: None,
+                error: None,
+                session_id: None,
+            })
+            .unwrap();
+        idle_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        conn.off_event("", "Test.idle", idle_id);
 
         drop(main_frame);
         assert_eq!(
             conn.handler_count(),
-            0,
-            "handler count must return to 0 when MainFrame is dropped"
+            baseline,
+            "handler count must return to baseline when MainFrame is dropped"
         );
 
         let _out_rx = responder2.join().unwrap();
         drop(in_tx);
         drop(context);
+        assert_eq!(
+            conn.handler_count(),
+            0,
+            "handler count must return to 0 when context is dropped"
+        );
         let mut conn = Arc::try_unwrap(conn).ok().expect("should unwrap Arc");
         conn.wait_closed();
     }

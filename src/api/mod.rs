@@ -24,6 +24,7 @@ pub mod context;
 pub mod dialog;
 pub(crate) mod exec_ctx;
 pub mod main_frame;
+pub(crate) mod page_registry;
 
 pub use browser::{Browser, BrowserOptions, ProxyConfig};
 pub use context::{BrowserContext, ContextOptions, Cookie, CookieOptions, Geolocation, Viewport};

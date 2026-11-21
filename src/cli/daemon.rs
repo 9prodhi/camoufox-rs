@@ -271,6 +271,16 @@ fn respond<T: Serialize>(result: Result<T, String>) -> DaemonResponse {
     }
 }
 
+fn with_dialog(
+    mut value: serde_json::Value,
+    outcome: crate::cli::instance::InteractionOutcome,
+) -> serde_json::Value {
+    if let Some(dialog) = outcome.dialog {
+        value["dialog"] = json!(dialog);
+    }
+    value
+}
+
 fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
     // Derive the duration once; instance-scoped locking lives in the manager.
     let timeout = Duration::from_secs(request.timeout_secs());
@@ -278,7 +288,11 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
         DaemonRequest::Ping => DaemonResponse::ok(json!({"instance_count": mgr.instance_count()})),
         DaemonRequest::List => DaemonResponse::ok(json!({"instances": mgr.list()})),
         DaemonRequest::Shutdown => DaemonResponse::ok_empty(),
-        DaemonRequest::Launch { headless, executable } => respond(mgr.launch_with(&LaunchOptions { headless, executable }).map(|(instance_id, version, pid)| json!({"instance_id": instance_id, "version": version, "pid": pid}))),
+        DaemonRequest::Launch { headless, executable, dialogs } => respond(mgr.launch_with(&LaunchOptions { headless, executable, dialogs }).map(|(instance_id, version, pid)| json!({"instance_id": instance_id, "version": version, "pid": pid}))),
+        DaemonRequest::Dialog { instance_id, page_id, action, text } => {
+            let accept = match action.as_str() { "accept" => true, "dismiss" => false, _ => return DaemonResponse::err("dialog action must be accept or dismiss") };
+            respond(mgr.dialog(&instance_id, &page_id, accept, text.as_deref()).map(|dialog| json!({"dialog_action": action, "dialog": dialog})))
+        },
         DaemonRequest::Stop { instance_id } => respond(mgr.stop(&instance_id)),
         DaemonRequest::NewPage { instance_id } => respond(mgr.new_page(&instance_id).map(|page_id| json!({"page_id": page_id}))),
         DaemonRequest::Navigate { instance_id, page_id, url, wait_until, .. } => respond(mgr.navigate(&instance_id, &page_id, &url, timeout, wait_until.as_deref()).map(|o| json!({"navigation_id": o.nav_id, "status_code": o.status_code}))),
@@ -290,8 +304,8 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
             };
             respond(result.map(|result| json!({"result": result})))
         },
-        DaemonRequest::Click { instance_id, page_id, x, y } => respond(mgr.click(&instance_id, &page_id, x, y).map(|()| json!({"clicked": true, "x": x, "y": y}))),
-        DaemonRequest::ClickSelector { instance_id, page_id, selector, .. } => respond(mgr.click_selector(&instance_id, &page_id, &selector, timeout).map(|(x,y)| json!({"clicked": true, "selector": selector, "x": x, "y": y}))),
+        DaemonRequest::Click { instance_id, page_id, x, y } => respond(mgr.click(&instance_id, &page_id, x, y).map(|o| with_dialog(json!({"clicked": true, "x": x, "y": y}), o))),
+        DaemonRequest::ClickSelector { instance_id, page_id, selector, .. } => respond(mgr.click_selector(&instance_id, &page_id, &selector, timeout).map(|(x,y,o)| with_dialog(json!({"clicked": true, "selector": selector, "x": x, "y": y}), o))),
         DaemonRequest::Screenshot { instance_id, page_id, format, quality, path, selector, clip, .. } => respond(mgr.screenshot(&instance_id, &page_id, format.as_deref(), quality, path.as_deref(), selector.as_deref(), clip, timeout).map(|(bytes, path, rect)| json!({"bytes": bytes.len(), "path": path, "clip": {"x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height}}))),
         DaemonRequest::Cookies { instance_id } => respond(mgr.cookies(&instance_id).map(|cookies| json!({"cookies": cookies}))),
         DaemonRequest::Text { instance_id, page_id, selector, .. } => respond(mgr.text(&instance_id, &page_id, selector.as_deref(), timeout).map(|text| json!({"text": text}))),
@@ -307,7 +321,7 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
         DaemonRequest::SetHeader { instance_id, page_id, name, value } => respond(mgr.set_header(&instance_id, &page_id, &name, &value).map(|headers| { let headers: Vec<_> = headers.iter().map(|(n,v)| json!({"name": n, "value": v})).collect(); json!({"header_set": name, "headers": headers}) })),
         DaemonRequest::Fill { instance_id, page_id, selector, value, .. } => respond(mgr.fill(&instance_id, &page_id, &selector, &value, timeout).map(|tag| json!({"filled": true, "selector": selector, "tag": tag, "value": value}))),
         DaemonRequest::Type { instance_id, page_id, text } => respond(mgr.insert_text(&instance_id, &page_id, &text).map(|()| json!({"typed": text}))),
-        DaemonRequest::Press { instance_id, page_id, key } => respond(mgr.press(&instance_id, &page_id, &key).map(|()| json!({"pressed": key}))),
+        DaemonRequest::Press { instance_id, page_id, key } => respond(mgr.press(&instance_id, &page_id, &key).map(|o| with_dialog(json!({"pressed": key}), o))),
         DaemonRequest::Hover { instance_id, page_id, selector, .. } => respond(mgr.hover(&instance_id, &page_id, &selector, timeout).map(|(x,y)| json!({"hovered": true, "selector": selector, "x": x, "y": y}))),
         DaemonRequest::Select { instance_id, page_id, selector, value, .. } => respond(mgr.select_option(&instance_id, &page_id, &selector, &value, timeout).map(|r| json!({"selected": true, "selector": selector, "option_value": r.get("value"), "option_text": r.get("text")}))),
         DaemonRequest::Scroll { instance_id, page_id, selector, .. } => respond(mgr.scroll(&instance_id, &page_id, selector.as_deref(), timeout)),

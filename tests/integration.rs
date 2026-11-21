@@ -865,7 +865,7 @@ fn interaction_commands_fill_press_and_click_by_selector() {
         "fill types the value into the element"
     );
     pressed.expect("press Enter failed");
-    let (x, y) = clicked.expect("click by selector failed");
+    let (x, y, _) = clicked.expect("click by selector failed");
     assert!(x > 0 && y > 0, "click resolved a real box, got ({x}, {y})");
     let selected = selected.expect("select failed");
     assert_eq!(selected["value"], "b", "select matches by visible text too");
@@ -1026,4 +1026,127 @@ fn wait_fails_fast_on_invalid_selector() {
         "wait must fail fast on a permanent (invalid-selector) error, not burn the \
          full 30s timeout. Took {elapsed:?}."
     );
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn manual_dialogs_can_be_resolved() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::DialogServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(&instance, &page, &server.url, timeout, Some("load"))
+        .unwrap();
+    for (selector, kind, accept, text, expected) in [
+        ("#alert", "alert", true, None, "alert"),
+        ("#confirm", "confirm", false, None, "false"),
+        ("#prompt", "prompt", true, Some("hi"), "hi"),
+    ] {
+        let start = std::time::Instant::now();
+        let (_, _, outcome) = manager
+            .click_selector(&instance, &page, selector, timeout)
+            .unwrap();
+        assert_eq!(outcome.dialog.unwrap().kind, kind);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(manager
+            .text(&instance, &page, None, timeout)
+            .unwrap_err()
+            .contains("open"));
+        manager.dialog(&instance, &page, accept, text).unwrap();
+        let value = manager
+            .evaluate(&instance, &page, "document.body.dataset.result", timeout)
+            .unwrap();
+        assert_eq!(value.as_str(), Some(expected));
+    }
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn in_flight_wait_fails_when_dialog_opens() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::DialogServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(&instance, &page, &server.url, timeout, Some("load"))
+        .unwrap();
+    manager
+        .evaluate_main_world(
+            &instance,
+            &page,
+            "setTimeout(() => alert('later'), 500), 1",
+            timeout,
+        )
+        .unwrap();
+    let start = std::time::Instant::now();
+    let error = manager
+        .wait_for_selector(&instance, &page, "#never-appears", Duration::from_secs(20))
+        .unwrap_err();
+    let elapsed = start.elapsed();
+    eprintln!("dialog wait fail-fast elapsed: {elapsed:?}; error: {error}");
+    assert!(elapsed < Duration::from_secs(3));
+    assert!(
+        error.contains("alert") && error.contains("later"),
+        "{error}"
+    );
+    manager.dialog(&instance, &page, true, None).unwrap();
+    manager.text(&instance, &page, None, timeout).unwrap();
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn accept_policy_auto_handles() {
+    use camoufox::api::DialogPolicy;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+    let server = fixtures::DialogServer::start();
+    let manager = InstanceManager::new();
+    let (instance, _, _) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            dialogs: DialogPolicy::Accept,
+        })
+        .unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(&instance, &page, &server.url, timeout, Some("load"))
+        .unwrap();
+    manager
+        .click_selector(&instance, &page, "#confirm", timeout)
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let value = manager.evaluate(
+            &instance,
+            &page,
+            "document.body.dataset.result",
+            Duration::from_secs(1),
+        );
+        if value.as_ref().ok().and_then(|v| v.as_str()) == Some("true") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "confirm was not accepted: {value:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let tabs = manager.tabs(&instance, timeout).unwrap();
+    let tab = tabs.iter().find(|tab| tab["page_id"] == page).unwrap();
+    assert!(
+        tab.get("dialog").is_none(),
+        "dialog is still pending: {tab}"
+    );
+    manager.stop(&instance).unwrap();
 }

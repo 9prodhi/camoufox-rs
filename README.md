@@ -225,6 +225,14 @@ Daemon security and lifecycle:
 - Requests for different instances run in parallel. Requests to the same instance are
   serialized. `launch` holds no lock while the browser starts.
 
+## JavaScript dialogs
+
+Dialogs use manual handling by default. When a page opens an alert, confirm,
+prompt, or beforeunload dialog, respond with `camoufox dialog <instance> <page> accept`
+or `camoufox dialog <instance> <page> dismiss`. For a prompt, supply the answer
+with `--text`. Launch with `--dialogs accept` or `--dialogs dismiss` to handle
+dialogs automatically; `--dialogs manual` restores the default.
+
 ## Library Bootstrap Example
 
 The low-level lifecycle is:

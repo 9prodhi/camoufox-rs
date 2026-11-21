@@ -26,6 +26,17 @@ pub enum DaemonRequest {
         headless: Option<bool>,
         #[serde(default)]
         executable: Option<String>,
+        #[serde(default)]
+        dialogs: crate::api::DialogPolicy,
+    },
+
+    /// Accept or dismiss a page's open JavaScript dialog.
+    Dialog {
+        instance_id: String,
+        page_id: String,
+        action: String,
+        #[serde(default)]
+        text: Option<String>,
     },
 
     /// List all running instances.
@@ -480,6 +491,7 @@ mod tests {
         let launch = DaemonRequest::Launch {
             headless: None,
             executable: None,
+            dialogs: Default::default(),
         };
         assert_eq!(launch.read_timeout().as_secs(), 210);
     }

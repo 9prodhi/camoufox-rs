@@ -114,6 +114,13 @@ impl PendingMap {
         true
     }
 
+    /// Reject all pending requests using an error constructed for each method.
+    pub fn reject_all_with(&mut self, make: impl Fn(&str) -> ProtocolError) {
+        for (_, pending) in self.requests.drain() {
+            let _ = pending.sender.send(Err(make(&pending.method)));
+        }
+    }
+
     /// Reject ALL pending requests in this session.
     ///
     /// Called when:

@@ -21,6 +21,7 @@
 
 pub mod browser;
 pub mod context;
+pub(crate) mod exec_ctx;
 pub mod main_frame;
 
 pub use browser::{Browser, BrowserOptions, ProxyConfig};

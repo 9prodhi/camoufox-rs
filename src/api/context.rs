@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::api::browser::{Connection, ProxyConfig, Session};
+use crate::api::exec_ctx::ExecContextTracker;
 use crate::api::main_frame::{MainFrame, SubscriptionGuard};
 use crate::protocol::errors::ProtocolError;
 
@@ -692,7 +693,7 @@ impl BrowserContext {
         let session_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let frame_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let exec_buffer: Arc<Mutex<Vec<BufferedContext>>> = Arc::new(Mutex::new(Vec::new()));
-        let exec_ctx: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let exec_ctx = Arc::new(ExecContextTracker::new());
 
         // Also register a sibling listener for Runtime.executionContextDestroyed
         // that clears the cache when the cached context is destroyed. Without
@@ -726,12 +727,7 @@ impl BrowserContext {
             if dead.is_empty() {
                 return;
             }
-            let mut guard = exec_ctx_for_destroyed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.as_deref() == Some(dead) {
-                *guard = None;
-            }
+            exec_ctx_for_destroyed.on_destroyed(dead);
         }));
         let destroyed_guard = SubscriptionGuard::global(Arc::clone(&self.connection), destroyed_id);
 
@@ -803,9 +799,7 @@ impl BrowserContext {
                 (Some(_), Some(fid)) => {
                     // Both known — apply final filter directly.
                     if event_fid == fid && is_main_world {
-                        *exec_ctx_for_listener
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ctx_id);
+                        exec_ctx_for_listener.on_created(ctx_id);
                     }
                 }
             }
@@ -908,23 +902,17 @@ impl BrowserContext {
         // exec_ctx. Acquiring the buffer lock first ensures no listener
         // invocation can interleave between buffer-check and frame_id set.
         // The LAST matching entry wins (matches the old listener's
-        // "last writer" semantics).
+        // "last writer" semantics), and all matching entries are recorded live.
         {
             let mut buf = exec_buffer.lock().unwrap();
             *frame_id_holder.lock().unwrap() = Some(frame_id.clone());
-            let mut latest: Option<String> = None;
             for entry in buf.drain(..) {
                 if entry.session_id == session_id
                     && entry.frame_id == frame_id
                     && entry.is_main_world
                 {
-                    latest = Some(entry.exec_ctx_id);
+                    exec_ctx.on_created(entry.exec_ctx_id);
                 }
-            }
-            if let Some(c) = latest {
-                *exec_ctx
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(c);
             }
         }
 

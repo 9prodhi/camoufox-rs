@@ -25,11 +25,13 @@ fn main() {
             headed,
             executable,
             downloads_dir,
+            bypass_csp,
         } => {
             let request = DaemonRequest::Launch {
                 headless: Some(!headed),
                 executable,
                 downloads_dir,
+                bypass_csp,
             };
             run_client(&sock, &request, cli.json);
         }

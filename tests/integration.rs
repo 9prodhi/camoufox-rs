@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 use std::process::Child;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use camoufox::api::{Browser, BrowserOptions, ContextOptions};
 use camoufox::config::LaunchConfig;
@@ -1158,6 +1158,7 @@ fn downloads_dir_saves_file_at_uuid_path() {
             headless: Some(true),
             executable: Some(camoufox_bin()),
             downloads_dir: Some(downloads_dir.clone()),
+            ..Default::default()
         })
         .expect("launch_with failed");
 
@@ -1230,6 +1231,7 @@ fn navigate_download_with_dir_still_returns_navigation_became_download_and_logs(
             headless: Some(true),
             executable: Some(camoufox_bin()),
             downloads_dir: Some(downloads_dir),
+            ..Default::default()
         })
         .expect("launch_with failed");
 
@@ -1258,4 +1260,288 @@ fn navigate_download_with_dir_still_returns_navigation_became_download_and_logs(
         !entries.is_empty(),
         "download event must be logged in DownloadLog"
     );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn page_usable_after_navigation_became_download() {
+    use crate::fixtures::{AttachmentServer, BrowseServer};
+    use camoufox::cli::instance::InstanceManager;
+
+    let browse = BrowseServer::start();
+    let attachment = AttachmentServer::start();
+
+    let mut manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch(Some(true), Some(&camoufox_bin()))
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(&instance_id, &page_id, &browse.url, timeout, Some("load"))
+        .expect("navigate to initial page failed");
+
+    let initial_url = manager
+        .url(&instance_id, &page_id, Duration::from_secs(3))
+        .expect("url failed")
+        .0;
+    assert_eq!(initial_url, browse.url);
+
+    let nav_err = manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &attachment.url,
+            timeout,
+            Some("load"),
+        )
+        .expect_err("navigation to attachment should fail");
+    assert!(
+        nav_err.contains("download"),
+        "expected error mentioning download, got: {nav_err}"
+    );
+
+    let t0 = Instant::now();
+    let (current_url, _) = manager
+        .url(&instance_id, &page_id, Duration::from_secs(3))
+        .expect("url after download failed");
+    assert!(
+        t0.elapsed() < Duration::from_secs(3),
+        "url took {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(current_url, browse.url);
+
+    let t1 = Instant::now();
+    let eval_res = manager
+        .evaluate(&instance_id, &page_id, "1 + 1", Duration::from_secs(3))
+        .expect("evaluate after download failed");
+    assert!(
+        t1.elapsed() < Duration::from_secs(3),
+        "evaluate took {:?}",
+        t1.elapsed()
+    );
+    assert_eq!(eval_res, 2);
+
+    let _ = manager.stop(&instance_id);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn main_world_strict_csp_reports_bypass_hint() {
+    use crate::fixtures::CspServer;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let csp = CspServer::start();
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            bypass_csp: false,
+            ..Default::default()
+        })
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &csp.url("/csp_strict.html"),
+            timeout,
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let t0 = Instant::now();
+    let err = manager
+        .evaluate_main_world(
+            &instance_id,
+            &page_id,
+            "window.answer",
+            Duration::from_secs(3),
+        )
+        .expect_err("evaluate_main_world should fail on strict CSP");
+    let elapsed = t0.elapsed();
+    let _ = manager.stop(&instance_id);
+
+    assert!(elapsed < Duration::from_secs(3), "eval took {elapsed:?}");
+    assert!(
+        err.contains("--bypass-csp"),
+        "error must mention --bypass-csp, got: {err}"
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn main_world_strict_csp_works_with_bypass_csp() {
+    use crate::fixtures::CspServer;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let csp = CspServer::start();
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            bypass_csp: true,
+            ..Default::default()
+        })
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &csp.url("/csp_strict.html"),
+            timeout,
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let res = manager
+        .evaluate_main_world(
+            &instance_id,
+            &page_id,
+            "window.answer",
+            Duration::from_secs(10),
+        )
+        .expect("evaluate_main_world failed with bypass_csp");
+    let _ = manager.stop(&instance_id);
+
+    assert_eq!(res, 42);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn main_world_unsafe_inline_works_without_flag() {
+    use crate::fixtures::CspServer;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let csp = CspServer::start();
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            bypass_csp: false,
+            ..Default::default()
+        })
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &csp.url("/csp_inline.html"),
+            timeout,
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let res = manager
+        .evaluate_main_world(
+            &instance_id,
+            &page_id,
+            "window.answer",
+            Duration::from_secs(10),
+        )
+        .expect("evaluate_main_world on csp_inline failed");
+    let _ = manager.stop(&instance_id);
+
+    assert_eq!(res, 42);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn main_world_nonce_csp_feasibility() {
+    use crate::fixtures::CspServer;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let csp = CspServer::start();
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            bypass_csp: false,
+            ..Default::default()
+        })
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &csp.url("/csp_nonce.html"),
+            timeout,
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let res = manager
+        .evaluate_main_world(
+            &instance_id,
+            &page_id,
+            "window.answer",
+            Duration::from_secs(10),
+        )
+        .expect("evaluate_main_world on nonce CSP should succeed without bypass_csp");
+    let _ = manager.stop(&instance_id);
+
+    // D10 feasibility gate:
+    // Camoufox 158 allows dynamically inserted scripts with borrowed nonces.
+    assert_eq!(res, 42);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn main_world_page_global_named_val_is_readable() {
+    use crate::fixtures::CspServer;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let csp = CspServer::start();
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            bypass_csp: false,
+            ..Default::default()
+        })
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &csp.url("/val.html"),
+            timeout,
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let res = manager
+        .evaluate_main_world(&instance_id, &page_id, "val", Duration::from_secs(10))
+        .expect("evaluate_main_world('val') failed");
+    let _ = manager.stop(&instance_id);
+
+    assert_eq!(res, 7);
 }

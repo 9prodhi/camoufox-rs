@@ -255,6 +255,8 @@ pub struct LaunchOptions {
     pub executable: Option<String>,
     /// Directory to save downloads to.
     pub downloads_dir: Option<PathBuf>,
+    /// Disable page Content-Security-Policy.
+    pub bypass_csp: bool,
 }
 
 impl LaunchOptions {
@@ -267,6 +269,7 @@ impl LaunchOptions {
                     downloads_dir: Some(dir.to_string_lossy().into_owned()),
                 }
             }),
+            bypass_csp: self.bypass_csp,
             ..Default::default()
         }
     }
@@ -351,9 +354,6 @@ impl Instance {
         wait_until: Option<&str>,
     ) -> Result<NavigateOutcome, String> {
         let mp = self.page(page_id)?;
-
-        // Force `evaluate` to wait for a fresh post-navigation context.
-        *mp.main_frame.execution_context_handle().lock().unwrap() = None;
 
         let options = NavigateOptions {
             wait_until: wait_until.map(|s| s.to_owned()),
@@ -1136,6 +1136,7 @@ impl InstanceManager {
             headless,
             executable: executable.map(str::to_owned),
             downloads_dir: None,
+            bypass_csp: false,
         })
     }
 
@@ -1861,6 +1862,14 @@ mod tests {
         assert!(opts.headless.is_none());
         assert!(!opts.context_options().bypass_csp);
         assert!(opts.context_options().download_options.is_none());
+        assert!(
+            LaunchOptions {
+                bypass_csp: true,
+                ..Default::default()
+            }
+            .context_options()
+            .bypass_csp
+        );
     }
 
     #[test]

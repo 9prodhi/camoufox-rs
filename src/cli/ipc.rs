@@ -26,6 +26,8 @@ pub enum DaemonRequest {
         headless: Option<bool>,
         #[serde(default)]
         executable: Option<String>,
+        #[serde(default)]
+        bypass_csp: bool,
     },
 
     /// List all running instances.
@@ -480,6 +482,7 @@ mod tests {
         let launch = DaemonRequest::Launch {
             headless: None,
             executable: None,
+            bypass_csp: false,
         };
         assert_eq!(launch.read_timeout().as_secs(), 210);
     }

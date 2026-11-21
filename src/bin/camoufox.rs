@@ -21,10 +21,15 @@ fn main() {
             }
         }
 
-        Command::Launch { headed, executable } => {
+        Command::Launch {
+            headed,
+            executable,
+            bypass_csp,
+        } => {
             let request = DaemonRequest::Launch {
                 headless: Some(!headed),
                 executable,
+                bypass_csp,
             };
             run_client(&sock, &request, cli.json);
         }

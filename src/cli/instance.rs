@@ -253,12 +253,17 @@ pub struct LaunchOptions {
     pub headless: Option<bool>,
     /// Camoufox executable; `None` uses the default install location.
     pub executable: Option<String>,
+    /// Disable page Content-Security-Policy.
+    pub bypass_csp: bool,
 }
 
 impl LaunchOptions {
     /// Browser-context options derived from the launch flags.
     pub(crate) fn context_options(&self) -> ContextOptions {
-        ContextOptions::default()
+        ContextOptions {
+            bypass_csp: self.bypass_csp,
+            ..Default::default()
+        }
     }
 }
 
@@ -330,9 +335,6 @@ impl Instance {
         wait_until: Option<&str>,
     ) -> Result<NavigateOutcome, String> {
         let mp = self.page(page_id)?;
-
-        // Force `evaluate` to wait for a fresh post-navigation context.
-        *mp.main_frame.execution_context_handle().lock().unwrap() = None;
 
         let options = NavigateOptions {
             wait_until: wait_until.map(|s| s.to_owned()),
@@ -1095,11 +1097,12 @@ impl InstanceManager {
         self.launch_with(&LaunchOptions {
             headless,
             executable: executable.map(str::to_owned),
+            bypass_csp: false,
         })
     }
 
     /// Launch a new browser instance from the full set of `launch` flags.
-    pub(crate) fn launch_with(
+    pub fn launch_with(
         &self,
         options: &LaunchOptions,
     ) -> Result<(String, Option<String>, u32), String> {
@@ -1639,6 +1642,14 @@ mod tests {
         assert!(opts.headless.is_none());
         assert!(!opts.context_options().bypass_csp);
         assert!(opts.context_options().download_options.is_none());
+        assert!(
+            LaunchOptions {
+                bypass_csp: true,
+                ..Default::default()
+            }
+            .context_options()
+            .bypass_csp
+        );
     }
 
     #[test]

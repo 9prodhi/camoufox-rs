@@ -31,6 +31,10 @@ pub enum Command {
         /// Path to the Camoufox executable.
         #[arg(long)]
         executable: Option<String>,
+
+        /// Disable page Content-Security-Policy (needed for --main-world on strict-CSP sites; detectable by pages)
+        #[arg(long)]
+        bypass_csp: bool,
     },
 
     /// List all running browser instances.

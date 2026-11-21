@@ -249,6 +249,31 @@ pub fn render(data: Option<&Value>) -> Rendered {
         });
     }
 
+    // Downloads response (standalone `downloads` command, not click outcome)
+    if data.get("clicked").is_none() {
+        if let Some(downloads) = data.get("downloads").and_then(|v| v.as_array()) {
+            if downloads.is_empty() {
+                return Rendered::out("no downloads");
+            }
+            let lines: Vec<String> = downloads
+                .iter()
+                .map(|d| {
+                    let state = d.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+                    let page = d.get("page").and_then(|v| v.as_str()).unwrap_or("-");
+                    let url = d.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(path) = d.get("path").and_then(|v| v.as_str()) {
+                        format!("{state}  {page}  {url}  -> {path}")
+                    } else if let Some(err) = d.get("error").and_then(|v| v.as_str()) {
+                        format!("{state}  {page}  {url}  (error: {err})")
+                    } else {
+                        format!("{state}  {page}  {url}")
+                    }
+                })
+                .collect();
+            return Rendered::out(lines.join("\n"));
+        }
+    }
+
     // Fallback: print the data as JSON.
     Rendered::out(pretty(data))
 }
@@ -455,5 +480,36 @@ mod tests {
             render(Some(&json!({ "instances": [] }))).stdout,
             "no running instances"
         );
+    }
+
+    #[test]
+    fn downloads_renders_one_line_per_entry_with_path() {
+        let data = json!({
+            "downloads": [
+                {
+                    "state": "completed",
+                    "page": "p1",
+                    "url": "http://x/a.pdf",
+                    "path": "/tmp/dl/u1"
+                },
+                {
+                    "state": "canceled",
+                    "page": "p1",
+                    "url": "http://x/b.pdf",
+                    "path": null
+                }
+            ]
+        });
+        let rendered = render(Some(&data));
+        assert_eq!(
+            rendered.stdout,
+            "completed  p1  http://x/a.pdf  -> /tmp/dl/u1\ncanceled  p1  http://x/b.pdf"
+        );
+    }
+
+    #[test]
+    fn downloads_renders_no_downloads_when_empty() {
+        let rendered = render(Some(&json!({ "downloads": [] })));
+        assert_eq!(rendered.stdout, "no downloads");
     }
 }

@@ -253,12 +253,22 @@ pub struct LaunchOptions {
     pub headless: Option<bool>,
     /// Camoufox executable; `None` uses the default install location.
     pub executable: Option<String>,
+    /// Directory to save downloads to.
+    pub downloads_dir: Option<PathBuf>,
 }
 
 impl LaunchOptions {
     /// Browser-context options derived from the launch flags.
     pub(crate) fn context_options(&self) -> ContextOptions {
-        ContextOptions::default()
+        ContextOptions {
+            download_options: self.downloads_dir.as_ref().map(|dir| {
+                crate::api::context::DownloadOptions {
+                    behavior: Some("saveToDisk".to_string()),
+                    downloads_dir: Some(dir.to_string_lossy().into_owned()),
+                }
+            }),
+            ..Default::default()
+        }
     }
 }
 
@@ -286,6 +296,17 @@ impl Instance {
         self.pages
             .get_mut(id)
             .ok_or_else(|| format!("page {id} not found"))
+    }
+
+    /// Look up the CLI page ID (e.g. "p1") whose main frame target ID matches `target_id`.
+    pub fn page_id_for_target(&self, target_id: &str) -> Option<String> {
+        self.pages.iter().find_map(|(page_id, mp)| {
+            if mp.main_frame.target_id() == target_id {
+                Some(page_id.clone())
+            } else {
+                None
+            }
+        })
     }
 
     /// Create a new page in this instance's context, fully wired with
@@ -1075,6 +1096,9 @@ struct InstanceEntry {
     /// Closes the protocol connection: rejects in-flight requests and makes
     /// Camoufox exit (pipe EOF). Used by stop/shutdown.
     closer: Arc<Connection>,
+    /// Download events for this instance's context. `downloads --wait`
+    /// blocks on it without taking the instance mutex.
+    downloads: Arc<crate::cli::downloads::DownloadLog>,
 }
 
 /// Manages all browser instances for the daemon.
@@ -1088,6 +1112,8 @@ pub struct InstanceManager {
 struct ManagedInstance {
     instance: Option<Instance>,
     context: crate::api::BrowserContext,
+    /// Keeps the download-log event subscriptions alive for the instance.
+    _download_guards: Vec<crate::api::main_frame::SubscriptionGuard>,
 }
 
 impl InstanceManager {
@@ -1109,17 +1135,48 @@ impl InstanceManager {
         self.launch_with(&LaunchOptions {
             headless,
             executable: executable.map(str::to_owned),
+            downloads_dir: None,
         })
     }
 
     /// Launch a new browser instance from the full set of `launch` flags.
-    pub(crate) fn launch_with(
+    pub fn launch_with(
         &self,
         options: &LaunchOptions,
     ) -> Result<(String, Option<String>, u32), String> {
         if self.is_closing() {
             return Err("daemon shutting down".into());
         }
+        if let Some(ref dir) = options.downloads_dir {
+            if !dir.is_absolute() {
+                return Err("--downloads-dir must be an absolute path".to_string());
+            }
+            if !dir.exists() {
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    format!("failed to create downloads dir {}: {e}", dir.display())
+                })?;
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+            let probe = dir.join(format!(".camoufox-probe-{}", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+            {
+                Ok(file) => {
+                    drop(file);
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "downloads dir {} is not writable: {e}",
+                        dir.display()
+                    ));
+                }
+            }
+        }
+
         let instance_id = format!("{:08x}", self.counter.fetch_add(1, Ordering::Relaxed) + 1);
         let profile_dir =
             tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
@@ -1166,6 +1223,12 @@ impl InstanceManager {
             .map_err(|e| format!("failed to create context: {e}"))?;
 
         let closer = Arc::clone(browser.connection());
+        let download_log = crate::cli::downloads::DownloadLog::new(
+            context.id().to_string(),
+            options.downloads_dir.clone(),
+        );
+        let download_guards = download_log.subscribe(browser.connection());
+
         let instance = Instance {
             instance_id: instance_id.clone(),
             browser,
@@ -1193,8 +1256,10 @@ impl InstanceManager {
                 managed: Arc::new(Mutex::new(ManagedInstance {
                     instance: Some(instance),
                     context,
+                    _download_guards: download_guards,
                 })),
                 closer,
+                downloads: download_log,
             },
         );
 
@@ -1237,6 +1302,7 @@ impl InstanceManager {
         let InstanceEntry {
             managed: entry,
             closer,
+            ..
         } = self
             .instances
             .lock()
@@ -1345,8 +1411,84 @@ impl InstanceManager {
         let mut entry = entry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ManagedInstance { instance, context } = &mut *entry;
+        let ManagedInstance {
+            instance, context, ..
+        } = &mut *entry;
         f(instance.as_mut().ok_or_else(|| Self::missing(id))?, context)
+    }
+
+    /// Access the download log for an instance without locking the instance.
+    pub fn download_log(
+        &self,
+        instance_id: &str,
+    ) -> Option<Arc<crate::cli::downloads::DownloadLog>> {
+        self.instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(instance_id)
+            .map(|entry| Arc::clone(&entry.downloads))
+    }
+
+    /// Fill CLI page IDs (e.g. "p1") on download entries via a brief instance lock.
+    pub fn populate_download_pages(
+        &self,
+        instance_id: &str,
+        entries: &mut [crate::cli::downloads::DownloadEntry],
+    ) {
+        // try_lock: `downloads` must not wait behind a long-running command on
+        // this instance. If the instance is busy, `page` stays None.
+        let Some(managed) = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(instance_id)
+            .map(|e| Arc::clone(&e.managed))
+        else {
+            return;
+        };
+        let guard = match managed.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        if let Some(inst) = &guard.instance {
+            for entry in entries.iter_mut() {
+                if entry.page.is_none() {
+                    entry.page = inst.page_id_for_target(&entry.page_target_id);
+                }
+            }
+        }
+    }
+
+    /// View or wait for downloads on an instance.
+    ///
+    /// The condvar wait runs outside the per-instance mutex so it never blocks
+    /// other commands on this instance.
+    pub fn downloads(
+        &self,
+        instance_id: &str,
+        wait: Option<Duration>,
+    ) -> Result<Vec<crate::cli::downloads::DownloadEntry>, String> {
+        let entry = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| Self::missing(instance_id))?;
+        let log = Arc::clone(&entry.downloads);
+
+        let mut entries = match wait {
+            Some(timeout) => {
+                let seq = log.snapshot().0;
+                let (_, entries) = log.wait_change(seq, timeout);
+                entries
+            }
+            None => log.snapshot().1,
+        };
+
+        self.populate_download_pages(instance_id, &mut entries);
+        Ok(entries)
     }
 
     // -----------------------------------------------------------------------
@@ -1683,6 +1825,7 @@ impl InstanceManager {
                 |InstanceEntry {
                      managed: entry,
                      closer,
+                     ..
                  }| {
                     std::thread::spawn(move || {
                         let _ = closer.close();
@@ -1924,5 +2067,18 @@ mod tests {
     fn user_agent_env_sets_nothing_when_browser_version_unknown() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(user_agent_env(&dir.path().join("camoufox"), &[]).is_empty());
+    }
+
+    #[test]
+    fn downloads_dir_relative_rejected() {
+        let mgr = InstanceManager::new();
+        let res = mgr.launch_with(&LaunchOptions {
+            downloads_dir: Some("rel/dir".into()),
+            ..Default::default()
+        });
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .contains("--downloads-dir must be an absolute path"));
     }
 }

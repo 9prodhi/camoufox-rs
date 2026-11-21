@@ -1094,3 +1094,168 @@ fn shutdown_all_three_instances_in_parallel() {
         assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0);
     }
 }
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn click_download_link_is_logged_and_canceled_by_default() {
+    use camoufox::cli::downloads::DownloadState;
+    use camoufox::cli::instance::InstanceManager;
+
+    let server = fixtures::DownloadServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch(Some(true), Some(&camoufox_bin()))
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &format!("{}/download.html", server.base_url),
+            Duration::from_secs(30),
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let _ = manager.click_selector(&instance_id, &page_id, "#dl", Duration::from_secs(10));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut final_entry = None;
+    while std::time::Instant::now() < deadline {
+        let entries = manager
+            .downloads(&instance_id, Some(Duration::from_millis(500)))
+            .expect("downloads failed");
+        if let Some(entry) = entries.iter().find(|e| e.state != DownloadState::Started) {
+            final_entry = Some(entry.clone());
+            break;
+        }
+    }
+
+    let _ = manager.stop(&instance_id);
+
+    let entry = final_entry.expect("expected non-Started download within 10s");
+    assert_eq!(entry.state, DownloadState::Canceled);
+    assert_eq!(entry.path, None);
+    assert!(entry.url.contains("/report.pdf"));
+    assert_eq!(entry.page.as_deref(), Some("p1"));
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn downloads_dir_saves_file_at_uuid_path() {
+    use camoufox::cli::downloads::DownloadState;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let server = fixtures::DownloadServer::start();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let downloads_dir = dir.path().to_path_buf();
+
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            downloads_dir: Some(downloads_dir.clone()),
+        })
+        .expect("launch_with failed");
+
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &format!("{}/download.html", server.base_url),
+            Duration::from_secs(30),
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let _ = manager.click_selector(&instance_id, &page_id, "#dl", Duration::from_secs(10));
+
+    // Wait for the download to complete
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut completed_entry = None;
+    while std::time::Instant::now() < deadline {
+        let entries = manager
+            .downloads(&instance_id, Some(Duration::from_millis(500)))
+            .expect("downloads query failed");
+        if let Some(entry) = entries.iter().find(|e| e.state == DownloadState::Completed) {
+            completed_entry = Some(entry.clone());
+            break;
+        }
+    }
+
+    let _ = manager.stop(&instance_id);
+
+    let entry = completed_entry.expect("download did not complete within timeout");
+    assert_eq!(entry.state, DownloadState::Completed);
+    let expected_path = downloads_dir
+        .join(&entry.uuid)
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(entry.path.as_deref(), Some(expected_path.as_str()));
+
+    // Verify on disk that downloads_dir/uuid exists with the fixture bytes
+    let saved_file = downloads_dir.join(&entry.uuid);
+    assert!(
+        saved_file.exists(),
+        "file at {saved_file:?} must exist on disk"
+    );
+    let saved_bytes = std::fs::read(&saved_file).expect("read saved file");
+    assert_eq!(
+        saved_bytes, server.pdf_bytes,
+        "saved file contents must match fixture"
+    );
+
+    // Guardrail: Assert no file named evil.pdf anywhere in downloads_dir or its parents
+    assert!(!downloads_dir.join("evil.pdf").exists());
+    assert!(!downloads_dir.join("../evil.pdf").exists());
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn navigate_download_with_dir_still_returns_navigation_became_download_and_logs() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let server = fixtures::DownloadServer::start();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let downloads_dir = dir.path().to_path_buf();
+
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            downloads_dir: Some(downloads_dir),
+        })
+        .expect("launch_with failed");
+
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let result = manager.navigate(
+        &instance_id,
+        &page_id,
+        &format!("{}/report.pdf", server.base_url),
+        Duration::from_secs(10),
+        None,
+    );
+
+    let entries = manager
+        .downloads(&instance_id, Some(Duration::from_secs(5)))
+        .expect("downloads failed");
+
+    let _ = manager.stop(&instance_id);
+
+    let err =
+        result.expect_err("navigate to download attachment must return NavigationBecameDownload");
+    assert!(
+        err.contains("NavigationBecameDownload") || err.contains("became a download"),
+        "expected NavigationBecameDownload in error, got: {err}"
+    );
+    assert!(
+        !entries.is_empty(),
+        "download event must be logged in DownloadLog"
+    );
+}

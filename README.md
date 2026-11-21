@@ -186,6 +186,20 @@ cargo run --features cli --bin camoufox -- tabs <instance_id>
 cargo run --features cli --bin camoufox -- close-tab <instance_id> <page_id>
 ```
 
+Manage downloads:
+
+```bash
+# Launch with an absolute download directory (defaults to cancel if omitted):
+cargo run --features cli --bin camoufox -- launch --downloads-dir /path/to/downloads
+
+# Two-step agent pattern: click a download link, then wait for the download to finish:
+cargo run --features cli --bin camoufox -- click <instance_id> <page_id> '#download-link'
+cargo run --features cli --bin camoufox -- downloads <instance_id> --wait 10
+
+# Inspect the download log for an instance:
+cargo run --features cli --bin camoufox -- downloads <instance_id>
+```
+
 Inspect and stop:
 
 ```bash

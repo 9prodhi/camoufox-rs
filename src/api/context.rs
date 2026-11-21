@@ -288,6 +288,11 @@ impl BrowserContext {
         &self.context_id
     }
 
+    /// Convenience alias for [`context_id`](Self::context_id).
+    pub fn id(&self) -> &str {
+        &self.context_id
+    }
+
     /// Returns a reference to the shared connection.
     pub fn connection(&self) -> &Arc<Connection> {
         &self.connection

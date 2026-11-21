@@ -1,5 +1,7 @@
 //! Clap CLI subcommand definitions.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -31,6 +33,10 @@ pub enum Command {
         /// Path to the Camoufox executable.
         #[arg(long)]
         executable: Option<String>,
+
+        /// Directory to save downloads to (must be absolute; defaults to cancel).
+        #[arg(long)]
+        downloads_dir: Option<PathBuf>,
     },
 
     /// List all running browser instances.
@@ -399,5 +405,14 @@ pub enum Command {
         instance_id: String,
         /// Page ID.
         page_id: String,
+    },
+
+    /// View or wait for downloads on an instance.
+    Downloads {
+        /// Instance ID.
+        instance_id: String,
+        /// Optional timeout in seconds to wait for download events.
+        #[arg(long)]
+        wait: Option<u64>,
     },
 }

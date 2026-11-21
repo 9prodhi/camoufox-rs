@@ -278,7 +278,20 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
         DaemonRequest::Ping => DaemonResponse::ok(json!({"instance_count": mgr.instance_count()})),
         DaemonRequest::List => DaemonResponse::ok(json!({"instances": mgr.list()})),
         DaemonRequest::Shutdown => DaemonResponse::ok_empty(),
-        DaemonRequest::Launch { headless, executable } => respond(mgr.launch_with(&LaunchOptions { headless, executable }).map(|(instance_id, version, pid)| json!({"instance_id": instance_id, "version": version, "pid": pid}))),
+        DaemonRequest::Launch {
+            headless,
+            executable,
+            downloads_dir,
+        } => respond(
+            mgr.launch_with(&LaunchOptions {
+                headless,
+                executable,
+                downloads_dir,
+            })
+            .map(|(instance_id, version, pid)| {
+                json!({"instance_id": instance_id, "version": version, "pid": pid})
+            }),
+        ),
         DaemonRequest::Stop { instance_id } => respond(mgr.stop(&instance_id)),
         DaemonRequest::NewPage { instance_id } => respond(mgr.new_page(&instance_id).map(|page_id| json!({"page_id": page_id}))),
         DaemonRequest::Navigate { instance_id, page_id, url, wait_until, .. } => respond(mgr.navigate(&instance_id, &page_id, &url, timeout, wait_until.as_deref()).map(|o| json!({"navigation_id": o.nav_id, "status_code": o.status_code}))),
@@ -290,8 +303,38 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
             };
             respond(result.map(|result| json!({"result": result})))
         },
-        DaemonRequest::Click { instance_id, page_id, x, y } => respond(mgr.click(&instance_id, &page_id, x, y).map(|()| json!({"clicked": true, "x": x, "y": y}))),
-        DaemonRequest::ClickSelector { instance_id, page_id, selector, .. } => respond(mgr.click_selector(&instance_id, &page_id, &selector, timeout).map(|(x,y)| json!({"clicked": true, "selector": selector, "x": x, "y": y}))),
+        DaemonRequest::Click { instance_id, page_id, x, y } => {
+            let log = mgr.download_log(&instance_id);
+            let seq = log.as_ref().map(|l| l.snapshot().0);
+            let res = mgr.click(&instance_id, &page_id, x, y);
+            respond(res.map(|()| {
+                let mut obj = json!({"clicked": true, "x": x, "y": y});
+                if let (Some(log), Some(seq)) = (log, seq) {
+                    let mut dl = log.since(seq);
+                    if !dl.is_empty() {
+                        mgr.populate_download_pages(&instance_id, &mut dl);
+                        obj["downloads"] = json!(dl);
+                    }
+                }
+                obj
+            }))
+        },
+        DaemonRequest::ClickSelector { instance_id, page_id, selector, .. } => {
+            let log = mgr.download_log(&instance_id);
+            let seq = log.as_ref().map(|l| l.snapshot().0);
+            let res = mgr.click_selector(&instance_id, &page_id, &selector, timeout);
+            respond(res.map(|(x, y)| {
+                let mut obj = json!({"clicked": true, "selector": selector, "x": x, "y": y});
+                if let (Some(log), Some(seq)) = (log, seq) {
+                    let mut dl = log.since(seq);
+                    if !dl.is_empty() {
+                        mgr.populate_download_pages(&instance_id, &mut dl);
+                        obj["downloads"] = json!(dl);
+                    }
+                }
+                obj
+            }))
+        },
         DaemonRequest::Screenshot { instance_id, page_id, format, quality, path, selector, clip, .. } => respond(mgr.screenshot(&instance_id, &page_id, format.as_deref(), quality, path.as_deref(), selector.as_deref(), clip, timeout).map(|(bytes, path, rect)| json!({"bytes": bytes.len(), "path": path, "clip": {"x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height}}))),
         DaemonRequest::Cookies { instance_id } => respond(mgr.cookies(&instance_id).map(|cookies| json!({"cookies": cookies}))),
         DaemonRequest::Text { instance_id, page_id, selector, .. } => respond(mgr.text(&instance_id, &page_id, selector.as_deref(), timeout).map(|text| json!({"text": text}))),
@@ -313,6 +356,16 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
         DaemonRequest::Scroll { instance_id, page_id, selector, .. } => respond(mgr.scroll(&instance_id, &page_id, selector.as_deref(), timeout)),
         DaemonRequest::Tabs { instance_id, .. } => respond(mgr.tabs(&instance_id, timeout).map(|tabs| json!({"tabs": tabs}))),
         DaemonRequest::CloseTab { instance_id, page_id } => respond(mgr.close_tab(&instance_id, &page_id).map(|()| json!({"closed_page": page_id}))),
+        DaemonRequest::Downloads {
+            instance_id,
+            wait_secs,
+        } => {
+            let wait = wait_secs.map(Duration::from_secs);
+            respond(
+                mgr.downloads(&instance_id, wait)
+                    .map(|downloads| json!({ "downloads": downloads })),
+            )
+        }
     }
 }
 

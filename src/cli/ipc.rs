@@ -26,6 +26,8 @@ pub enum DaemonRequest {
         headless: Option<bool>,
         #[serde(default)]
         executable: Option<String>,
+        #[serde(default)]
+        downloads_dir: Option<std::path::PathBuf>,
     },
 
     /// List all running instances.
@@ -292,6 +294,13 @@ pub enum DaemonRequest {
         instance_id: String,
         page_id: String,
     },
+
+    /// View or wait for downloads on an instance.
+    Downloads {
+        instance_id: String,
+        #[serde(default)]
+        wait_secs: Option<u64>,
+    },
 }
 
 impl DaemonRequest {
@@ -300,6 +309,7 @@ impl DaemonRequest {
         match self {
             Self::Launch { .. } => 180,
             Self::Shutdown => 20,
+            Self::Downloads { wait_secs, .. } => wait_secs.unwrap_or(0).saturating_add(10),
             Self::Navigate { timeout_secs, .. }
             | Self::Evaluate { timeout_secs, .. }
             | Self::ClickSelector { timeout_secs, .. }
@@ -481,6 +491,7 @@ mod tests {
         let launch = DaemonRequest::Launch {
             headless: None,
             executable: None,
+            downloads_dir: None,
         };
         assert_eq!(launch.read_timeout().as_secs(), 210);
     }
@@ -700,5 +711,42 @@ mod tests {
         assert!(!back.ok);
         assert_eq!(back.error.as_deref(), Some("instance not found"));
         assert!(back.data.is_none());
+    }
+
+    #[test]
+    fn downloads_request_serde_round_trip() {
+        let req = DaemonRequest::Downloads {
+            instance_id: "00000001".into(),
+            wait_secs: Some(10),
+        };
+        let serialized = serde_json::to_string(&req).expect("serialize");
+        let deserialized: DaemonRequest = serde_json::from_str(&serialized).expect("deserialize");
+        match deserialized {
+            DaemonRequest::Downloads {
+                instance_id,
+                wait_secs,
+            } => {
+                assert_eq!(instance_id, "00000001");
+                assert_eq!(wait_secs, Some(10));
+            }
+            other => panic!("expected Downloads, got {other:?}"),
+        }
+        assert_eq!(req.timeout_secs(), 20);
+
+        // Minimal payload without wait_secs defaults to None and 10s timeout
+        let minimal = r#"{"method":"Downloads","params":{"instance_id":"00000001"}}"#;
+        let deserialized: DaemonRequest =
+            serde_json::from_str(minimal).expect("deserialize minimal");
+        match &deserialized {
+            DaemonRequest::Downloads {
+                instance_id,
+                wait_secs,
+            } => {
+                assert_eq!(instance_id, "00000001");
+                assert_eq!(*wait_secs, None);
+            }
+            other => panic!("expected Downloads, got {other:?}"),
+        }
+        assert_eq!(deserialized.timeout_secs(), 10);
     }
 }

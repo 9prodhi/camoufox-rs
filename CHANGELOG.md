@@ -6,6 +6,17 @@ All notable changes to camoufox-rs are documented here.
 
 ### Added
 
+- **Download log and file saving (`downloads` command and `--downloads-dir`)**:
+  - `launch --downloads-dir <path>` configures a validated absolute directory where downloads
+    are saved (defaults to `cancel` behavior when omitted, preventing uninspected files on disk).
+  - Saved files are written to `<downloads_dir>/<uuid>`, verified on disk against Camoufox 158;
+    paths are never derived from untrusted `suggestedFileName`.
+  - `downloads <instance_id> [--wait <secs>]` views or waits for download lifecycle events via
+    a context-scoped `DownloadLog`. Condvar waiting runs outside the per-instance mutex so it
+    never blocks concurrent commands on that instance.
+  - `click` and `click_selector` responses include recent download events (`"downloads": [...]`),
+    enabling the two-step agent pattern `click <inst> <page> <sel> && downloads <inst> --wait 10`.
+
 - **Browsing command surface (20 new CLI subcommands)**: the CLI grew from 12 primitives to a
   full browsing/scraping surface. Every new command is a thin CLI/IPC wrapper over the existing
   `api` layer — no new protocol plumbing.

@@ -38,6 +38,11 @@ impl ConnectionState {
         *self == ConnectionState::Closed
     }
 
+    /// Closing and closed connections refuse new requests.
+    pub fn rejects_sends(&self) -> bool {
+        matches!(self, Self::Closing | Self::Closed)
+    }
+
     /// Returns `true` if normal commands can be sent (connection is `Ready`).
     #[inline]
     pub fn is_ready(&self) -> bool {

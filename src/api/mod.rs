@@ -13,7 +13,8 @@
 //! use camoufox::api::{Browser, BrowserOptions};
 //!
 //! // After establishing a Connection via transport + protocol layers:
-//! // let browser = Browser::connect(connection, BrowserOptions::default())?;
+//! // let root = connection.root_session();
+//! // let browser = Browser::connect(connection, root, BrowserOptions::default())?;
 //! // let context = browser.new_context(Default::default())?;
 //! // let main_frame = context.new_main_frame()?;
 //! // main_frame.navigate("https://example.com", Default::default(), std::time::Duration::from_secs(30))?;
@@ -21,11 +22,16 @@
 
 pub mod browser;
 pub mod context;
+pub mod dialog;
+pub(crate) mod exec_ctx;
 pub mod main_frame;
+pub(crate) mod page_registry;
 
 pub use browser::{Browser, BrowserOptions, ProxyConfig};
 pub use context::{BrowserContext, ContextOptions, Cookie, CookieOptions, Geolocation, Viewport};
+pub use dialog::{DialogInfo, DialogPolicy};
 pub use main_frame::{
     KeyEventParams, MainFrame, MouseEventParams, NavigateOptions, Rect, ScreenshotOptions,
     WheelEventParams,
 };
+pub mod selectors;

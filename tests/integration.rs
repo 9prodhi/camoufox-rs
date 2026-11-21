@@ -10,6 +10,8 @@
 use std::path::PathBuf;
 use std::process::Child;
 use std::time::Duration;
+#[cfg(feature = "cli")]
+use std::time::Instant;
 
 use camoufox::api::{Browser, BrowserOptions, ContextOptions};
 use camoufox::config::LaunchConfig;
@@ -561,7 +563,8 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
     //   MainFrame::dispatch_mouse_event calls (mousemove/mousedown/mouseup).
     //
     // The fixture page arms a capture-phase click listener that records the
-    // last click into window.__click_result. We assert the listener fired with
+    // last click into a shared DOM dataset (visible across isolated worlds).
+    // We assert the listener fired with
     // isTrusted == true at the dispatched coordinates.
     //
     // Run with (requires the `cli` feature — the `click` command only exists
@@ -599,6 +602,15 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
         .click(&instance_id, &page_id, CLICK_X, CLICK_Y)
         .expect("click failed");
 
+    // Undefined must be null, and page exceptions must be errors, not envelopes.
+    let undefined = manager.evaluate(&instance_id, &page_id, "void 0", Duration::from_secs(10));
+    let exception = manager.evaluate(
+        &instance_id,
+        &page_id,
+        "(() => { throw new Error('evaluate regression'); })()",
+        Duration::from_secs(10),
+    );
+
     // Read back the recorded event field by field, operating on the returned
     // serde_json::Value via its inherent accessors — matching this file's
     // evaluate-result convention (no serde_json import needed).
@@ -606,7 +618,7 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
         .evaluate(
             &instance_id,
             &page_id,
-            "window.__click_result && window.__click_result.trusted",
+            "JSON.parse(document.documentElement.dataset.clickResult || 'null')?.trusted",
             Duration::from_secs(10),
         )
         .expect("evaluate trusted failed");
@@ -614,7 +626,7 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
         .evaluate(
             &instance_id,
             &page_id,
-            "window.__click_result ? window.__click_result.x : -1",
+            "JSON.parse(document.documentElement.dataset.clickResult || 'null')?.x ?? -1",
             Duration::from_secs(10),
         )
         .expect("evaluate clientX failed");
@@ -622,13 +634,18 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
         .evaluate(
             &instance_id,
             &page_id,
-            "window.__click_result ? window.__click_result.y : -1",
+            "JSON.parse(document.documentElement.dataset.clickResult || 'null')?.y ?? -1",
             Duration::from_secs(10),
         )
         .expect("evaluate clientY failed");
 
     // Stop the browser before asserting so a failed assertion can't leak it.
     let _ = manager.stop(&instance_id);
+
+    assert!(undefined.expect("evaluate undefined failed").is_null());
+    assert!(exception
+        .expect_err("page exception must fail")
+        .contains("page script error"));
 
     // The load-bearing assertion: the event must be TRUSTED. `None` means the
     // listener never fired (no click registered); `Some(false)` means the event
@@ -649,6 +666,35 @@ fn click_command_dispatches_trusted_event_at_coordinates() {
         Some(CLICK_Y as i64),
         "event clientY must equal the dispatched y ({CLICK_Y}); got {client_y:?}"
     );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn evaluate_main_world_reads_page_globals() {
+    use camoufox::cli::instance::InstanceManager;
+
+    let mut manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch(Some(true), Some(&camoufox_bin()))
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+    let navigation = manager.navigate(
+        &instance_id,
+        &page_id,
+        "data:text/html,<script>window.__app%20=%20%7Bn:%2042%7D</script>",
+        timeout,
+        Some("load"),
+    );
+    let isolated = manager.evaluate(&instance_id, &page_id, "typeof window.__app", timeout);
+    let main_world = manager.evaluate_main_world(&instance_id, &page_id, "window.__app.n", timeout);
+
+    // Stop before asserting so failures do not leak the browser.
+    let _ = manager.stop(&instance_id);
+    navigation.expect("navigate to app-state page failed");
+    assert_eq!(isolated.expect("isolated evaluate failed"), "undefined");
+    assert_eq!(main_world.expect("main-world evaluate failed"), 42);
 }
 
 #[test]
@@ -688,11 +734,11 @@ fn reading_commands_extract_text_html_links_and_metadata() {
         .expect("navigate to browse fixture failed");
 
     let timeout = Duration::from_secs(10);
-    let full_text = manager.text(&instance_id, &page_id, None, timeout);
-    let scoped_text = manager.text(&instance_id, &page_id, Some("#body-copy"), timeout);
-    let missing_text = manager.text(&instance_id, &page_id, Some("#nope"), timeout);
-    let scoped_html = manager.html(&instance_id, &page_id, Some("#heading"), timeout);
-    let links = manager.links(&instance_id, &page_id, None, timeout);
+    let full_text = manager.text(&instance_id, &page_id, None, &[], timeout);
+    let scoped_text = manager.text(&instance_id, &page_id, Some("#body-copy"), &[], timeout);
+    let missing_text = manager.text(&instance_id, &page_id, Some("#nope"), &[], timeout);
+    let scoped_html = manager.html(&instance_id, &page_id, Some("#heading"), &[], timeout);
+    let links = manager.links(&instance_id, &page_id, None, &[], timeout);
     let og = manager.data(&instance_id, &page_id, true, false, false, timeout);
     let all = manager.data(&instance_id, &page_id, false, false, false, timeout);
     let url = manager.url(&instance_id, &page_id, timeout);
@@ -793,7 +839,7 @@ fn interaction_commands_fill_press_and_click_by_selector() {
 
     let timeout = Duration::from_secs(10);
 
-    let filled = manager.fill(&instance_id, &page_id, "#q", "hello world", timeout);
+    let filled = manager.fill(&instance_id, &page_id, "#q", "hello world", &[], timeout);
     let input_value = manager.evaluate(
         &instance_id,
         &page_id,
@@ -801,12 +847,12 @@ fn interaction_commands_fill_press_and_click_by_selector() {
         timeout,
     );
     // Enter must submit the form — the composition-commit regression guard.
-    let pressed = manager.press(&instance_id, &page_id, "Enter");
-    let clicked = manager.click_selector(&instance_id, &page_id, "#go", timeout);
-    let selected = manager.select_option(&instance_id, &page_id, "#sel", "Beta", timeout);
-    let hovered = manager.hover(&instance_id, &page_id, "#heading", timeout);
-    let missing = manager.click_selector(&instance_id, &page_id, "#nope", timeout);
-    let log = manager.text(&instance_id, &page_id, Some("#log"), timeout);
+    let pressed = manager.press(&instance_id, &page_id, "Enter", &[]);
+    let clicked = manager.click_selector(&instance_id, &page_id, "#go", &[], timeout);
+    let selected = manager.select_option(&instance_id, &page_id, "#sel", "Beta", &[], timeout);
+    let hovered = manager.hover(&instance_id, &page_id, "#heading", &[], timeout);
+    let missing = manager.click_selector(&instance_id, &page_id, "#nope", &[], timeout);
+    let log = manager.text(&instance_id, &page_id, Some("#log"), &[], timeout);
 
     let _ = manager.stop(&instance_id);
 
@@ -821,7 +867,7 @@ fn interaction_commands_fill_press_and_click_by_selector() {
         "fill types the value into the element"
     );
     pressed.expect("press Enter failed");
-    let (x, y) = clicked.expect("click by selector failed");
+    let (x, y, _) = clicked.expect("click by selector failed");
     assert!(x > 0 && y > 0, "click resolved a real box, got ({x}, {y})");
     let selected = selected.expect("select failed");
     assert_eq!(selected["value"], "b", "select matches by visible text too");
@@ -966,6 +1012,7 @@ fn wait_fails_fast_on_invalid_selector() {
         &instance_id,
         &page_id,
         ":::not-a-selector",
+        &[],
         Duration::from_secs(30),
     );
     let elapsed = started.elapsed();
@@ -982,4 +1029,3284 @@ fn wait_fails_fast_on_invalid_selector() {
         "wait must fail fast on a permanent (invalid-selector) error, not burn the \
          full 30s timeout. Took {elapsed:?}."
     );
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn stop_returns_quickly_without_sigkill() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::BrowseServer::start();
+    let mut mgr = InstanceManager::new();
+    let (id, _, pid) = mgr.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = mgr.new_page(&id).unwrap();
+    mgr.navigate(
+        &id,
+        &page,
+        &server.url,
+        Duration::from_secs(20),
+        Some("load"),
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    mgr.stop(&id).unwrap();
+    let elapsed = start.elapsed();
+    eprintln!("stop elapsed: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(3));
+    assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0);
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn stop_interrupts_a_long_running_command() {
+    use camoufox::cli::instance::InstanceManager;
+    use std::sync::Arc;
+    let mut mgr = InstanceManager::new();
+    let (id, _, _) = mgr.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = mgr.new_page(&id).unwrap();
+    let mgr = Arc::new(mgr);
+    let (other, id2) = (Arc::clone(&mgr), id.clone());
+    let waiter = std::thread::spawn(move || {
+        other.wait_for_selector(&id2, &page, "#never-appears", &[], Duration::from_secs(30))
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let start = std::time::Instant::now();
+    mgr.stop(&id).unwrap();
+    let elapsed = start.elapsed();
+    eprintln!("interrupting stop elapsed: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(3));
+    assert!(waiter.join().unwrap().is_err());
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn shutdown_all_three_instances_in_parallel() {
+    use camoufox::cli::instance::InstanceManager;
+    let mut mgr = InstanceManager::new();
+    let pids: Vec<_> = (0..3)
+        .map(|_| mgr.launch(Some(true), Some(&camoufox_bin())).unwrap().2)
+        .collect();
+    let start = std::time::Instant::now();
+    mgr.shutdown_all();
+    let elapsed = start.elapsed();
+    eprintln!("three-instance shutdown elapsed: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5));
+    for pid in pids {
+        assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0);
+    }
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn click_download_link_is_logged_and_canceled_by_default() {
+    use camoufox::cli::downloads::DownloadState;
+    use camoufox::cli::instance::InstanceManager;
+
+    let server = fixtures::DownloadServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch(Some(true), Some(&camoufox_bin()))
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &format!("{}/download.html", server.base_url),
+            Duration::from_secs(30),
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let _ = manager.click_selector(&instance_id, &page_id, "#dl", &[], Duration::from_secs(10));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut final_entry = None;
+    while std::time::Instant::now() < deadline {
+        let entries = manager
+            .downloads(&instance_id, Some(Duration::from_millis(500)))
+            .expect("downloads failed");
+        if let Some(entry) = entries.iter().find(|e| e.state != DownloadState::Started) {
+            final_entry = Some(entry.clone());
+            break;
+        }
+    }
+
+    let _ = manager.stop(&instance_id);
+
+    let entry = final_entry.expect("expected non-Started download within 10s");
+    assert_eq!(entry.state, DownloadState::Canceled);
+    assert_eq!(entry.path, None);
+    assert!(entry.url.contains("/report.pdf"));
+    assert_eq!(entry.page.as_deref(), Some("p1"));
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn downloads_dir_saves_file_at_uuid_path() {
+    use camoufox::cli::downloads::DownloadState;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let server = fixtures::DownloadServer::start();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let downloads_dir = dir.path().to_path_buf();
+
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            downloads_dir: Some(downloads_dir.clone()),
+            ..Default::default()
+        })
+        .expect("launch_with failed");
+
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &format!("{}/download.html", server.base_url),
+            Duration::from_secs(30),
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let _ = manager.click_selector(&instance_id, &page_id, "#dl", &[], Duration::from_secs(10));
+
+    // Wait for the download to complete
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut completed_entry = None;
+    while std::time::Instant::now() < deadline {
+        let entries = manager
+            .downloads(&instance_id, Some(Duration::from_millis(500)))
+            .expect("downloads query failed");
+        if let Some(entry) = entries.iter().find(|e| e.state == DownloadState::Completed) {
+            completed_entry = Some(entry.clone());
+            break;
+        }
+    }
+
+    let _ = manager.stop(&instance_id);
+
+    let entry = completed_entry.expect("download did not complete within timeout");
+    assert_eq!(entry.state, DownloadState::Completed);
+    let expected_path = downloads_dir
+        .join(&entry.uuid)
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(entry.path.as_deref(), Some(expected_path.as_str()));
+
+    // Verify on disk that downloads_dir/uuid exists with the fixture bytes
+    let saved_file = downloads_dir.join(&entry.uuid);
+    assert!(
+        saved_file.exists(),
+        "file at {saved_file:?} must exist on disk"
+    );
+    let saved_bytes = std::fs::read(&saved_file).expect("read saved file");
+    assert_eq!(
+        saved_bytes, server.pdf_bytes,
+        "saved file contents must match fixture"
+    );
+
+    // Guardrail: Assert no file named evil.pdf anywhere in downloads_dir or its parents
+    assert!(!downloads_dir.join("evil.pdf").exists());
+    assert!(!downloads_dir.join("../evil.pdf").exists());
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn navigate_download_with_dir_still_returns_navigation_became_download_and_logs() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let server = fixtures::DownloadServer::start();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let downloads_dir = dir.path().to_path_buf();
+
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            downloads_dir: Some(downloads_dir),
+            ..Default::default()
+        })
+        .expect("launch_with failed");
+
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let result = manager.navigate(
+        &instance_id,
+        &page_id,
+        &format!("{}/report.pdf", server.base_url),
+        Duration::from_secs(10),
+        None,
+    );
+
+    let entries = manager
+        .downloads(&instance_id, Some(Duration::from_secs(5)))
+        .expect("downloads failed");
+
+    let _ = manager.stop(&instance_id);
+
+    let err =
+        result.expect_err("navigate to download attachment must return NavigationBecameDownload");
+    assert!(
+        err.contains("navigation diverted into download flow") || err.contains("became a download"),
+        "expected NavigationBecameDownload in error, got: {err}"
+    );
+    assert!(
+        !entries.is_empty(),
+        "download event must be logged in DownloadLog"
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn page_usable_after_navigation_became_download() {
+    use crate::fixtures::{AttachmentServer, BrowseServer};
+    use camoufox::cli::instance::InstanceManager;
+
+    let browse = BrowseServer::start();
+    let attachment = AttachmentServer::start();
+
+    let mut manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch(Some(true), Some(&camoufox_bin()))
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(&instance_id, &page_id, &browse.url, timeout, Some("load"))
+        .expect("navigate to initial page failed");
+
+    let initial_url = manager
+        .url(&instance_id, &page_id, Duration::from_secs(3))
+        .expect("url failed")
+        .0;
+    assert_eq!(initial_url, browse.url);
+
+    let nav_err = manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &attachment.url,
+            timeout,
+            Some("load"),
+        )
+        .expect_err("navigation to attachment should fail");
+    assert!(
+        nav_err.contains("download"),
+        "expected error mentioning download, got: {nav_err}"
+    );
+
+    let t0 = Instant::now();
+    let (current_url, _) = manager
+        .url(&instance_id, &page_id, Duration::from_secs(3))
+        .expect("url after download failed");
+    assert!(
+        t0.elapsed() < Duration::from_secs(3),
+        "url took {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(current_url, browse.url);
+
+    let t1 = Instant::now();
+    let eval_res = manager
+        .evaluate(&instance_id, &page_id, "1 + 1", Duration::from_secs(3))
+        .expect("evaluate after download failed");
+    assert!(
+        t1.elapsed() < Duration::from_secs(3),
+        "evaluate took {:?}",
+        t1.elapsed()
+    );
+    assert_eq!(eval_res, 2);
+
+    let _ = manager.stop(&instance_id);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn main_world_strict_csp_reports_bypass_hint() {
+    use crate::fixtures::CspServer;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let csp = CspServer::start();
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            bypass_csp: false,
+            ..Default::default()
+        })
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &csp.url("/csp_strict.html"),
+            timeout,
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let t0 = Instant::now();
+    let err = manager
+        .evaluate_main_world(
+            &instance_id,
+            &page_id,
+            "window.answer",
+            Duration::from_secs(3),
+        )
+        .expect_err("evaluate_main_world should fail on strict CSP");
+    let elapsed = t0.elapsed();
+    let _ = manager.stop(&instance_id);
+
+    assert!(elapsed < Duration::from_secs(3), "eval took {elapsed:?}");
+    assert!(
+        err.contains("--bypass-csp"),
+        "error must mention --bypass-csp, got: {err}"
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn main_world_strict_csp_works_with_bypass_csp() {
+    use crate::fixtures::CspServer;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let csp = CspServer::start();
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            bypass_csp: true,
+            ..Default::default()
+        })
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &csp.url("/csp_strict.html"),
+            timeout,
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let res = manager
+        .evaluate_main_world(
+            &instance_id,
+            &page_id,
+            "window.answer",
+            Duration::from_secs(10),
+        )
+        .expect("evaluate_main_world failed with bypass_csp");
+    let _ = manager.stop(&instance_id);
+
+    assert_eq!(res, 42);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn main_world_unsafe_inline_works_without_flag() {
+    use crate::fixtures::CspServer;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let csp = CspServer::start();
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            bypass_csp: false,
+            ..Default::default()
+        })
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &csp.url("/csp_inline.html"),
+            timeout,
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let res = manager
+        .evaluate_main_world(
+            &instance_id,
+            &page_id,
+            "window.answer",
+            Duration::from_secs(10),
+        )
+        .expect("evaluate_main_world on csp_inline failed");
+    let _ = manager.stop(&instance_id);
+
+    assert_eq!(res, 42);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn main_world_nonce_csp_feasibility() {
+    use crate::fixtures::CspServer;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let csp = CspServer::start();
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            bypass_csp: false,
+            ..Default::default()
+        })
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &csp.url("/csp_nonce.html"),
+            timeout,
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let res = manager
+        .evaluate_main_world(
+            &instance_id,
+            &page_id,
+            "window.answer",
+            Duration::from_secs(10),
+        )
+        .expect("evaluate_main_world on nonce CSP should succeed without bypass_csp");
+    let _ = manager.stop(&instance_id);
+
+    // D10 feasibility gate:
+    // Camoufox 158 allows dynamically inserted scripts with borrowed nonces.
+    assert_eq!(res, 42);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn main_world_page_global_named_val_is_readable() {
+    use crate::fixtures::CspServer;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let csp = CspServer::start();
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            bypass_csp: false,
+            ..Default::default()
+        })
+        .expect("launch failed");
+    let page_id = manager.new_page(&instance_id).expect("new_page failed");
+    let timeout = Duration::from_secs(30);
+
+    manager
+        .navigate(
+            &instance_id,
+            &page_id,
+            &csp.url("/val.html"),
+            timeout,
+            Some("load"),
+        )
+        .expect("navigate failed");
+
+    let res = manager
+        .evaluate_main_world(&instance_id, &page_id, "val", Duration::from_secs(10))
+        .expect("evaluate_main_world('val') failed");
+    let _ = manager.stop(&instance_id);
+
+    assert_eq!(res, 7);
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn manual_dialogs_can_be_resolved() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::DialogServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(&instance, &page, &server.url, timeout, Some("load"))
+        .unwrap();
+    for (selector, kind, accept, text, expected) in [
+        ("#alert", "alert", true, None, "alert"),
+        ("#confirm", "confirm", false, None, "false"),
+        ("#prompt", "prompt", true, Some("hi"), "hi"),
+    ] {
+        let start = std::time::Instant::now();
+        let (_, _, outcome) = manager
+            .click_selector(&instance, &page, selector, &[], timeout)
+            .unwrap();
+        assert_eq!(outcome.dialog.unwrap().kind, kind);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(manager
+            .text(&instance, &page, None, &[], timeout)
+            .unwrap_err()
+            .contains("open"));
+        manager.dialog(&instance, &page, accept, text).unwrap();
+        let value = manager
+            .evaluate(&instance, &page, "document.body.dataset.result", timeout)
+            .unwrap();
+        assert_eq!(value.as_str(), Some(expected));
+    }
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn in_flight_wait_fails_when_dialog_opens() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::DialogServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(&instance, &page, &server.url, timeout, Some("load"))
+        .unwrap();
+    manager
+        .evaluate_main_world(
+            &instance,
+            &page,
+            "setTimeout(() => alert('later'), 500), 1",
+            timeout,
+        )
+        .unwrap();
+    let start = std::time::Instant::now();
+    let error = manager
+        .wait_for_selector(
+            &instance,
+            &page,
+            "#never-appears",
+            &[],
+            Duration::from_secs(20),
+        )
+        .unwrap_err();
+    let elapsed = start.elapsed();
+    eprintln!("dialog wait fail-fast elapsed: {elapsed:?}; error: {error}");
+    assert!(elapsed < Duration::from_secs(3));
+    assert!(
+        error.contains("alert") && error.contains("later"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("camoufox dialog {instance} {page} accept|dismiss")),
+        "{error}"
+    );
+
+    manager.dialog(&instance, &page, true, None).unwrap();
+    manager.text(&instance, &page, None, &[], timeout).unwrap();
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn accept_policy_auto_handles() {
+    use camoufox::api::DialogPolicy;
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+    let server = fixtures::DialogServer::start();
+    let manager = InstanceManager::new();
+    let (instance, _, _) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            dialogs: DialogPolicy::Accept,
+            ..Default::default()
+        })
+        .unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(&instance, &page, &server.url, timeout, Some("load"))
+        .unwrap();
+    manager
+        .click_selector(&instance, &page, "#confirm", &[], timeout)
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let value = manager.evaluate(
+            &instance,
+            &page,
+            "document.body.dataset.result",
+            Duration::from_secs(1),
+        );
+        if value.as_ref().ok().and_then(|v| v.as_str()) == Some("true") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "confirm was not accepted: {value:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let tabs = manager.tabs(&instance, timeout).unwrap();
+    let tab = tabs.iter().find(|tab| tab["page_id"] == page).unwrap();
+    assert!(
+        tab.get("dialog").is_none(),
+        "dialog is still pending: {tab}"
+    );
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn target_blank_link_adopted_as_new_tab() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::PopupServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/popup.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    manager
+        .click_selector(&instance, &page, "#blank", &[], timeout)
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut popup_id = None;
+    while std::time::Instant::now() < deadline {
+        let tabs = manager.tabs(&instance, timeout).unwrap();
+        if tabs.len() >= 2 {
+            for tab in &tabs {
+                let pid = tab["page_id"].as_str().unwrap();
+                let url = tab["url"].as_str().unwrap_or("");
+                if pid != page && url.ends_with("/main.html") {
+                    assert_eq!(tab["opener"].as_str(), Some(page.as_str()));
+                    popup_id = Some(pid.to_string());
+                    break;
+                }
+            }
+            if popup_id.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let p2 = popup_id.expect("popup tab was not adopted within 5s");
+    let text = manager.text(&instance, &p2, None, &[], timeout).unwrap();
+    assert!(
+        text.contains("MAIN_SENTINEL_8f3a2b1c"),
+        "text on adopted popup should contain fixture marker: {text}"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn window_open_popup_adopted_and_evaluable() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::PopupServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/popup.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    manager
+        .click_selector(&instance, &page, "#open", &[], timeout)
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut popup_id = None;
+    while std::time::Instant::now() < deadline {
+        let tabs = manager.tabs(&instance, timeout).unwrap();
+        if tabs.len() >= 2 {
+            for tab in &tabs {
+                let pid = tab["page_id"].as_str().unwrap();
+                if pid != page {
+                    assert_eq!(tab["opener"].as_str(), Some(page.as_str()));
+                    popup_id = Some(pid.to_string());
+                    break;
+                }
+            }
+            if popup_id.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let p2 = popup_id.expect("window.open popup was not adopted within 5s");
+    let val = manager
+        .evaluate(&instance, &p2, "1 + 1", timeout)
+        .expect("evaluate on window.open popup should succeed");
+    assert_eq!(val, 2);
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn self_closing_popup_disappears_from_tabs() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::PopupServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/popup.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    manager
+        .click_selector(&instance, &page, "#selfclose", &[], timeout)
+        .unwrap();
+
+    // 1. First it should appear as a tab
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut popup_id = None;
+    while std::time::Instant::now() < deadline {
+        let tabs = manager.tabs(&instance, timeout).unwrap();
+        if tabs.len() >= 2 {
+            for tab in &tabs {
+                let pid = tab["page_id"].as_str().unwrap();
+                if pid != page {
+                    popup_id = Some(pid.to_string());
+                    break;
+                }
+            }
+            if popup_id.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let p2 = popup_id.expect("selfclose popup was not adopted");
+
+    // 2. The popup calls window.close() after 300 ms, so it should disappear from tabs
+    let close_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut closed = false;
+    while std::time::Instant::now() < close_deadline {
+        let tabs = manager.tabs(&instance, timeout).unwrap();
+        if tabs.iter().all(|tab| tab["page_id"] != p2) {
+            closed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(closed, "self-closing popup did not disappear from tabs");
+
+    // Also verify that accessing p2 returns "page p2 was closed" error
+    let err = manager.evaluate(&instance, &p2, "1", timeout).unwrap_err();
+    assert!(
+        err.contains("was closed"),
+        "expected 'page was closed' error, got: {err}"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn new_page_still_works_and_is_not_duplicated_as_popup() {
+    use camoufox::cli::instance::InstanceManager;
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let p1 = manager.new_page(&instance).unwrap();
+    assert_eq!(p1, "p1");
+
+    for i in 2..=6 {
+        let page = manager.new_page(&instance).unwrap();
+        assert_eq!(page, format!("p{i}"));
+    }
+
+    let tabs = manager.tabs(&instance, Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        tabs.len(),
+        6,
+        "tabs must have exactly 6 pages after 6x new_page: {tabs:?}"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn frame_selector_not_iframe_errors_clearly() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    // 1. Non-existent iframe selector
+    let err_missing = manager
+        .text(&instance, &page, None, &["#nonexistent".into()], timeout)
+        .unwrap_err();
+    assert!(
+        err_missing.contains("--frame #nonexistent: no element matches"),
+        "expected missing element error, got: {err_missing}"
+    );
+
+    // 2. Element exists but is a div, not an iframe
+    let err_not_iframe = manager
+        .text(&instance, &page, None, &["#not-an-iframe".into()], timeout)
+        .unwrap_err();
+    assert!(
+        err_not_iframe.contains("--frame #not-an-iframe: element is not an iframe"),
+        "expected not-an-iframe error, got: {err_not_iframe}"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn text_inside_same_origin_iframe() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let text = manager
+        .text(
+            &instance,
+            &page,
+            Some("#msg"),
+            &["#same-frame".into()],
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(text, "Hello from same origin");
+
+    let full_text = manager
+        .text(&instance, &page, None, &["#same-frame".into()], timeout)
+        .unwrap();
+    assert!(full_text.contains("Same Origin Frame"));
+    assert!(full_text.contains("Hello from same origin"));
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn click_and_fill_inside_cross_origin_iframe() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    // 1. Fill input inside cross-origin iframe
+    let tag = manager
+        .fill(
+            &instance,
+            &page,
+            "#cross-input",
+            "hello-cross",
+            &["#cross-frame".into()],
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(tag, "input");
+
+    // Verify value inside frame
+    let val = manager
+        .evaluate_scoped(
+            &instance,
+            &page,
+            "document.getElementById('cross-input').value",
+            false,
+            &["#cross-frame".into()],
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(val, "hello-cross");
+
+    // 2. Click button inside cross-origin iframe
+    let _ = manager
+        .click_selector(
+            &instance,
+            &page,
+            "#cross-btn",
+            &["#cross-frame".into()],
+            timeout,
+        )
+        .unwrap();
+    // Verify click handler set data-clicked attribute
+    let clicked_attr = manager
+        .evaluate_scoped(
+            &instance,
+            &page,
+            "document.getElementById('cross-input').getAttribute('data-clicked')",
+            false,
+            &["#cross-frame".into()],
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(clicked_attr, "cross-yes");
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn nested_frames_chain() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let text = manager
+        .text(
+            &instance,
+            &page,
+            Some("#nested-val"),
+            &["#nested-outer".into(), "#nested-inner".into()],
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(text, "Deep Content");
+
+    let _ = manager
+        .click_selector(
+            &instance,
+            &page,
+            "#nested-btn",
+            &["#nested-outer".into(), "#nested-inner".into()],
+            timeout,
+        )
+        .unwrap();
+    let clicked_attr = manager
+        .evaluate_scoped(
+            &instance,
+            &page,
+            "document.getElementById('nested-btn').getAttribute('data-clicked')",
+            false,
+            &["#nested-outer".into(), "#nested-inner".into()],
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(clicked_attr, "nested-yes");
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn shadow_pierce_click_open_root() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/shadow.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let text = manager
+        .text(
+            &instance,
+            &page,
+            Some("#open-host >>> #open-text"),
+            &[],
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(text, "Inside Open Shadow");
+
+    let _ = manager
+        .click_selector(&instance, &page, "#open-host >>> #open-btn", &[], timeout)
+        .unwrap();
+
+    let clicked = manager
+        .evaluate(
+            &instance,
+            &page,
+            "document.getElementById('open-host').shadowRoot.getElementById('open-btn').getAttribute('data-clicked')",
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(clicked, "open-yes");
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn shadow_closed_root_feasibility() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/shadow.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let probe = manager
+        .evaluate(
+            &instance,
+            &page,
+            "(() => { const el = document.getElementById('closed-host'); return typeof el.openOrClosedShadowRoot; })()",
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(probe, "undefined");
+    let err = manager
+        .text(
+            &instance,
+            &page,
+            Some("#closed-host >>> #closed-text"),
+            &[],
+            timeout,
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("has no open shadow root (absent or closed; cannot pierce)"),
+        "{err}"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn piercing_css_regressions() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    manager.evaluate(&instance, &page, r##"(() => {
+      document.body.innerHTML = '<a title="x >>> y">literal</a><div class="h"></div><div class="h"></div><div id="ends ">escaped</div>';
+      const hosts = document.querySelectorAll('.h');
+      hosts[0].attachShadow({mode:'open'}).innerHTML = '<span>first</span>';
+      hosts[1].attachShadow({mode:'open'}).innerHTML = '<span id="second">second</span>';
+    })()"##, timeout).unwrap();
+    assert_eq!(
+        manager
+            .text(
+                &instance,
+                &page,
+                Some(r#"a[title="x >>> y"]"#),
+                &[],
+                timeout
+            )
+            .unwrap(),
+        "literal"
+    );
+    assert_eq!(
+        manager
+            .text(&instance, &page, Some(".h >>> #second"), &[], timeout)
+            .unwrap(),
+        "second"
+    );
+    assert_eq!(
+        manager
+            .text(&instance, &page, Some(r"#ends\ "), &[], timeout)
+            .unwrap(),
+        "escaped"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn wait_delayed_frame() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    assert_eq!(manager.evaluate(&instance, &page, "setTimeout(() => { const f = document.createElement('iframe'); f.id = 'late'; f.srcdoc = '<button id=ready>ready</button>'; document.body.append(f); }, 1000); !!document.querySelector('#late')", timeout).unwrap(), false);
+    manager
+        .wait_for_selector(&instance, &page, "#ready", &["#late".into()], timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .text(&instance, &page, Some("#ready"), &["#late".into()], timeout)
+            .unwrap(),
+        "ready"
+    );
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn wait_delayed_shadow() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    assert_eq!(manager.evaluate(&instance, &page, "document.body.innerHTML = '<div id=host></div>'; setTimeout(() => document.querySelector('#host').attachShadow({mode:'open'}).innerHTML = '<b id=ready>ready</b>', 1500); !!document.querySelector('#host').shadowRoot", timeout).unwrap(), false);
+    manager
+        .wait_for_selector(&instance, &page, "#host >>> #ready", &[], timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .text(&instance, &page, Some("#host >>> #ready"), &[], timeout)
+            .unwrap(),
+        "ready"
+    );
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn wait_recreated_frame() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    assert_eq!(manager.evaluate(&instance, &page, "document.body.innerHTML = '<iframe id=late></iframe>'; setTimeout(() => document.querySelector('#late').remove(), 300); setTimeout(() => { const f = document.createElement('iframe'); f.id='late'; f.srcdoc='<b id=ready>ready</b>'; document.body.append(f); }, 1100); !!document.querySelector('#late').contentDocument?.querySelector('#ready')", timeout).unwrap(), false);
+    manager
+        .wait_for_selector(&instance, &page, "#ready", &["#late".into()], timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .text(&instance, &page, Some("#ready"), &["#late".into()], timeout)
+            .unwrap(),
+        "ready"
+    );
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn pointer_below_fold_same() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    let frames = ["#same-frame".into()];
+    manager.evaluate(&instance, &page, r#"document.querySelector('#same-frame').style.cssText = 'margin-top:3000px;width:400px;height:300px;'"#, timeout).unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML = '<button id="tiny" style="position:absolute;left:240px;top:150px;width:16px;height:16px;padding:0;border:0" onclick="this.dataset.clicked=1" onmouseover="this.dataset.hovered=1"></button>'"#, false, &frames, timeout).unwrap();
+    manager
+        .click_selector(&instance, &page, "#tiny", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#tiny').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1",
+        "click handler did not fire"
+    );
+    manager
+        .evaluate_scoped(
+            &instance,
+            &page,
+            "delete document.querySelector('#tiny').dataset.hovered",
+            false,
+            &frames,
+            timeout,
+        )
+        .unwrap();
+    manager.click(&instance, &page, 0, 0).unwrap();
+    manager
+        .evaluate(&instance, &page, "window.scrollTo(0,0)", timeout)
+        .unwrap();
+    manager
+        .hover(&instance, &page, "#tiny", &frames, timeout)
+        .unwrap();
+    manager
+        .wait_for_selector(&instance, &page, "#tiny[data-hovered]", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#tiny').dataset.hovered",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1",
+        "hover handler did not fire"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn pointer_below_fold_cross() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    let frames = ["#cross-frame".into()];
+    manager.evaluate(&instance, &page, r#"document.querySelector('#cross-frame').style.cssText = 'margin-top:3000px;width:400px;height:300px;'"#, timeout).unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML = '<button id="tiny" style="position:absolute;left:240px;top:150px;width:16px;height:16px;padding:0;border:0" onclick="this.dataset.clicked=1" onmouseover="this.dataset.hovered=1"></button>'"#, false, &frames, timeout).unwrap();
+    manager
+        .click_selector(&instance, &page, "#tiny", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#tiny').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1",
+        "click handler did not fire"
+    );
+    manager
+        .evaluate_scoped(
+            &instance,
+            &page,
+            "delete document.querySelector('#tiny').dataset.hovered",
+            false,
+            &frames,
+            timeout,
+        )
+        .unwrap();
+    manager.click(&instance, &page, 0, 0).unwrap();
+    manager
+        .evaluate(&instance, &page, "window.scrollTo(0,0)", timeout)
+        .unwrap();
+    manager
+        .hover(&instance, &page, "#tiny", &frames, timeout)
+        .unwrap();
+    manager
+        .wait_for_selector(&instance, &page, "#tiny[data-hovered]", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#tiny').dataset.hovered",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1",
+        "hover handler did not fire"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn pointer_below_fold_nested() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    let frames = ["#nested-outer".into(), "#nested-inner".into()];
+    manager.evaluate(&instance, &page, r#"document.querySelector('#nested-outer').style.cssText = 'margin-top:3000px;width:400px;height:300px;'"#, timeout).unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML = '<button id="tiny" style="position:absolute;left:240px;top:150px;width:16px;height:16px;padding:0;border:0" onclick="this.dataset.clicked=1" onmouseover="this.dataset.hovered=1"></button>'"#, false, &frames, timeout).unwrap();
+    manager
+        .click_selector(&instance, &page, "#tiny", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#tiny').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1",
+        "click handler did not fire"
+    );
+    manager
+        .evaluate_scoped(
+            &instance,
+            &page,
+            "delete document.querySelector('#tiny').dataset.hovered",
+            false,
+            &frames,
+            timeout,
+        )
+        .unwrap();
+    manager.click(&instance, &page, 0, 0).unwrap();
+    manager
+        .evaluate(&instance, &page, "window.scrollTo(0,0)", timeout)
+        .unwrap();
+    manager
+        .hover(&instance, &page, "#tiny", &frames, timeout)
+        .unwrap();
+    manager
+        .wait_for_selector(&instance, &page, "#tiny[data-hovered]", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#tiny').dataset.hovered",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1",
+        "hover handler did not fire"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn pointer_scaled_frame() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    let frames = ["#same-frame".into()];
+    manager.evaluate(&instance, &page, r#"document.querySelector('#same-frame').style.cssText = 'transform:scale(0.5);transform-origin:0 0;width:600px;height:400px;'"#, timeout).unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML = '<button id="tiny" style="position:absolute;left:240px;top:150px;width:16px;height:16px;padding:0;border:0" onclick="this.dataset.clicked=1" onmouseover="this.dataset.hovered=1"></button>'"#, false, &frames, timeout).unwrap();
+    manager
+        .click_selector(&instance, &page, "#tiny", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#tiny').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1",
+        "click handler did not fire"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn pointer_padded_frame() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    let frames = ["#same-frame".into()];
+    manager.evaluate(&instance, &page, r#"document.querySelector('#same-frame').style.cssText = 'padding:50px;border:20px solid black;width:400px;height:300px;'"#, timeout).unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML = '<button id="tiny" style="position:absolute;left:240px;top:150px;width:16px;height:16px;padding:0;border:0" onclick="this.dataset.clicked=1" onmouseover="this.dataset.hovered=1"></button>'"#, false, &frames, timeout).unwrap();
+    manager
+        .click_selector(&instance, &page, "#tiny", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#tiny').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1",
+        "click handler did not fire"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn frame_commands_cover_scoped_dom_and_input() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let frames = ["#cross-frame".into()];
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML = '<input id=edit oninput="this.dataset.typed=this.value" onkeydown="this.dataset.key=event.key"><select id=pick onchange="this.dataset.changed=this.value"><option>a</option><option>b</option></select><a href="/local">local</a>';"#, false, &frames, timeout).unwrap();
+    manager
+        .wait_for_selector(&instance, &page, "#edit", &frames, timeout)
+        .unwrap();
+    manager
+        .fill(&instance, &page, "#edit", "first", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#edit').dataset.typed",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "first"
+    );
+    manager
+        .select_option(&instance, &page, "#pick", "b", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#pick').dataset.changed",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "b"
+    );
+    assert!(manager
+        .html(&instance, &page, Some("#edit"), &frames, timeout)
+        .unwrap()
+        .contains("data-typed=\"first\""));
+    let links = manager
+        .links(&instance, &page, None, &frames, timeout)
+        .unwrap();
+    assert_eq!(links[0]["text"], "local");
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "window.scopedValue = 73; scopedValue",
+                true,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        73
+    );
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "typeof scopedValue",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "undefined"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn evaluate_non_error_throws_preserve_details() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    for frames in [vec![], vec!["#same-frame".into()]] {
+        for (expr, expected) in [
+            ("throw 42", "42"),
+            ("throw {a:1}", "{\"a\":1}"),
+            (
+                "throw new Error('closed shadow root at segment fake')",
+                "page script error:",
+            ),
+        ] {
+            let err = manager
+                .evaluate_scoped(&instance, &page, expr, false, &frames, timeout)
+                .unwrap_err();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn detached_frame_evaluate_fails_fast() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let err = manager
+        .evaluate_scoped(
+            &instance,
+            &page,
+            "new Promise(resolve => { parent.setTimeout(() => frameElement.remove(), 100); })",
+            false,
+            &["#same-frame".into()],
+            timeout,
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("--frame #same-frame: frame was detached"),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn nested_frame_command_uses_one_timeout() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let err = manager
+        .evaluate_scoped(
+            &instance,
+            &page,
+            "new Promise(() => {})",
+            false,
+            &["#nested-outer".into(), "#nested-inner".into()],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_millis(2000),
+        "{:?}: {err}",
+        started.elapsed()
+    );
+    assert!(
+        err.to_ascii_lowercase().contains("timeout") || err.contains("timed out"),
+        "{err}"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn scoped_type_press_use_currently_focused_field() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let frames = ["#cross-frame".into()];
+    manager.evaluate(&instance, &page, "const top = document.createElement('input'); top.id='top-edit'; document.body.prepend(top);", timeout).unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML = '<input id="edit" oninput="this.dataset.typed=this.value" onkeydown="this.dataset.key=event.key">';"#, false, &frames, timeout).unwrap();
+    manager
+        .click_selector(&instance, &page, "#edit", &frames, timeout)
+        .unwrap();
+    manager
+        .insert_text(&instance, &page, "abc", &frames)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#edit').dataset.typed",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "abc"
+    );
+    assert_eq!(
+        manager
+            .evaluate(
+                &instance,
+                &page,
+                "document.querySelector('#top-edit').value",
+                timeout
+            )
+            .unwrap(),
+        ""
+    );
+    manager.press(&instance, &page, "Enter", &frames).unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#edit').dataset.key",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "Enter"
+    );
+    assert_eq!(
+        manager
+            .evaluate(
+                &instance,
+                &page,
+                "document.querySelector('#top-edit').value",
+                timeout
+            )
+            .unwrap(),
+        ""
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn scoped_input_rejects_missing_focus_and_focus_errors() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let frames = ["#cross-frame".into()];
+    manager
+        .evaluate_scoped(
+            &instance,
+            &page,
+            "document.body.innerHTML='<p>no focus target</p>'",
+            false,
+            &frames,
+            timeout,
+        )
+        .unwrap();
+    let expected = "--frame #cross-frame: nothing is focused inside the frame; click or fill an element inside it first";
+    assert_eq!(
+        manager
+            .insert_text(&instance, &page, "abc", &frames)
+            .unwrap_err(),
+        expected
+    );
+    assert_eq!(
+        manager
+            .press(&instance, &page, "Enter", &frames)
+            .unwrap_err(),
+        expected
+    );
+    manager.evaluate(&instance, &page, "const top = document.createElement('input'); top.id='top-edit'; top.setAttribute('onkeydown', 'this.dataset.key=event.key'); document.body.prepend(top); top.focus(); document.querySelector('#cross-frame').focus = () => { throw new Error('focus blocked'); }", timeout).unwrap();
+    let err = manager
+        .insert_text(&instance, &page, "abc", &frames)
+        .unwrap_err();
+    assert!(
+        err.contains("--frame #cross-frame:") && err.contains("focus blocked"),
+        "{err}"
+    );
+    let err = manager
+        .press(&instance, &page, "Enter", &frames)
+        .unwrap_err();
+    assert!(err.contains("focus blocked"), "{err}");
+    assert_eq!(
+        manager
+            .evaluate(
+                &instance,
+                &page,
+                "document.querySelector('#top-edit').value",
+                timeout
+            )
+            .unwrap(),
+        ""
+    );
+    assert_eq!(
+        manager
+            .evaluate(
+                &instance,
+                &page,
+                "document.querySelector('#top-edit').dataset.key || null",
+                timeout
+            )
+            .unwrap(),
+        serde_json::Value::Null
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn scoped_user_detach_and_shadow_phrases_are_not_rewritten() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let frames = ["#same-frame".into()];
+    for expr in [
+        "throw new Error('frame was detached')",
+        "throw new Error('a user error mentioning closed shadow root')",
+    ] {
+        let err = manager
+            .evaluate_scoped(&instance, &page, expr, false, &frames, timeout)
+            .unwrap_err();
+        assert!(err.contains("page script error:"), "{err}");
+        assert!(
+            err.starts_with("--frame #same-frame: page script error:"),
+            "{err}"
+        );
+        assert_eq!(err.matches("--frame #same-frame:").count(), 1, "{err}");
+    }
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn wait_frame_permanent_errors_fail_fast() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let mut failures = Vec::new();
+    for sel in [":::bad", "a >>>", "#not-an-iframe"] {
+        let started = std::time::Instant::now();
+        let err = manager
+            .wait_for_selector(
+                &instance,
+                &page,
+                "#msg",
+                &[sel.into()],
+                Duration::from_secs(3),
+            )
+            .unwrap_err();
+        if started.elapsed() >= Duration::from_secs(1)
+            || !err.contains(sel)
+            || err.starts_with("timed out")
+        {
+            failures.push(format!("{sel}: {:?}: {err}", started.elapsed()));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "permanent frame errors were not reported promptly: {failures:#?}"
+    );
+
+    let err = manager
+        .wait_for_selector(
+            &instance,
+            &page,
+            "#msg",
+            &["#missing-frame".into()],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(
+        err.starts_with("timed out after 1s waiting for selector: #msg"),
+        "{err}"
+    );
+    assert!(
+        err.contains("--frame #missing-frame: no element matches"),
+        "{err}"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn plain_wait_timeout_sanity() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    for _ in 0..1 {
+        let err = manager
+            .wait_for_selector(&instance, &page, "#never", &[], Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(err, "timed out after 1s waiting for selector: #never");
+    }
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn hover_without_click_fires_handler() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let frames = ["#cross-frame".into()];
+    manager
+        .evaluate(
+            &instance,
+            &page,
+            "document.querySelector('#cross-frame').style.marginTop='3000px'",
+            timeout,
+        )
+        .unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML='<button id="hover-only" style="position:absolute;left:180px;top:100px;width:16px;height:16px;padding:0;border:0" onmouseenter="this.dataset.hovered=1"></button>'"#, false, &frames, timeout).unwrap();
+    manager
+        .hover(&instance, &page, "#hover-only", &frames, timeout)
+        .unwrap();
+    manager
+        .wait_for_selector(
+            &instance,
+            &page,
+            "#hover-only[data-hovered]",
+            &frames,
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#hover-only').dataset.hovered",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn hidden_iframe_pointer_commands_fail() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let frames = ["#same-frame".into()];
+    for style in ["display:none", "width:0;height:0;border:0;padding:0"] {
+        manager
+            .evaluate(
+                &instance,
+                &page,
+                &format!("document.querySelector('#same-frame').style.cssText='{style}'"),
+                timeout,
+            )
+            .unwrap();
+        let err = manager
+            .click_selector(&instance, &page, "#msg", &frames, timeout)
+            .unwrap_err();
+        assert_eq!(err, "--frame #same-frame: iframe is not rendered");
+        let err = manager
+            .hover(&instance, &page, "#msg", &frames, timeout)
+            .unwrap_err();
+        assert_eq!(err, "--frame #same-frame: iframe is not rendered");
+    }
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn wait_rejects_already_open_dialog_plain() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    manager.evaluate(&instance, &page, "document.body.insertAdjacentHTML('afterbegin', '<button id=alert onclick=alert(123)>alert</button>')", timeout).unwrap();
+    let (_, _, outcome) = manager
+        .click_selector(&instance, &page, "#alert", &[], timeout)
+        .unwrap();
+    assert_eq!(outcome.dialog.unwrap().kind, "alert");
+    let started = std::time::Instant::now();
+    let error = manager
+        .wait_for_selector(&instance, &page, "#never", &[], Duration::from_secs(4))
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}: {error}",
+        started.elapsed()
+    );
+    assert!(error.contains("open alert dialog"), "{error}");
+    manager.dialog(&instance, &page, true, None).unwrap();
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn wait_rejects_already_open_dialog_scoped() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    manager.evaluate(&instance, &page, "document.body.insertAdjacentHTML('afterbegin', '<button id=alert onclick=alert(123)>alert</button>')", timeout).unwrap();
+    let (_, _, outcome) = manager
+        .click_selector(&instance, &page, "#alert", &[], timeout)
+        .unwrap();
+    assert_eq!(outcome.dialog.unwrap().kind, "alert");
+    let started = std::time::Instant::now();
+    let error = manager
+        .wait_for_selector(
+            &instance,
+            &page,
+            "#never",
+            &["#same-frame".into()],
+            Duration::from_secs(4),
+        )
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}: {error}",
+        started.elapsed()
+    );
+    assert!(error.contains("open alert dialog"), "{error}");
+    manager.dialog(&instance, &page, true, None).unwrap();
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn scoped_input_forgets_focus_after_clicking_text() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    let frames = ["#cross-frame".into()];
+    manager
+        .click_selector(&instance, &page, "#cross-input", &frames, timeout)
+        .unwrap();
+    manager
+        .click_selector(&instance, &page, "#cross-text", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.hasFocus() && document.activeElement === document.body",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        true
+    );
+    let error = manager
+        .insert_text(&instance, &page, "STALE", &frames)
+        .unwrap_err();
+    assert_eq!(error, "--frame #cross-frame: nothing is focused inside the frame; click or fill an element inside it first");
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#cross-input').value",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        ""
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn scoped_input_forgets_focus_after_script_blur() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+    let frames = ["#cross-frame".into()];
+    manager
+        .click_selector(&instance, &page, "#cross-input", &frames, timeout)
+        .unwrap();
+    manager
+        .evaluate_scoped(
+            &instance,
+            &page,
+            "document.querySelector('#cross-input').blur()",
+            false,
+            &frames,
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.hasFocus() && document.activeElement === document.body",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        true
+    );
+    let error = manager
+        .insert_text(&instance, &page, "STALE", &frames)
+        .unwrap_err();
+    assert_eq!(error, "--frame #cross-frame: nothing is focused inside the frame; click or fill an element inside it first");
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#cross-input').value",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        ""
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn selector_commands_do_not_install_focus_instrumentation() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let install_probe = r#"(() => {
+        document.body.insertAdjacentHTML('afterbegin', '<section id="probe"><input id="probe-edit" onclick="this.dataset.clicked=1" oninput="this.dataset.typed=this.value" onkeydown="this.dataset.key=event.key"><select id="probe-select" onchange="this.dataset.changed=this.value"><option>a</option><option>b</option></select><a href="/local">link</a></section>');
+        document.documentElement.dataset.blurSource = String(HTMLElement.prototype.blur);
+        const original = EventTarget.prototype.addEventListener;
+        EventTarget.prototype.addEventListener = function(type, ...args) {
+            if (['focus','blur','focusin','focusout','pointerdown','mousedown'].includes(type)) document.documentElement.dataset.focusListener = type;
+            return Reflect.apply(original, this, [type, ...args]);
+        };
+    })()"#;
+    for frames in [vec![], vec!["#cross-frame".into()]] {
+        manager
+            .evaluate_scoped(&instance, &page, install_probe, false, &frames, timeout)
+            .unwrap();
+        manager
+            .click_selector(&instance, &page, "#probe-edit", &frames, timeout)
+            .unwrap();
+        assert_eq!(
+            manager
+                .evaluate_scoped(
+                    &instance,
+                    &page,
+                    "document.querySelector('#probe-edit').dataset.clicked",
+                    false,
+                    &frames,
+                    timeout
+                )
+                .unwrap(),
+            "1"
+        );
+        manager
+            .fill(&instance, &page, "#probe-edit", "seed", &frames, timeout)
+            .unwrap();
+        manager
+            .insert_text(&instance, &page, "direct", &frames)
+            .unwrap();
+        manager.press(&instance, &page, "Enter", &frames).unwrap();
+        assert_eq!(
+            manager
+                .evaluate_scoped(
+                    &instance,
+                    &page,
+                    "document.querySelector('#probe-edit').dataset.typed",
+                    false,
+                    &frames,
+                    timeout
+                )
+                .unwrap(),
+            "seeddirect"
+        );
+        assert_eq!(
+            manager
+                .evaluate_scoped(
+                    &instance,
+                    &page,
+                    "document.querySelector('#probe-edit').dataset.key",
+                    false,
+                    &frames,
+                    timeout
+                )
+                .unwrap(),
+            "Enter"
+        );
+        manager
+            .fill(&instance, &page, "#probe-edit", "filled", &frames, timeout)
+            .unwrap();
+        manager
+            .hover(&instance, &page, "#probe-edit", &frames, timeout)
+            .unwrap();
+        manager
+            .select_option(&instance, &page, "#probe-select", "b", &frames, timeout)
+            .unwrap();
+        assert_eq!(
+            manager
+                .evaluate_scoped(
+                    &instance,
+                    &page,
+                    "document.querySelector('#probe-select').dataset.changed",
+                    false,
+                    &frames,
+                    timeout
+                )
+                .unwrap(),
+            "b"
+        );
+        manager
+            .wait_for_selector(&instance, &page, "#probe-edit", &frames, timeout)
+            .unwrap();
+        manager
+            .text(&instance, &page, Some("#probe"), &frames, timeout)
+            .unwrap();
+        manager
+            .html(&instance, &page, Some("#probe"), &frames, timeout)
+            .unwrap();
+        manager
+            .links(&instance, &page, Some("#probe"), &frames, timeout)
+            .unwrap();
+    }
+    let (png, _, _) = manager
+        .screenshot(
+            &instance,
+            &page,
+            None,
+            None,
+            None,
+            Some("#probe-edit"),
+            None,
+            timeout,
+        )
+        .unwrap();
+    assert!(!png.is_empty());
+    for frames in [vec![], vec!["#cross-frame".into()]] {
+        assert_eq!(manager.evaluate_scoped(&instance, &page, "!document.documentElement.dataset.focusListener && String(HTMLElement.prototype.blur) === document.documentElement.dataset.blurSource", false, &frames, timeout).unwrap(), true, "commands must install neither focus listeners nor blur hooks: {frames:?}");
+    }
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn user_shadow_marker_text_is_unchanged() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    for frames in [vec![], vec!["#same-frame".into()]] {
+        let error = manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "throw new Error('CamoufoxShadowRootError: mine')",
+                false,
+                &frames,
+                timeout,
+            )
+            .unwrap_err();
+        let expected = if frames.is_empty() {
+            "page script error: CamoufoxShadowRootError: mine"
+        } else {
+            "--frame #same-frame: page script error: CamoufoxShadowRootError: mine"
+        };
+        assert_eq!(error, expected);
+    }
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn wait_validates_css_behind_missing_frames() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let mut failures = Vec::new();
+    for (frames, selector) in [
+        (vec!["#missing".into(), ":::bad-frame".into()], "#target"),
+        (vec!["#missing".into()], ":::bad-target"),
+    ] {
+        let bad = if selector == "#target" {
+            ":::bad-frame"
+        } else {
+            ":::bad-target"
+        };
+        let started = std::time::Instant::now();
+        let error = manager
+            .wait_for_selector(&instance, &page, selector, &frames, Duration::from_secs(4))
+            .unwrap_err();
+        if started.elapsed() >= Duration::from_secs(1)
+            || !error.starts_with(&format!("invalid selector {bad:?}:"))
+            || error.contains("ScriptException")
+            || error.contains("Runtime.evaluate")
+        {
+            failures.push(format!("{bad}: {:?}: {error}", started.elapsed()));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "invalid CSS was not rejected up front: {failures:#?}"
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn plain_click_missing_selector_has_base_error_text() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let error = manager
+        .click_selector(&instance, &page, "#missing", &[], timeout)
+        .unwrap_err();
+    assert_eq!(error, "selector not found: #missing");
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn scoped_focus_outside_then_text_same_origin() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let frames = ["#same-frame".into()];
+    manager.evaluate(&instance, &page, r#"document.body.insertAdjacentHTML('afterbegin','<input id="top-edit" onclick="this.dataset.clicked=1">')"#, timeout).unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML='<input id="field" onclick="this.dataset.clicked=1"><p id="text" onclick="this.dataset.clicked=1">non-focusable text</p>'"#, false, &frames, timeout).unwrap();
+    manager
+        .click_selector(&instance, &page, "#field", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#field').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1"
+    );
+    manager
+        .click_selector(&instance, &page, "#top-edit", &[], timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate(
+                &instance,
+                &page,
+                "document.querySelector('#top-edit').dataset.clicked",
+                timeout
+            )
+            .unwrap(),
+        "1"
+    );
+    manager
+        .click_selector(&instance, &page, "#text", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#text').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.hasFocus() && document.activeElement === document.body",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        true
+    );
+    let error = manager
+        .insert_text(&instance, &page, "STALE", &frames)
+        .unwrap_err();
+    assert_eq!(error, "--frame #same-frame: nothing is focused inside the frame; click or fill an element inside it first");
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#field').value",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        ""
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn scoped_focus_outside_then_text_cross_origin() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let frames = ["#cross-frame".into()];
+    manager.evaluate(&instance, &page, r#"document.body.insertAdjacentHTML('afterbegin','<input id="top-edit" onclick="this.dataset.clicked=1">')"#, timeout).unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML='<input id="field" onclick="this.dataset.clicked=1"><p id="text" onclick="this.dataset.clicked=1">non-focusable text</p>'"#, false, &frames, timeout).unwrap();
+    manager
+        .click_selector(&instance, &page, "#field", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#field').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1"
+    );
+    manager
+        .click_selector(&instance, &page, "#top-edit", &[], timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate(
+                &instance,
+                &page,
+                "document.querySelector('#top-edit').dataset.clicked",
+                timeout
+            )
+            .unwrap(),
+        "1"
+    );
+    manager
+        .click_selector(&instance, &page, "#text", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#text').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.hasFocus() && document.activeElement === document.body",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        true
+    );
+    let error = manager
+        .insert_text(&instance, &page, "STALE", &frames)
+        .unwrap_err();
+    assert_eq!(error, "--frame #cross-frame: nothing is focused inside the frame; click or fill an element inside it first");
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#field').value",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        ""
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn scoped_focus_explicit_blur_then_outside_same_tick() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let frames = ["#same-frame".into()];
+    manager.evaluate(&instance, &page, r#"document.body.insertAdjacentHTML('afterbegin','<input id="top-edit" onclick="this.dataset.clicked=1">')"#, timeout).unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML='<input id="field" onclick="this.dataset.clicked=1"><p id="text" onclick="this.dataset.clicked=1">non-focusable text</p>'"#, false, &frames, timeout).unwrap();
+    manager
+        .click_selector(&instance, &page, "#field", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#field').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.activeElement === document.querySelector('#field')",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        true
+    );
+    manager.evaluate_scoped(&instance, &page, "document.activeElement.blur(); parent.document.querySelector('#top-edit').focus(); document.body.dataset.blurred='yes'", false, &frames, timeout).unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.body.dataset.blurred",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "yes"
+    );
+    let error = manager
+        .insert_text(&instance, &page, "STALE", &frames)
+        .unwrap_err();
+    assert_eq!(error, "--frame #same-frame: nothing is focused inside the frame; click or fill an element inside it first");
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#field').value",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        ""
+    );
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn scoped_in_flight_wait_dialog_has_actionable_hint() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    manager
+        .evaluate_main_world(
+            &instance,
+            &page,
+            "setTimeout(() => alert('late-scoped'), 500), 1",
+            timeout,
+        )
+        .unwrap();
+    let error = manager
+        .wait_for_selector(
+            &instance,
+            &page,
+            "#never",
+            &["#cross-frame".into()],
+            Duration::from_secs(4),
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("open alert dialog") && error.contains("late-scoped"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("camoufox dialog {instance} {page} accept|dismiss")),
+        "{error}"
+    );
+    manager.dialog(&instance, &page, true, None).unwrap();
+
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn scoped_type_press_reject_focus_lost_to_top_page() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let frames = ["#cross-frame".into()];
+    manager.evaluate(&instance, &page, r#"document.body.insertAdjacentHTML('afterbegin', '<input id="top-edit" onclick="this.dataset.clicked=1" onkeydown="this.dataset.key=event.key">')"#, timeout).unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML='<input id="edit" onclick="this.dataset.clicked=1" onkeydown="this.dataset.key=event.key">'"#, false, &frames, timeout).unwrap();
+    manager
+        .click_selector(&instance, &page, "#edit", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#edit').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1"
+    );
+    manager
+        .click_selector(&instance, &page, "#top-edit", &[], timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate(
+                &instance,
+                &page,
+                "document.querySelector('#top-edit').dataset.clicked",
+                timeout
+            )
+            .unwrap(),
+        "1"
+    );
+    let expected = "--frame #cross-frame: nothing is focused inside the frame; click or fill an element inside it first";
+    assert_eq!(
+        manager
+            .insert_text(&instance, &page, "STALE", &frames)
+            .unwrap_err(),
+        expected
+    );
+    assert_eq!(
+        manager
+            .press(&instance, &page, "Enter", &frames)
+            .unwrap_err(),
+        expected
+    );
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#edit').value",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        ""
+    );
+    assert_eq!(
+        manager
+            .evaluate(
+                &instance,
+                &page,
+                "document.querySelector('#top-edit').value",
+                timeout
+            )
+            .unwrap(),
+        ""
+    );
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#edit').dataset.key || null",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        manager
+            .evaluate(
+                &instance,
+                &page,
+                "document.querySelector('#top-edit').dataset.key || null",
+                timeout
+            )
+            .unwrap(),
+        serde_json::Value::Null
+    );
+    // Filling inside the frame establishes current focus again; no memory is needed.
+    manager
+        .fill(&instance, &page, "#edit", "fresh", &frames, timeout)
+        .unwrap();
+    manager
+        .insert_text(&instance, &page, "again", &frames)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#edit').value",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "freshagain"
+    );
+    manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn scoped_focus_explicit_blur_then_outside_same_tick_main_world() {
+    use camoufox::cli::instance::InstanceManager;
+    let server = fixtures::FramesServer::start();
+    let mut manager = InstanceManager::new();
+    let (instance, _, _) = manager.launch(Some(true), Some(&camoufox_bin())).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    let timeout = Duration::from_secs(10);
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url("/frames.html"),
+            timeout,
+            Some("load"),
+        )
+        .unwrap();
+
+    let frames = ["#same-frame".into()];
+    manager.evaluate(&instance, &page, r#"document.body.insertAdjacentHTML('afterbegin','<input id="top-edit" onclick="this.dataset.clicked=1">')"#, timeout).unwrap();
+    manager.evaluate_scoped(&instance, &page, r#"document.body.innerHTML='<input id="field" onclick="this.dataset.clicked=1"><p id="text" onclick="this.dataset.clicked=1">non-focusable text</p>'"#, false, &frames, timeout).unwrap();
+    manager
+        .click_selector(&instance, &page, "#field", &frames, timeout)
+        .unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#field').dataset.clicked",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.activeElement === document.querySelector('#field')",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        true
+    );
+    manager.evaluate_scoped(&instance, &page, "document.activeElement.blur(); parent.document.querySelector('#top-edit').focus(); document.body.dataset.blurred='yes'", true, &frames, timeout).unwrap();
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.body.dataset.blurred",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        "yes"
+    );
+    let error = manager
+        .insert_text(&instance, &page, "STALE", &frames)
+        .unwrap_err();
+    assert_eq!(error, "--frame #same-frame: nothing is focused inside the frame; click or fill an element inside it first");
+    assert_eq!(
+        manager
+            .evaluate_scoped(
+                &instance,
+                &page,
+                "document.querySelector('#field').value",
+                false,
+                &frames,
+                timeout
+            )
+            .unwrap(),
+        ""
+    );
+
+    manager.stop(&instance).unwrap();
 }

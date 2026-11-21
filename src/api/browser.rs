@@ -256,13 +256,39 @@ impl Browser {
             json!({ "removeOnDetach": true }),
         )?;
 
-        let context_id = result
+        let context_id = match result
             .get("browserContextId")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
+            .filter(|s| !s.is_empty())
+        {
+            Some(id) => id.to_owned(),
+            None => {
+                return Err(ProtocolError::response_msg(
+                    "Browser.createBrowserContext",
+                    "missing or empty browserContextId in Browser.createBrowserContext response",
+                ));
+            }
+        };
 
-        let ctx = BrowserContext::new(context_id, &self.session, Arc::clone(&self.connection));
+        let ctx = BrowserContext::new(
+            context_id.clone(),
+            &self.session,
+            Arc::clone(&self.connection),
+        );
+
+        // When the caller did not specify download_options, set context download
+        // behavior to "cancel" so navigations to attachments fail fast with
+        // NavigationBecameDownload rather than downloading to disk.
+        if options.download_options.is_none() {
+            let dl_params = json!({
+                "browserContextId": context_id,
+                "downloadOptions": { "behavior": "cancel" }
+            });
+            if let Err(e) = self.session.send("Browser.setDownloadOptions", dl_params) {
+                ctx.try_remove();
+                return Err(e);
+            }
+        }
 
         // Apply context options. On failure, attempt to clean up the context.
         if let Err(e) = ctx.configure(&options) {

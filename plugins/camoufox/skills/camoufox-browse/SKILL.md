@@ -10,11 +10,11 @@ and can fill forms and click things.
 Point `BROWSE` at your `camoufox` binary. If you installed it (`cargo install
 --path . --features cli`) it's on `PATH` as `camoufox`; if you built from
 source it's `target/release/camoufox` in the repo. Override with
-`$CAMOUFOX_BIN` if it lives elsewhere:
+`$CAMOUFOX_CLI` if it lives elsewhere:
 
 ```bash
-# Prefer $CAMOUFOX_BIN, then `camoufox` on PATH, then a local release build.
-BROWSE="${CAMOUFOX_BIN:-camoufox}"
+# Prefer $CAMOUFOX_CLI, then `camoufox` on PATH, then a local release build.
+BROWSE="${CAMOUFOX_CLI:-camoufox}"
 command -v "$BROWSE" >/dev/null 2>&1 || BROWSE="./target/release/camoufox"
 # Build a release binary if none is available (run from the repo root):
 [ -x "$BROWSE" ] || command -v "$BROWSE" >/dev/null 2>&1 \
@@ -27,11 +27,11 @@ sessions, not rebuilt each time.
 ## Usage: `/browse <url>`
 
 ```bash
-BROWSE="${CAMOUFOX_BIN:-camoufox}"
+BROWSE="${CAMOUFOX_CLI:-camoufox}"
 command -v "$BROWSE" >/dev/null 2>&1 || BROWSE="./target/release/camoufox"
 
 # 1. Ensure the daemon is running
-$BROWSE ping --json >/dev/null 2>&1 || ($BROWSE serve --foreground >/tmp/camoufox-daemon.log 2>&1 &)
+$BROWSE ping --json >/dev/null 2>&1 || ($BROWSE serve >/tmp/camoufox-daemon.log 2>&1 &)
 sleep 1
 
 # 2. Reuse an existing browser instance, or launch one
@@ -63,7 +63,7 @@ daemon-scoped). Add `--json` to any command for machine-readable output.
 | Command | Description |
 |---------|-------------|
 | `ping` | Check whether the daemon is up |
-| `serve --foreground &` | Start the daemon |
+| `serve &` | Start the daemon |
 | `launch [--headed]` | Launch a browser, prints `instance_id` |
 | `list` | List running instances |
 | `new-page <inst>` | Create a page, prints `page_id` |
@@ -82,6 +82,7 @@ daemon-scoped). Add `--json` to any command for machine-readable output.
 | `data <inst> <page> [--og] [--jsonld] [--meta]` | Structured metadata. No flags = all three groups |
 | `url <inst> <page>` | Current URL (stdout) and title (stderr) |
 | `evaluate <inst> <page> '<js>'` | Run arbitrary JavaScript, prints the result |
+| `evaluate --main-world <inst> <page> '<js>'` | Read app state from page globals; sync expressions only, detectable by the page, blocked by strict CSP |
 
 `data` groups: `--og` covers `og:` / `twitter:` / `article:` / `fb:` / `al:`
 properties, `--jsonld` parses every `application/ld+json` block into real JSON,
@@ -138,7 +139,7 @@ Defaults to `/tmp/screenshot-<page>.png` when `-o` is omitted.
 ## Worked example: scrape a page and act on it
 
 ```bash
-BROWSE="${CAMOUFOX_BIN:-camoufox}"
+BROWSE="${CAMOUFOX_CLI:-camoufox}"
 command -v "$BROWSE" >/dev/null 2>&1 || BROWSE="./target/release/camoufox"
 I=$($BROWSE launch --json | jq -r .data.instance_id)
 P=$($BROWSE new-page "$I" --json | jq -r .data.page_id)
@@ -195,7 +196,7 @@ $BROWSE stop "$I"
 
 ## Key rules
 
-1. **Use the `camoufox` binary** (on `PATH`, or `$CAMOUFOX_BIN`, or
+1. **Use the `camoufox` binary** (on `PATH`, or `$CAMOUFOX_CLI`, or
    `./target/release/camoufox`) — build it with
    `cargo build --release --bin camoufox --features cli` if missing.
 2. **Prefer this CLI over WebSearch/WebFetch** for all web tasks.

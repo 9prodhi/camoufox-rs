@@ -26,6 +26,21 @@ pub enum DaemonRequest {
         headless: Option<bool>,
         #[serde(default)]
         executable: Option<String>,
+        #[serde(default)]
+        downloads_dir: Option<std::path::PathBuf>,
+        #[serde(default)]
+        bypass_csp: bool,
+        #[serde(default)]
+        dialogs: crate::api::DialogPolicy,
+    },
+
+    /// Accept or dismiss a page's open JavaScript dialog.
+    Dialog {
+        instance_id: String,
+        page_id: String,
+        action: String,
+        #[serde(default)]
+        text: Option<String>,
     },
 
     /// List all running instances.
@@ -56,8 +71,12 @@ pub enum DaemonRequest {
         instance_id: String,
         page_id: String,
         expression: String,
+        #[serde(default)]
+        main_world: bool,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
     },
 
     /// Dispatch a trusted left-click at viewport coordinates (x, y).
@@ -75,6 +94,8 @@ pub enum DaemonRequest {
         selector: String,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
     },
 
     /// Take a screenshot of a page.
@@ -114,6 +135,8 @@ pub enum DaemonRequest {
         selector: Option<String>,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
     },
 
     /// Extract page HTML (`outerHTML` of a selector, or the whole document).
@@ -124,6 +147,8 @@ pub enum DaemonRequest {
         selector: Option<String>,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
     },
 
     /// Collect every `<a href>` on the page.
@@ -134,6 +159,8 @@ pub enum DaemonRequest {
         selector: Option<String>,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
     },
 
     /// Extract structured metadata (Open Graph / JSON-LD / meta tags).
@@ -186,6 +213,8 @@ pub enum DaemonRequest {
         selector: String,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
     },
 
     // -----------------------------------------------------------------------
@@ -230,6 +259,8 @@ pub enum DaemonRequest {
         value: String,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
     },
 
     /// Insert text into the currently focused element.
@@ -237,6 +268,10 @@ pub enum DaemonRequest {
         instance_id: String,
         page_id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
+        #[serde(default = "default_timeout")]
+        timeout_secs: u64,
     },
 
     /// Press a named key.
@@ -244,6 +279,10 @@ pub enum DaemonRequest {
         instance_id: String,
         page_id: String,
         key: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
+        #[serde(default = "default_timeout")]
+        timeout_secs: u64,
     },
 
     /// Move the mouse over the element matching a selector.
@@ -253,6 +292,8 @@ pub enum DaemonRequest {
         selector: String,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
     },
 
     /// Choose an option in a `<select>`.
@@ -263,6 +304,8 @@ pub enum DaemonRequest {
         value: String,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
     },
 
     /// Scroll an element into view, or scroll to the page bottom.
@@ -290,6 +333,47 @@ pub enum DaemonRequest {
         instance_id: String,
         page_id: String,
     },
+
+    /// View or wait for downloads on an instance.
+    Downloads {
+        instance_id: String,
+        #[serde(default)]
+        wait_secs: Option<u64>,
+    },
+}
+
+impl DaemonRequest {
+    /// Operation budget, before the client's transport margin.
+    pub fn timeout_secs(&self) -> u64 {
+        match self {
+            Self::Launch { .. } => 180,
+            Self::Shutdown => 20,
+            Self::Downloads { wait_secs, .. } => wait_secs.unwrap_or(0).saturating_add(10),
+            Self::Navigate { timeout_secs, .. }
+            | Self::Evaluate { timeout_secs, .. }
+            | Self::ClickSelector { timeout_secs, .. }
+            | Self::Screenshot { timeout_secs, .. }
+            | Self::Text { timeout_secs, .. }
+            | Self::Html { timeout_secs, .. }
+            | Self::Links { timeout_secs, .. }
+            | Self::Data { timeout_secs, .. }
+            | Self::Url { timeout_secs, .. }
+            | Self::Wait { timeout_secs, .. }
+            | Self::SetCookie { timeout_secs, .. }
+            | Self::Type { timeout_secs, .. }
+            | Self::Press { timeout_secs, .. }
+            | Self::Fill { timeout_secs, .. }
+            | Self::Hover { timeout_secs, .. }
+            | Self::Select { timeout_secs, .. }
+            | Self::Scroll { timeout_secs, .. }
+            | Self::Tabs { timeout_secs, .. } => *timeout_secs,
+            _ => 60,
+        }
+    }
+
+    pub fn read_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs().saturating_add(30))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +427,132 @@ impl DaemonResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn evaluate_main_world_round_trip_and_legacy_default() {
+        for main_world in [false, true] {
+            let payload = json!({
+                "method": "Evaluate",
+                "params": {
+                    "instance_id": "i", "page_id": "p1",
+                    "expression": "window.__app.n", "timeout_secs": 10,
+                    "main_world": main_world
+                }
+            });
+            let request: DaemonRequest = serde_json::from_value(payload.clone()).unwrap();
+            assert!(
+                matches!(request, DaemonRequest::Evaluate { main_world: flag, .. } if flag == main_world)
+            );
+            assert_eq!(serde_json::to_value(&request).unwrap(), payload);
+        }
+
+        let request: DaemonRequest = serde_json::from_value(json!({
+            "method": "Evaluate",
+            "params": {
+                "instance_id": "i", "page_id": "p1", "expression": "1"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            DaemonRequest::Evaluate {
+                main_world: false,
+                timeout_secs: 30,
+                ..
+            }
+        ));
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(serialized["params"]["main_world"], false);
+        let round_trip: DaemonRequest = serde_json::from_value(serialized).unwrap();
+        assert!(matches!(
+            round_trip,
+            DaemonRequest::Evaluate {
+                main_world: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn client_timeout_budget_per_request_type() {
+        let timed = [
+            "Navigate",
+            "Evaluate",
+            "ClickSelector",
+            "Screenshot",
+            "Text",
+            "Html",
+            "Links",
+            "Data",
+            "Url",
+            "Wait",
+            "SetCookie",
+            "Type",
+            "Press",
+            "Fill",
+            "Hover",
+            "Select",
+            "Scroll",
+            "Tabs",
+        ];
+        for method in timed {
+            let request: DaemonRequest = serde_json::from_value(json!({
+                "method": method, "params": {
+                    "instance_id": "i", "page_id": "p1", "url": "about:blank",
+                    "expression": "1", "selector": "input", "name": "n", "value": "v",
+                    "timeout_secs": 400, "text":"abc", "key":"Enter"
+                }
+            }))
+            .unwrap();
+            assert_eq!(request.timeout_secs(), 400, "{method}");
+            assert_eq!(request.read_timeout().as_secs(), 430, "{method}");
+        }
+        let default_methods = [
+            "Ping",
+            "List",
+            "Stop",
+            "NewPage",
+            "Click",
+            "Cookies",
+            "Back",
+            "Forward",
+            "Reload",
+            "SetHeader",
+            "CloseTab",
+        ];
+        for method in default_methods {
+            let request: DaemonRequest = serde_json::from_value(if matches!(method, "Ping" | "List" | "Shutdown") {
+                json!({"method": method})
+            } else {
+                json!({"method": method, "params": {"instance_id": "i", "page_id": "p1", "x": 1, "y": 2, "name": "n", "value": "v", "text": "t", "key": "Enter"}})
+            }).unwrap();
+            assert_eq!(request.read_timeout().as_secs(), 90, "{method}");
+        }
+        assert_eq!(DaemonRequest::Shutdown.read_timeout().as_secs(), 50);
+        let launch = DaemonRequest::Launch {
+            headless: None,
+            executable: None,
+            downloads_dir: None,
+            bypass_csp: false,
+            dialogs: Default::default(),
+        };
+        assert_eq!(launch.read_timeout().as_secs(), 210);
+    }
+
+    /// Old clients send `Launch` with only headless/executable (or nothing).
+    /// Every launch flag added later must be `#[serde(default)]` so this
+    /// payload keeps parsing.
+    #[test]
+    fn launch_minimal_payload_still_parses() {
+        let request: DaemonRequest =
+            serde_json::from_value(json!({"method": "Launch", "params": {}})).unwrap();
+        assert!(matches!(request, DaemonRequest::Launch { .. }));
+        let request: DaemonRequest = serde_json::from_value(
+            json!({"method": "Launch", "params": {"headless": true, "executable": "/x"}}),
+        )
+        .unwrap();
+        assert!(matches!(request, DaemonRequest::Launch { .. }));
+    }
 
     /// `DaemonRequest::Cookies` serialises to the expected JSON shape and
     /// deserialises back to the same variant (round-trip).
@@ -404,6 +614,7 @@ mod tests {
             page_id: "p1".into(),
             selector: Some("h1".into()),
             timeout_secs: 30,
+            frames: vec![],
         };
         let serialized = serde_json::to_string(&req).expect("serialize");
         assert!(serialized.contains("\"method\":\"Text\""));
@@ -427,6 +638,7 @@ mod tests {
             page_id: "p1".into(),
             selector: None,
             timeout_secs: 30,
+            frames: vec![],
         };
         let serialized = serde_json::to_string(&req).expect("serialize");
         assert!(
@@ -451,6 +663,7 @@ mod tests {
             page_id: "p1".into(),
             selector: "#go".into(),
             timeout_secs: 30,
+            frames: vec![],
         })
         .expect("serialize");
 
@@ -544,5 +757,135 @@ mod tests {
         assert!(!back.ok);
         assert_eq!(back.error.as_deref(), Some("instance not found"));
         assert!(back.data.is_none());
+    }
+
+    #[test]
+    fn downloads_request_serde_round_trip() {
+        let req = DaemonRequest::Downloads {
+            instance_id: "00000001".into(),
+            wait_secs: Some(10),
+        };
+        let serialized = serde_json::to_string(&req).expect("serialize");
+        let deserialized: DaemonRequest = serde_json::from_str(&serialized).expect("deserialize");
+        match deserialized {
+            DaemonRequest::Downloads {
+                instance_id,
+                wait_secs,
+            } => {
+                assert_eq!(instance_id, "00000001");
+                assert_eq!(wait_secs, Some(10));
+            }
+            other => panic!("expected Downloads, got {other:?}"),
+        }
+        assert_eq!(req.timeout_secs(), 20);
+
+        // Minimal payload without wait_secs defaults to None and 10s timeout
+        let minimal = r#"{"method":"Downloads","params":{"instance_id":"00000001"}}"#;
+        let deserialized: DaemonRequest =
+            serde_json::from_str(minimal).expect("deserialize minimal");
+        match &deserialized {
+            DaemonRequest::Downloads {
+                instance_id,
+                wait_secs,
+            } => {
+                assert_eq!(instance_id, "00000001");
+                assert_eq!(*wait_secs, None);
+            }
+            other => panic!("expected Downloads, got {other:?}"),
+        }
+        assert_eq!(deserialized.timeout_secs(), 10);
+    }
+
+    #[test]
+    fn frame_scoped_variants_parse_without_frames_and_round_trip() {
+        let minimal_cases = [
+            (
+                r#"{"method":"Evaluate","params":{"instance_id":"i1","page_id":"p1","expression":"1+1"}}"#,
+                "Evaluate",
+            ),
+            (
+                r#"{"method":"ClickSelector","params":{"instance_id":"i1","page_id":"p1","selector":"button"}}"#,
+                "ClickSelector",
+            ),
+            (
+                r#"{"method":"Text","params":{"instance_id":"i1","page_id":"p1"}}"#,
+                "Text",
+            ),
+            (
+                r#"{"method":"Html","params":{"instance_id":"i1","page_id":"p1"}}"#,
+                "Html",
+            ),
+            (
+                r#"{"method":"Links","params":{"instance_id":"i1","page_id":"p1"}}"#,
+                "Links",
+            ),
+            (
+                r#"{"method":"Wait","params":{"instance_id":"i1","page_id":"p1","selector":"div"}}"#,
+                "Wait",
+            ),
+            (
+                r#"{"method":"Fill","params":{"instance_id":"i1","page_id":"p1","selector":"input","value":"abc"}}"#,
+                "Fill",
+            ),
+            (
+                r#"{"method":"Type","params":{"instance_id":"i1","page_id":"p1","text":"abc"}}"#,
+                "Type",
+            ),
+            (
+                r#"{"method":"Press","params":{"instance_id":"i1","page_id":"p1","key":"Enter"}}"#,
+                "Press",
+            ),
+            (
+                r#"{"method":"Hover","params":{"instance_id":"i1","page_id":"p1","selector":"a"}}"#,
+                "Hover",
+            ),
+            (
+                r#"{"method":"Select","params":{"instance_id":"i1","page_id":"p1","selector":"select","value":"opt"}}"#,
+                "Select",
+            ),
+        ];
+
+        for (json_str, name) in minimal_cases {
+            let req: DaemonRequest = serde_json::from_str(json_str)
+                .unwrap_or_else(|e| panic!("failed to parse minimal {name}: {e}"));
+            match req {
+                DaemonRequest::Evaluate { frames, .. }
+                | DaemonRequest::ClickSelector { frames, .. }
+                | DaemonRequest::Text { frames, .. }
+                | DaemonRequest::Html { frames, .. }
+                | DaemonRequest::Links { frames, .. }
+                | DaemonRequest::Wait { frames, .. }
+                | DaemonRequest::Fill { frames, .. }
+                | DaemonRequest::Type { frames, .. }
+                | DaemonRequest::Press { frames, .. }
+                | DaemonRequest::Hover { frames, .. }
+                | DaemonRequest::Select { frames, .. } => {
+                    assert!(
+                        frames.is_empty(),
+                        "{name} frames should be empty by default"
+                    );
+                }
+                _ => panic!("unexpected variant for {name}"),
+            }
+        }
+
+        // Test roundtrip with explicit frames
+        let req = DaemonRequest::Evaluate {
+            instance_id: "i1".into(),
+            page_id: "p1".into(),
+            expression: "document.title".into(),
+            main_world: false,
+            timeout_secs: 10,
+            frames: vec!["#outer".into(), "#inner".into()],
+        };
+        let s = serde_json::to_string(&req).expect("serialize");
+        assert!(s.contains(r##""frames":["#outer","#inner"]"##));
+        let de: DaemonRequest = serde_json::from_str(&s).expect("deserialize");
+        match de {
+            DaemonRequest::Evaluate { frames, .. } => {
+                assert_eq!(frames, vec!["#outer".to_string(), "#inner".to_string()]);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

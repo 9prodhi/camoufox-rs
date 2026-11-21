@@ -411,8 +411,8 @@ impl Drop for StatusServer {
 
 /// A single-port HTTP server that serves a page with a full-viewport
 /// `#target` div and a capture-phase click listener pre-armed in the page.
-/// The listener records the most recent click into `window.__click_result`
-/// as `{ trusted, x, y, tag, id }`.
+/// The listener records `{ trusted, x, y, tag, id }` in a DOM dataset too,
+/// so evaluation in an isolated world can read it.
 ///
 /// Used by the trusted-click integration test
 /// (`click_command_dispatches_trusted_event_at_coordinates`) to prove the
@@ -460,6 +460,7 @@ impl ClickServer {
       tag: e.target.tagName,
       id: e.target.id
     };
+    document.documentElement.dataset.clickResult = JSON.stringify(window.__click_result);
   }, true);
 </script>
 </body>
@@ -577,4 +578,469 @@ impl BrowseServer {
 #[cfg(feature = "cli")]
 impl Drop for BrowseServer {
     fn drop(&mut self) {}
+}
+
+/// A single-port HTTP server for download testing.
+///
+/// Serves:
+/// - `/download.html` (or any non-PDF route): `<a id="dl" href="/report.pdf">Download</a>`
+/// - `/report.pdf`: PDF bytes served with `Content-Disposition: attachment; filename="../evil.pdf"`
+#[cfg(feature = "cli")]
+pub struct DownloadServer {
+    pub base_url: String,
+    pub pdf_bytes: Vec<u8>,
+    _server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl DownloadServer {
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").expect("bind download server"));
+        let port = server.server_addr().to_ip().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        const PDF_BYTES: &[u8] = b"%PDF-1.4\n%report-content-12345\n%%EOF\n";
+        const HTML: &[u8] = br#"<!DOCTYPE html>
+<html>
+<head><title>Download Test</title></head>
+<body>
+  <a id="dl" href="/report.pdf">Download</a>
+</body>
+</html>"#;
+
+        let server_clone = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in server_clone.incoming_requests() {
+                let url = req.url().to_owned();
+                if url.starts_with("/report.pdf") {
+                    let resp = Response::new(
+                        200.into(),
+                        vec![
+                            Header::from_bytes(&b"Content-Type"[..], &b"application/pdf"[..])
+                                .unwrap(),
+                            Header::from_bytes(
+                                &b"Content-Disposition"[..],
+                                &b"attachment; filename=\"../evil.pdf\""[..],
+                            )
+                            .unwrap(),
+                        ],
+                        Cursor::new(PDF_BYTES.to_vec()),
+                        Some(PDF_BYTES.len()),
+                        None,
+                    );
+                    let _ = req.respond(resp);
+                } else {
+                    let resp = Response::new(
+                        200.into(),
+                        vec![Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"text/html; charset=utf-8"[..],
+                        )
+                        .unwrap()],
+                        Cursor::new(HTML.to_vec()),
+                        Some(HTML.len()),
+                        None,
+                    );
+                    let _ = req.respond(resp);
+                }
+            }
+        });
+
+        DownloadServer {
+            base_url,
+            pdf_bytes: PDF_BYTES.to_vec(),
+            _server: server,
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+impl Drop for DownloadServer {
+    fn drop(&mut self) {}
+}
+
+// ---------------------------------------------------------------------------
+// CspServer — fixture for Content-Security-Policy tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cli")]
+const CSP_STRICT_HTML: &str = include_str!("csp_strict.html");
+#[cfg(feature = "cli")]
+const CSP_INLINE_HTML: &str = include_str!("csp_inline.html");
+#[cfg(feature = "cli")]
+const CSP_NONCE_HTML: &str = include_str!("csp_nonce.html");
+
+/// A single-port HTTP server serving pages with varying Content-Security-Policy headers:
+/// - `/csp_strict.html` with CSP: `script-src 'self'`, plus `/csp_strict.js`
+/// - `/csp_inline.html` with CSP: `script-src 'self' 'unsafe-inline'`
+/// - `/csp_nonce.html` with CSP: `script-src 'nonce-n0nc3'`
+/// - `/val.html` with no CSP, sets `window.val = 7`
+#[cfg(feature = "cli")]
+pub struct CspServer {
+    pub base_url: String,
+    _server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl CspServer {
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").expect("bind csp server"));
+        let port = server.server_addr().to_ip().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let server_clone = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in server_clone.incoming_requests() {
+                let path = req.url().to_owned();
+                let (status, headers, body) = match path.as_str() {
+                    "/csp_strict.html" => (
+                        200,
+                        vec![
+                            Header::from_bytes(
+                                &b"Content-Type"[..],
+                                &b"text/html; charset=utf-8"[..],
+                            )
+                            .unwrap(),
+                            Header::from_bytes(
+                                &b"Content-Security-Policy"[..],
+                                &b"script-src 'self'"[..],
+                            )
+                            .unwrap(),
+                        ],
+                        CSP_STRICT_HTML.as_bytes().to_vec(),
+                    ),
+                    "/csp_strict.js" => (
+                        200,
+                        vec![Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"application/javascript"[..],
+                        )
+                        .unwrap()],
+                        b"window.answer = 42;".to_vec(),
+                    ),
+                    "/csp_inline.html" => (
+                        200,
+                        vec![
+                            Header::from_bytes(
+                                &b"Content-Type"[..],
+                                &b"text/html; charset=utf-8"[..],
+                            )
+                            .unwrap(),
+                            Header::from_bytes(
+                                &b"Content-Security-Policy"[..],
+                                &b"script-src 'self' 'unsafe-inline'"[..],
+                            )
+                            .unwrap(),
+                        ],
+                        CSP_INLINE_HTML.as_bytes().to_vec(),
+                    ),
+                    "/csp_nonce.html" => (
+                        200,
+                        vec![
+                            Header::from_bytes(
+                                &b"Content-Type"[..],
+                                &b"text/html; charset=utf-8"[..],
+                            )
+                            .unwrap(),
+                            Header::from_bytes(
+                                &b"Content-Security-Policy"[..],
+                                &b"script-src 'nonce-n0nc3'"[..],
+                            )
+                            .unwrap(),
+                        ],
+                        CSP_NONCE_HTML.as_bytes().to_vec(),
+                    ),
+                    "/val.html" => (
+                        200,
+                        vec![Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"text/html; charset=utf-8"[..],
+                        )
+                        .unwrap()],
+                        b"<!DOCTYPE html><html><head><script>window.val = 7;</script></head><body>val</body></html>".to_vec(),
+                    ),
+                    _ => (
+                        404,
+                        vec![Header::from_bytes(&b"Content-Type"[..], &b"text/plain"[..]).unwrap()],
+                        b"not found".to_vec(),
+                    ),
+                };
+                let resp = Response::new(
+                    status.into(),
+                    headers,
+                    Cursor::new(body.clone()),
+                    Some(body.len()),
+                    None,
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        CspServer {
+            base_url,
+            _server: server,
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+}
+
+#[cfg(feature = "cli")]
+impl Drop for CspServer {
+    fn drop(&mut self) {}
+}
+
+#[cfg(feature = "cli")]
+pub struct DialogServer {
+    pub url: String,
+    _server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl DialogServer {
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let url = format!(
+            "http://127.0.0.1:{}/",
+            server.server_addr().to_ip().unwrap().port()
+        );
+        let worker = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in worker.incoming_requests() {
+                let response = Response::from_string(include_str!("dialogs.html")).with_header(
+                    Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(response);
+            }
+        });
+        Self {
+            url,
+            _server: server,
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+const POPUP_HTML: &str = include_str!("popup.html");
+#[cfg(feature = "cli")]
+const SELFCLOSE_HTML: &str = include_str!("selfclose.html");
+
+#[cfg(feature = "cli")]
+pub struct PopupServer {
+    pub base_url: String,
+    _server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl PopupServer {
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let worker = Arc::clone(&server);
+        thread::spawn(move || {
+            for req in worker.incoming_requests() {
+                let path = req.url().to_owned();
+                let (status, body) = match path.as_str() {
+                    "/popup.html" => (200, POPUP_HTML.as_bytes().to_vec()),
+                    "/main.html" => (
+                        200,
+                        MAIN_HTML_TEMPLATE
+                            .replace("__IFRAME_URL__", "about:blank")
+                            .into_bytes(),
+                    ),
+                    "/selfclose.html" => (200, SELFCLOSE_HTML.as_bytes().to_vec()),
+                    _ => (404, b"not found".to_vec()),
+                };
+                let resp = Response::new(
+                    status.into(),
+                    vec![Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    )
+                    .unwrap()],
+                    Cursor::new(body.clone()),
+                    Some(body.len()),
+                    None,
+                );
+                let _ = req.respond(resp);
+            }
+        });
+        Self {
+            base_url,
+            _server: server,
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+}
+
+#[cfg(feature = "cli")]
+const FRAMES_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Frames Test</title></head>
+<body style="margin: 0; padding: 0;">
+  <iframe id="same-frame" src="/same-frame.html" style="margin-left: 20px; margin-top: 30px; border: 4px solid black; width: 300px; height: 200px;"></iframe>
+  <iframe id="cross-frame" src="__CROSS_URL__/cross-frame.html" style="margin-left: 50px; margin-top: 40px; border: 10px solid gray; width: 400px; height: 300px;"></iframe>
+  <iframe id="nested-outer" src="/nested-outer.html" style="margin-left: 10px; margin-top: 15px; border: 2px solid blue; width: 400px; height: 400px;"></iframe>
+  <div id="not-an-iframe">I am a div</div>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+const SAME_FRAME_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Same Frame</title></head>
+<body style="margin: 0; padding: 0;">
+  <h1>Same Origin Frame</h1>
+  <p id="msg">Hello from same origin</p>
+  <button id="same-btn" onclick="this.setAttribute('data-clicked', 'true')">Same Button</button>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+const NESTED_OUTER_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Nested Outer</title></head>
+<body style="margin: 0; padding: 0;">
+  <h2>Nested Outer</h2>
+  <iframe id="nested-inner" src="/nested-inner.html" style="margin-left: 25px; margin-top: 35px; border: 5px solid green; width: 300px; height: 200px;"></iframe>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+const NESTED_INNER_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Nested Inner</title></head>
+<body style="margin: 0; padding: 0;">
+  <h3>Nested Inner</h3>
+  <p id="nested-val">Deep Content</p>
+  <button id="nested-btn" style="width:16px;height:16px;padding:0;border:0" onclick="this.setAttribute('data-clicked', 'nested-yes')">Nested Button</button>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+const SHADOW_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Shadow DOM Test</title></head>
+<body style="margin: 0; padding: 0;">
+  <div id="open-host"></div>
+  <div id="closed-host"></div>
+  <script>
+    const openHost = document.getElementById('open-host');
+    const openRoot = openHost.attachShadow({ mode: 'open' });
+    openRoot.innerHTML = '<button id="open-btn" onclick="this.setAttribute(\'data-clicked\', \'open-yes\')">Open Shadow Button</button><span id="open-text">Inside Open Shadow</span>';
+
+    const closedHost = document.getElementById('closed-host');
+    const closedRoot = closedHost.attachShadow({ mode: 'closed' });
+    closedRoot.innerHTML = '<button id="closed-btn" onclick="this.setAttribute(\'data-clicked\', \'closed-yes\')">Closed Shadow Button</button><span id="closed-text">Inside Closed Shadow</span>';
+  </script>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+const CROSS_FRAME_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Cross Frame</title></head>
+<body style="margin: 0; padding: 0;">
+  <h1>Cross Origin Frame</h1>
+  <input id="cross-input" type="text" value="" style="margin-left: 10px; margin-top: 10px;" />
+  <button id="cross-btn" onclick="document.getElementById('cross-input').setAttribute('data-clicked', 'cross-yes')" style="margin-left: 10px; margin-top: 10px; width: 16px; height: 16px; padding:0;border:0;">Cross Button</button>
+  <p id="cross-text">Cross Origin Text</p>
+</body>
+</html>"#;
+
+#[cfg(feature = "cli")]
+pub struct FramesServer {
+    pub main_url: String,
+    #[allow(dead_code)]
+    pub cross_url: String,
+    _main_server: Arc<Server>,
+    _cross_server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl FramesServer {
+    pub fn start() -> Self {
+        let main_server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let cross_server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+
+        let main_port = main_server.server_addr().to_ip().unwrap().port();
+        let cross_port = cross_server.server_addr().to_ip().unwrap().port();
+
+        let main_url = format!("http://127.0.0.1:{main_port}");
+        let cross_url = format!("http://127.0.0.1:{cross_port}");
+
+        let cross_url_clone = cross_url.clone();
+        let worker_main = Arc::clone(&main_server);
+        thread::spawn(move || {
+            for req in worker_main.incoming_requests() {
+                let path = req.url().to_owned();
+                let (status, body) = match path.as_str() {
+                    "/frames.html" => (
+                        200,
+                        FRAMES_HTML_TEMPLATE
+                            .replace("__CROSS_URL__", &cross_url_clone)
+                            .into_bytes(),
+                    ),
+                    "/same-frame.html" => (200, SAME_FRAME_HTML.as_bytes().to_vec()),
+                    "/nested-outer.html" => (200, NESTED_OUTER_HTML.as_bytes().to_vec()),
+                    "/nested-inner.html" => (200, NESTED_INNER_HTML.as_bytes().to_vec()),
+                    "/shadow.html" => (200, SHADOW_HTML.as_bytes().to_vec()),
+                    _ => (404, b"not found".to_vec()),
+                };
+                let resp = Response::new(
+                    status.into(),
+                    vec![Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    )
+                    .unwrap()],
+                    Cursor::new(body.clone()),
+                    Some(body.len()),
+                    None,
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        let worker_cross = Arc::clone(&cross_server);
+        thread::spawn(move || {
+            for req in worker_cross.incoming_requests() {
+                let path = req.url().to_owned();
+                let (status, body) = match path.as_str() {
+                    "/cross-frame.html" => (200, CROSS_FRAME_HTML.as_bytes().to_vec()),
+                    _ => (404, b"not found".to_vec()),
+                };
+                let resp = Response::new(
+                    status.into(),
+                    vec![Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    )
+                    .unwrap()],
+                    Cursor::new(body.clone()),
+                    Some(body.len()),
+                    None,
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        Self {
+            main_url,
+            cross_url,
+            _main_server: main_server,
+            _cross_server: cross_server,
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.main_url, path)
+    }
 }

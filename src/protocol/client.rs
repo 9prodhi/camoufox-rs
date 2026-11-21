@@ -12,12 +12,17 @@ use crate::protocol::types::{
     EventMessage, IncomingMessage, MessageId, Request, ResponseMessage, SessionId,
     BROWSER_CLOSE_MESSAGE_ID,
 };
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportReader, TransportWriter};
 
 /// Default deadline applied to `Session::send` so no protocol call can hang
 /// forever. Individual callers that need a tighter (or looser) bound should
 /// use [`Session::send_with_timeout`] explicitly.
 pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[cfg(not(test))]
+const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const READER_JOIN_TIMEOUT: Duration = Duration::from_millis(200);
 
 // ---------------------------------------------------------------------------
 // Internal shared state
@@ -66,86 +71,48 @@ impl SessionInner {
 }
 
 // ---------------------------------------------------------------------------
-// Split transport
-// ---------------------------------------------------------------------------
-
-/// Enables concurrent read and write access to a `Transport`.
-///
-/// The `Transport` trait uses `&mut self` for both `send()` and `receive()`.
-/// For pipe-based transports, reads and writes go to separate file
-/// descriptors (fd 3 write, fd 4 read) and can safely happen concurrently.
-///
-/// `SplitTransport` uses `UnsafeCell` to allow the reader thread to call
-/// `receive()` while caller threads call `send()` (serialized by a Mutex).
-///
-/// # Safety
-///
-/// Sound when `send()` and `receive()` operate on independent internal state,
-/// which is true for pipe transports (separate fds) and for the channel-based
-/// mock transport in tests (separate channels).
-struct SplitTransport {
-    inner: std::cell::UnsafeCell<Box<dyn Transport>>,
-}
-
-unsafe impl Send for SplitTransport {}
-unsafe impl Sync for SplitTransport {}
-
-impl SplitTransport {
-    fn new(transport: Box<dyn Transport>) -> Self {
-        Self {
-            inner: std::cell::UnsafeCell::new(transport),
-        }
-    }
-
-    /// Read the next message. Only called by the reader thread.
-    fn receive(
-        &self,
-    ) -> Result<crate::protocol::types::RawMessage, crate::transport::errors::TransportError> {
-        unsafe { &mut *self.inner.get() }.receive()
-    }
-
-    /// Send a message. Caller must serialize access (via Mutex).
-    fn send(
-        &self,
-        message: &serde_json::Value,
-    ) -> Result<(), crate::transport::errors::TransportError> {
-        unsafe { &mut *self.inner.get() }.send(message)
-    }
-
-    /// Close the transport.
-    fn close(&self) -> Result<(), crate::transport::errors::TransportError> {
-        unsafe { &mut *self.inner.get() }.close()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
+
+fn join_reader_bounded(
+    handle: Option<thread::JoinHandle<()>>,
+    exit_rx: Option<std::sync::mpsc::Receiver<()>>,
+) {
+    if let Some(rx) = exit_rx {
+        match rx.recv_timeout(READER_JOIN_TIMEOUT) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(h) = handle {
+                    let _ = h.join();
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                log::warn!(
+                    "reader thread did not exit within {:?}; detaching",
+                    READER_JOIN_TIMEOUT
+                );
+                // Intentionally do not call join(); dropping the JoinHandle detaches the thread.
+            }
+        }
+    } else if let Some(h) = handle {
+        let _ = h.join();
+    }
+}
 
 /// A connection to the Juggler protocol endpoint.
 ///
 /// Manages the root session and page sessions. Spawns a single reader thread
 /// that processes incoming messages (responses and events). Outgoing messages
-/// are sent directly from the caller's thread, serialized by a `Mutex`.
-///
-/// # Architecture
-///
-/// - **Reader thread**: loops on `transport.receive()`, classifies each
-///   incoming message, resolves pending requests, and dispatches events.
-/// - **Write path**: caller threads hold the `write_lock` Mutex, serialize
-///   the request to JSON, and call `transport.send()` directly.
-///
-/// There is no dedicated writer thread. This avoids deadlock issues with
-/// channel-based designs and is simpler overall.
+/// are sent directly from the caller's thread, serialized by the writer `Mutex`.
 pub struct Connection {
     /// Thread-safe shared state.
     inner: Arc<Mutex<ConnectionInner>>,
     /// Handle to the reader thread.
     reader_handle: Option<thread::JoinHandle<()>>,
-    /// Shared transport (concurrent read/write via SplitTransport).
-    transport: Arc<SplitTransport>,
-    /// Mutex to serialize write operations from multiple caller threads.
-    write_lock: Arc<Mutex<()>>,
+    reader_thread_id: thread::ThreadId,
+    /// Receiver for exit notification from the reader thread.
+    reader_exit_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Serialized write half of the transport (guards send and close).
+    writer: Arc<Mutex<Box<dyn TransportWriter>>>,
 }
 
 impl Connection {
@@ -154,6 +121,9 @@ impl Connection {
     /// Spawns the reader thread. The root session (key `""`) is
     /// automatically created.
     pub fn new(transport: Box<dyn Transport>) -> Self {
+        let (writer, reader) = transport.into_split();
+        let writer = Arc::new(Mutex::new(writer));
+
         let inner = Arc::new(Mutex::new(ConnectionInner {
             state: ConnectionState::Connected,
             id_gen: IdGenerator::new(),
@@ -164,28 +134,29 @@ impl Connection {
 
         // Create root session
         {
-            let mut guard = inner.lock().unwrap();
+            let mut guard = inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.sessions.insert(String::new(), SessionInner::new());
         }
 
-        let transport = Arc::new(SplitTransport::new(transport));
-        let write_lock = Arc::new(Mutex::new(()));
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
 
         // Spawn reader thread
         let inner_r = Arc::clone(&inner);
-        let transport_r = Arc::clone(&transport);
         let reader_handle = thread::Builder::new()
             .name("juggler-reader".into())
             .spawn(move || {
-                reader_thread(transport_r, inner_r);
+                reader_thread(reader, inner_r, exit_tx);
             })
             .expect("failed to spawn reader thread");
 
         Connection {
             inner,
+            reader_thread_id: reader_handle.thread().id(),
             reader_handle: Some(reader_handle),
-            transport,
-            write_lock,
+            reader_exit_rx: Mutex::new(Some(exit_rx)),
+            writer,
         }
     }
 
@@ -195,8 +166,17 @@ impl Connection {
             session_id: None,
             session_key: String::new(),
             inner: Arc::clone(&self.inner),
-            transport: Arc::clone(&self.transport),
-            write_lock: Arc::clone(&self.write_lock),
+            writer: Arc::clone(&self.writer),
+        }
+    }
+
+    /// Obtain a handle without creating or reviving a session.
+    pub(crate) fn session_handle(&self, session_id: String) -> Session {
+        Session {
+            session_key: session_id.clone(),
+            session_id: Some(session_id),
+            inner: Arc::clone(&self.inner),
+            writer: Arc::clone(&self.writer),
         }
     }
 
@@ -207,7 +187,10 @@ impl Connection {
     pub fn create_session(&self, session_id: String) -> Session {
         let session_key = session_id.clone();
         {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard
                 .sessions
                 .entry(session_key.clone())
@@ -217,8 +200,22 @@ impl Connection {
             session_id: Some(session_id),
             session_key,
             inner: Arc::clone(&self.inner),
-            transport: Arc::clone(&self.transport),
-            write_lock: Arc::clone(&self.write_lock),
+            writer: Arc::clone(&self.writer),
+        }
+    }
+
+    /// Reject in-flight requests belonging to a single session.
+    pub(crate) fn reject_session_pending(
+        &self,
+        session_key: &str,
+        make: impl Fn(&str) -> ProtocolError,
+    ) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(session) = guard.sessions.get_mut(session_key) {
+            session.pending.reject_all_with(make);
         }
     }
 
@@ -227,11 +224,20 @@ impl Connection {
     /// Called when `Browser.detachedFromTarget` arrives. Rejects all pending
     /// requests and removes event handlers.
     pub fn dispose_session(&self, session_id: &str) {
-        let mut guard = self.inner.lock().unwrap();
-        if let Some(mut session) = guard.sessions.remove(session_id) {
-            session.pending.reject_all(ProtocolErrorKind::Closed);
-        }
-        guard.events.remove_session(session_id);
+        let handlers_to_drop = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(mut session) = guard.sessions.remove(session_id) {
+                session.pending.reject_all(ProtocolErrorKind::Closed);
+            }
+            guard
+                .pending_navs
+                .retain(|_, nav| nav.session_key != session_id);
+            guard.events.take_session_handlers(session_id)
+        };
+        drop(handlers_to_drop);
     }
 
     /// Subscribe to events on a specific session.
@@ -241,7 +247,10 @@ impl Connection {
     /// duration of a single operation MUST call `off_event` when done, or the
     /// closure leaks in the router (it stays in the handler Vec forever).
     pub fn on_event(&self, session_key: &str, method: &str, handler: EventHandler) -> HandlerId {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.events.on(session_key, method, handler)
     }
 
@@ -249,7 +258,10 @@ impl Connection {
     ///
     /// No-op if the handler was already removed (e.g. by session disposal).
     pub fn off_event(&self, session_key: &str, method: &str, id: HandlerId) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.events.off(session_key, method, id);
     }
 
@@ -257,22 +269,59 @@ impl Connection {
     ///
     /// Returns a [`HandlerId`]; deregister with `off_event(session_key, "*", id)`.
     pub fn on_event_any(&self, session_key: &str, handler: EventHandler) -> HandlerId {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.events.on_any(session_key, handler)
     }
 
     /// Subscribe to all events globally (for logging/debugging).
-    pub fn on_event_global(&self, handler: EventHandler) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.events.on_global(handler);
+    pub fn on_event_global(&self, handler: EventHandler) -> HandlerId {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.events.on_global(handler)
+    }
+
+    /// Deregister a global handler previously registered with [`on_event_global`](Self::on_event_global).
+    pub fn off_event_global(&self, id: HandlerId) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.events.off_global(id);
+    }
+
+    /// Total number of registered handlers (session-scoped and global).
+    #[doc(hidden)]
+    pub fn handler_count(&self) -> usize {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.events.handler_count()
     }
 
     /// Test-only: number of handlers registered for one `(session_key, method)`.
     /// Used by leak-regression guards (e.g. transient lifecycle waits).
     #[cfg(test)]
     pub fn event_handler_count_for(&self, session_key: &str, method: &str) -> usize {
-        let guard = self.inner.lock().unwrap();
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.events.handler_count_for(session_key, method)
+    }
+
+    /// Whether the connection is closing or closed.
+    pub fn rejects_sends(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state
+            .rejects_sends()
     }
 
     /// Close the connection gracefully.
@@ -281,7 +330,10 @@ impl Connection {
     /// (bypassing session send). After this, call `wait_closed()`.
     pub fn close(&self) -> Result<(), ProtocolError> {
         {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.state.is_closed() || guard.state == ConnectionState::Closing {
                 return Ok(());
             }
@@ -303,38 +355,63 @@ impl Connection {
             download_info: None,
         })?;
 
-        let _lock = self.write_lock.lock().unwrap();
-        self.transport
-            .send(&value)
-            .map_err(ProtocolError::transport)?;
-
-        Ok(())
+        crate::obs::log_outgoing(&value);
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = writer.send(&value).map_err(ProtocolError::transport);
+        // Camoufox exits on EOF even when a browser context remains open.
+        let _ = writer.close();
+        drop(writer);
+        close_all_sessions(&self.inner);
+        result
     }
 
     /// Wait for the connection to fully close.
     ///
     /// Force-closes the transport, rejects all pending requests, and joins
-    /// the reader thread.
+    /// the reader thread (with a bounded timeout).
     pub fn wait_closed(&mut self) {
-        let _ = self.transport.close();
+        {
+            let mut writer = self
+                .writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = writer.close();
+        }
         close_all_sessions(&self.inner);
-        if let Some(handle) = self.reader_handle.take() {
-            let _ = handle.join();
+        self.finish_reader();
+    }
+
+    fn finish_reader(&mut self) {
+        let exit_rx = self
+            .reader_exit_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let handle = self.reader_handle.take();
+        // A handler's temporary upgrade can be the last owner. Waiting for
+        // our own exit notification would stall this reader until timeout.
+        if thread::current().id() != self.reader_thread_id {
+            join_reader_bounded(handle, exit_rx);
         }
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // Force-close the transport so the reader thread exits.
-        let _ = self.transport.close();
-        // Join the reader thread to ensure clean shutdown. This is safe
-        // because close() above guarantees the reader will exit promptly
-        // (real transports unblock read on fd close; MockTransport uses
-        // recv_timeout to check the closed flag).
-        if let Some(handle) = self.reader_handle.take() {
-            let _ = handle.join();
+        // Closing fd 3 does not unblock a read on fd 4 if the browser is wedged.
+        // Therefore, we wait for the reader thread for a bounded time and detach
+        // on timeout to prevent hanging shutdown.
+        {
+            let mut writer = self
+                .writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = writer.close();
         }
+        self.finish_reader();
     }
 }
 
@@ -356,11 +433,68 @@ pub struct Session {
     session_id: SessionId,
     session_key: String,
     inner: Arc<Mutex<ConnectionInner>>,
-    transport: Arc<SplitTransport>,
-    write_lock: Arc<Mutex<()>>,
+    writer: Arc<Mutex<Box<dyn TransportWriter>>>,
 }
 
 impl Session {
+    /// Pre-send check: session state
+    pub fn is_closed(&self) -> bool {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.state.rejects_sends() {
+            return true;
+        }
+        match guard.sessions.get(&self.session_key) {
+            Some(session) => session.state == SessionState::Disposed,
+            None => true,
+        }
+    }
+
+    pub fn is_crashed(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .get(&self.session_key)
+            .is_some_and(|session| session.state == SessionState::Crashed)
+    }
+
+    /// Close a crashed page without waiting for a renderer response. Unlike
+    /// ordinary sends, Page.close is allowed on a crashed (but not disposed)
+    /// session. No pending request is registered; a late response is ignored.
+    pub(crate) fn close_page_best_effort(&self) {
+        let request = {
+            let guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.state.rejects_sends()
+                || !guard
+                    .sessions
+                    .get(&self.session_key)
+                    .is_some_and(|s| s.state == SessionState::Crashed)
+            {
+                return;
+            }
+            Request {
+                id: guard.id_gen.next(),
+                method: "Page.close".into(),
+                params: serde_json::json!({}),
+                session_id: self.session_id.clone(),
+            }
+        };
+        if let Ok(value) = serde_json::to_value(request) {
+            crate::obs::log_outgoing(&value);
+            let _ = self
+                .writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .send(&value);
+        }
+    }
+
     /// Send a protocol method and wait for the response.
     ///
     /// Applies a default deadline of [`DEFAULT_SEND_TIMEOUT`] so no protocol
@@ -398,10 +532,13 @@ impl Session {
         deadline: Duration,
     ) -> Result<serde_json::Value, ProtocolError> {
         let (rx, id, value) = {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             // Pre-send check: connection state
-            if guard.state.is_closed() {
+            if guard.state.rejects_sends() {
                 return Err(ProtocolError::closed(Some(method.to_owned())));
             }
 
@@ -451,11 +588,18 @@ impl Session {
             (rx, id, value)
         };
         // Inner lock released. Now send through the transport with write serialization.
+        crate::obs::log_outgoing(&value);
         {
-            let _lock = self.write_lock.lock().unwrap();
-            if let Err(e) = self.transport.send(&value) {
+            let mut writer = self
+                .writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(e) = writer.send(&value) {
                 // Send failed — drop the pending slot so it does not leak.
-                let mut guard = self.inner.lock().unwrap();
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(session) = guard.sessions.get_mut(&self.session_key) {
                     session.pending.remove(id);
                 }
@@ -470,7 +614,10 @@ impl Session {
                 // Free the pending slot so a late response is silently
                 // discarded by the reader thread (resolve returns false for
                 // unknown ids) and the slot is not leaked.
-                let mut guard = self.inner.lock().unwrap();
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(session) = guard.sessions.get_mut(&self.session_key) {
                     session.pending.remove(id);
                 }
@@ -525,9 +672,12 @@ impl Session {
         // logic inline. We can't piggy-back on `send` because we need the
         // allocated ID *before* the request goes out.
         let (rx, value, id) = {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-            if guard.state.is_closed() {
+            if guard.state.rejects_sends() {
                 return Err(ProtocolError::closed(Some(method.to_owned())));
             }
 
@@ -600,11 +750,18 @@ impl Session {
             (rx, value, id)
         };
 
+        crate::obs::log_outgoing(&value);
         {
-            let _lock = self.write_lock.lock().unwrap();
-            if let Err(e) = self.transport.send(&value) {
+            let mut writer = self
+                .writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(e) = writer.send(&value) {
                 // Clean up the pending-nav entry on send failure.
-                let mut guard = self.inner.lock().unwrap();
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(p) = guard.pending_navs.get(frame_id) {
                     if p.request_id == id {
                         guard.pending_navs.remove(frame_id);
@@ -623,7 +780,10 @@ impl Session {
             Err(RecvTimeoutError::Timeout) => {
                 // Free the pending slot so a late response is silently
                 // discarded by the reader thread.
-                let mut guard = self.inner.lock().unwrap();
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(session) = guard.sessions.get_mut(&self.session_key) {
                     session.pending.remove(id);
                 }
@@ -638,7 +798,10 @@ impl Session {
         // *our* request (a later navigation for the same frame may have
         // overwritten it).
         {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(p) = guard.pending_navs.get(frame_id) {
                 if p.request_id == id {
                     guard.pending_navs.remove(frame_id);
@@ -682,7 +845,10 @@ impl Session {
     /// Rejects all pending requests with `Crashed`. Future sends fail
     /// immediately.
     pub fn mark_crashed(&self) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(session) = guard.sessions.get_mut(&self.session_key) {
             session.state = SessionState::Crashed;
             session.pending.reject_all(ProtocolErrorKind::Crashed);
@@ -701,22 +867,53 @@ impl Session {
 }
 
 // ---------------------------------------------------------------------------
-// Reader thread
+// Reader thread & drop guard
 // ---------------------------------------------------------------------------
 
-fn reader_thread(transport: Arc<SplitTransport>, inner: Arc<Mutex<ConnectionInner>>) {
+struct ReaderDropGuard {
+    inner: Arc<Mutex<ConnectionInner>>,
+    exit_tx: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl Drop for ReaderDropGuard {
+    fn drop(&mut self) {
+        close_all_sessions(&self.inner);
+        if let Some(tx) = self.exit_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+fn reader_thread(
+    mut reader: Box<dyn TransportReader>,
+    inner: Arc<Mutex<ConnectionInner>>,
+    exit_tx: std::sync::mpsc::Sender<()>,
+) {
+    let _guard = ReaderDropGuard {
+        inner: Arc::clone(&inner),
+        exit_tx: Some(exit_tx),
+    };
+
     loop {
-        let raw = transport.receive();
+        let raw = reader.receive();
 
         let raw_message = match raw {
             Ok(msg) => msg,
-            Err(e) => {
-                log::debug!("reader thread: transport error: {e}");
-                close_all_sessions(&inner);
-                return;
+            Err(crate::transport::errors::TransportError::Codec(e)) => {
+                log::warn!("reader thread: codec error, skipping frame: {e}");
+                continue;
+            }
+            Err(crate::transport::errors::TransportError::Closed) => {
+                log::debug!("reader thread: transport closed");
+                break;
+            }
+            Err(crate::transport::errors::TransportError::Io(e)) => {
+                log::debug!("reader thread: transport I/O error: {e}");
+                break;
             }
         };
 
+        crate::obs::log_incoming_message(&raw_message);
         let incoming = match raw_message.classify() {
             Some(msg) => msg,
             None => {
@@ -744,7 +941,9 @@ fn handle_response(inner: &Arc<Mutex<ConnectionInner>>, response: ResponseMessag
         return;
     }
 
-    let mut guard = inner.lock().unwrap();
+    let mut guard = inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let session_key = response.session_id.as_deref().unwrap_or("");
 
     if let Some(session) = guard.sessions.get_mut(session_key) {
@@ -766,8 +965,42 @@ fn handle_event(inner: &Arc<Mutex<ConnectionInner>>, event: EventMessage) {
         handle_download_created(inner, &event);
     }
 
-    let guard = inner.lock().unwrap();
-    guard.events.dispatch(&event);
+    let mut handlers_to_drop = Default::default();
+    let handlers = {
+        let mut guard = inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Handle session lifecycle events under the lock before dispatch
+        if event.method == "Browser.detachedFromTarget" {
+            if let Some(sid) = event.params.get("sessionId").and_then(|v| v.as_str()) {
+                if let Some(mut session) = guard.sessions.remove(sid) {
+                    session.pending.reject_all(ProtocolErrorKind::Closed);
+                }
+                guard.pending_navs.retain(|_, nav| nav.session_key != sid);
+                handlers_to_drop = guard.events.take_session_handlers(sid);
+            }
+        } else if event.method == "Page.crashed" {
+            let session_key = event.session_id.as_deref().unwrap_or("");
+            if let Some(session) = guard.sessions.get_mut(session_key) {
+                session.state = SessionState::Crashed;
+                session.pending.reject_all(ProtocolErrorKind::Crashed);
+            }
+        }
+
+        guard.events.matching_handlers(&event)
+    };
+    drop(handlers_to_drop);
+
+    // Dispatch handlers outside the mutex lock to prevent deadlocks and poison cascades.
+    for handler in handlers {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handler(&event);
+        }));
+        if let Err(e) = res {
+            log::error!("event handler panicked: {:?}", e);
+        }
+    }
 }
 
 /// Match an incoming `Browser.downloadCreated` event against the pending-nav
@@ -798,7 +1031,9 @@ fn handle_download_created(inner: &Arc<Mutex<ConnectionInner>>, event: &EventMes
         return;
     };
 
-    let mut guard = inner.lock().unwrap();
+    let mut guard = inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(pending) = guard.pending_navs.remove(&frame_id) else {
         log::warn!(
             "Browser.downloadCreated for frame {} has no matching pending navigation (download_id={:?})",
@@ -823,20 +1058,24 @@ fn handle_download_created(inner: &Arc<Mutex<ConnectionInner>>, event: &EventMes
         return;
     };
 
-    // Reject the matching pending request slot. We can't go through
-    // `PendingMap::resolve` (which only takes `Result<Value, ErrorData>`),
-    // so we inject the error directly via reject_one — but PendingMap has no
-    // such method. Instead we remove-and-send via a tiny helper here.
+    // Reject the matching pending request slot via `PendingMap::resolve_with_error`.
     session.pending.resolve_with_error(pending.request_id, err);
 }
 
 fn close_all_sessions(inner: &Arc<Mutex<ConnectionInner>>) {
-    let mut guard = inner.lock().unwrap();
-    guard.state = ConnectionState::Closed;
-    for (_key, session) in guard.sessions.iter_mut() {
-        session.state = SessionState::Disposed;
-        session.pending.reject_all(ProtocolErrorKind::Closed);
-    }
+    let events_to_drop = {
+        let mut guard = inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.state = ConnectionState::Closed;
+        for (_key, session) in guard.sessions.iter_mut() {
+            session.state = SessionState::Disposed;
+            session.pending.reject_all(ProtocolErrorKind::Closed);
+        }
+        guard.pending_navs.clear();
+        std::mem::take(&mut guard.events)
+    };
+    drop(events_to_drop);
 }
 
 // ---------------------------------------------------------------------------
@@ -857,10 +1096,61 @@ mod tests {
     // Mock transport
     // -----------------------------------------------------------------------
 
+    struct MockWriter {
+        outgoing_tx: mpsc::Sender<serde_json::Value>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl TransportWriter for MockWriter {
+        fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(TransportError::Closed);
+            }
+            self.outgoing_tx
+                .send(message.clone())
+                .map_err(|_| TransportError::Closed)
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    struct MockReader {
+        incoming_rx: mpsc::Receiver<RawMessage>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl TransportReader for MockReader {
+        fn receive(&mut self) -> Result<RawMessage, TransportError> {
+            loop {
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(TransportError::Closed);
+                }
+                match self
+                    .incoming_rx
+                    .recv_timeout(std::time::Duration::from_millis(10))
+                {
+                    Ok(msg) => return Ok(msg),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(TransportError::Closed)
+                    }
+                }
+            }
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
     /// Mock transport using independent channels for read and write.
-    /// `receive()` blocks on `incoming_rx.recv()`.
-    /// `send()` pushes to `outgoing_tx`.
-    /// Both are independent, satisfying SplitTransport's safety invariant.
     struct MockTransport {
         incoming_rx: mpsc::Receiver<RawMessage>,
         outgoing_tx: mpsc::Sender<serde_json::Value>,
@@ -891,44 +1181,17 @@ mod tests {
     }
 
     impl Transport for MockTransport {
-        fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
-            if self.closed.load(Ordering::SeqCst) {
-                return Err(TransportError::Closed);
-            }
-            self.outgoing_tx
-                .send(message.clone())
-                .map_err(|_| TransportError::Closed)
-        }
-
-        fn receive(&mut self) -> Result<RawMessage, TransportError> {
-            // Use recv_timeout so that transport.close() (which sets the
-            // closed flag) can unblock this loop promptly. Without this,
-            // Connection::drop would hang waiting for the reader thread
-            // when tests run in parallel and don't explicitly call teardown.
-            loop {
-                if self.closed.load(Ordering::SeqCst) {
-                    return Err(TransportError::Closed);
-                }
-                match self
-                    .incoming_rx
-                    .recv_timeout(std::time::Duration::from_millis(10))
-                {
-                    Ok(msg) => return Ok(msg),
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(TransportError::Closed)
-                    }
-                }
-            }
-        }
-
-        fn close(&mut self) -> Result<(), TransportError> {
-            self.closed.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn is_closed(&self) -> bool {
-            self.closed.load(Ordering::SeqCst)
+        fn into_split(self: Box<Self>) -> (Box<dyn TransportWriter>, Box<dyn TransportReader>) {
+            (
+                Box::new(MockWriter {
+                    outgoing_tx: self.outgoing_tx,
+                    closed: Arc::clone(&self.closed),
+                }),
+                Box::new(MockReader {
+                    incoming_rx: self.incoming_rx,
+                    closed: Arc::clone(&self.closed),
+                }),
+            )
         }
     }
 
@@ -1007,6 +1270,37 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn reject_session_pending_only_hits_that_session() {
+        let h = setup();
+        let a = h.conn.create_session("A".into());
+        let b = h.conn.create_session("B".into());
+        let ha = thread::spawn(move || {
+            a.send_with_timeout("Runtime.evaluate", json!({}), Duration::from_secs(5))
+        });
+        let hb = thread::spawn(move || {
+            b.send_with_timeout("Runtime.evaluate", json!({}), Duration::from_millis(300))
+        });
+        recv_out(&h.out_rx);
+        recv_out(&h.out_rx);
+        h.conn.reject_session_pending("A", |m| {
+            ProtocolError::new(
+                ProtocolErrorKind::DialogOpened,
+                Some(m.to_owned()),
+                "dialog",
+            )
+        });
+        assert_eq!(
+            ha.join().unwrap().unwrap_err().kind,
+            ProtocolErrorKind::DialogOpened
+        );
+        assert_eq!(
+            hb.join().unwrap().unwrap_err().kind,
+            ProtocolErrorKind::Timeout
+        );
+        teardown(h);
+    }
+
+    #[test]
     fn root_session_send_and_receive() {
         let h = setup();
         let session = h.conn.root_session();
@@ -1081,7 +1375,7 @@ mod tests {
         h.conn.on_event(
             "",
             "Browser.attachedToTarget",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 r.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -1135,6 +1429,48 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind, ProtocolErrorKind::Crashed);
 
+        teardown(h);
+    }
+
+    #[test]
+    fn close_closes_writer_after_browser_close() {
+        let h = setup();
+        h.conn.close().unwrap();
+        assert_eq!(recv_out(&h.out_rx)["method"], "Browser.close");
+        assert!(h.conn.writer.lock().unwrap().is_closed());
+        teardown(h);
+    }
+
+    #[test]
+    fn close_rejects_in_flight_requests_promptly() {
+        let h = setup();
+        let session = h.conn.root_session();
+        let worker = thread::spawn(move || {
+            session.send_with_timeout("Browser.getInfo", json!({}), Duration::from_secs(2))
+        });
+        recv_out(&h.out_rx);
+        let start = std::time::Instant::now();
+        h.conn.close().unwrap();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().kind,
+            ProtocolErrorKind::Closed
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        teardown(h);
+    }
+
+    #[test]
+    fn send_after_close_is_rejected_as_closed() {
+        let h = setup();
+        h.conn.close().unwrap();
+        assert_eq!(
+            h.conn
+                .root_session()
+                .send("Browser.getInfo", json!({}))
+                .unwrap_err()
+                .kind,
+            ProtocolErrorKind::Closed
+        );
         teardown(h);
     }
 
@@ -1525,7 +1861,7 @@ mod tests {
 
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        h.conn.on_event_global(Box::new(move |_| {
+        h.conn.on_event_global(Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
         }));
 
@@ -1836,5 +2172,445 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("result must have 'cookies' array");
         assert!(cookies.is_empty(), "expected empty cookie array");
+    }
+
+    #[test]
+    fn handler_panic_does_not_kill_connection() {
+        let mut h = setup();
+
+        let (subsequent_tx, subsequent_rx) = mpsc::channel();
+        let (later_event_tx, later_event_rx) = mpsc::channel();
+
+        // 1. Register a handler that panics
+        h.conn.on_event(
+            "",
+            "Browser.attachedToTarget",
+            Arc::new(|_| {
+                panic!("deliberate panic inside handler");
+            }),
+        );
+
+        // 2. Register a sibling handler on the same event
+        let sub_tx = subsequent_tx;
+        h.conn.on_event(
+            "",
+            "Browser.attachedToTarget",
+            Arc::new(move |_| {
+                let _ = sub_tx.send(());
+            }),
+        );
+
+        // 3. Register a handler on a later event
+        h.conn.on_event(
+            "",
+            "Page.loadEventFired",
+            Arc::new(move |_| {
+                let _ = later_event_tx.send(());
+            }),
+        );
+
+        // Trigger the panicking event
+        h.in_tx
+            .send(event_message("Browser.attachedToTarget", None))
+            .unwrap();
+
+        // Sibling handler must run despite the panic
+        assert_eq!(
+            subsequent_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "sibling handler should have run after the panicking handler"
+        );
+
+        // Subsequent send must still get its response
+        let session = h.conn.root_session();
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+        let responder = thread::spawn(move || {
+            let sent = recv_out(&out_rx);
+            let id = sent["id"].as_i64().unwrap();
+            in_tx.send(success_response(id, None)).unwrap();
+        });
+
+        let result = session.send("Browser.enable", json!({}));
+        assert!(result.is_ok(), "send should succeed after handler panic");
+        responder.join().unwrap();
+
+        // Later events must still be dispatched
+        h.in_tx
+            .send(event_message("Page.loadEventFired", None))
+            .unwrap();
+        assert_eq!(
+            later_event_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "later event should still be dispatched"
+        );
+
+        drop(h.in_tx);
+        h.conn.wait_closed();
+    }
+
+    #[test]
+    fn handler_calling_methods_does_not_deadlock() {
+        let (transport, in_tx, out_rx, _closed) = MockTransport::new();
+        let conn = Arc::new(Connection::new(Box::new(transport)));
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let conn_weak = Arc::downgrade(&conn);
+        let session_for_handler = conn.root_session();
+
+        conn.on_event(
+            "",
+            "Custom.testEvent",
+            Arc::new(move |_| {
+                if let Some(c) = conn_weak.upgrade() {
+                    let id = c.on_event("s1", "Inner.event", Arc::new(|_| {}));
+                    c.off_event("s1", "Inner.event", id);
+                }
+                // Calling send_with_timeout directly inside dispatch does not deadlock on inner mutex
+                let res = session_for_handler.send_with_timeout(
+                    "Browser.enable",
+                    json!({}),
+                    std::time::Duration::from_millis(50),
+                );
+                assert_eq!(res.unwrap_err().kind, ProtocolErrorKind::Timeout);
+                let _ = done_tx.send(());
+            }),
+        );
+
+        in_tx.send(event_message("Custom.testEvent", None)).unwrap();
+
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "handler calling on_event/off_event/send should not deadlock"
+        );
+
+        // Drain the outgoing request from send_with_timeout
+        let _ = out_rx.recv_timeout(std::time::Duration::from_millis(200));
+
+        drop(in_tx);
+        drop(conn);
+    }
+
+    #[test]
+    fn c1_reader_thread_no_deadlock_when_dropping_session_handler_reacquires_inner() {
+        let (transport, in_tx, _out_rx, _closed) = MockTransport::new();
+        let conn = Arc::new(Connection::new(Box::new(transport)));
+        let (done_tx, done_rx) = mpsc::channel();
+
+        struct ReacquireInnerOnDrop {
+            conn: Arc<Connection>,
+            done_tx: mpsc::Sender<()>,
+        }
+        impl Drop for ReacquireInnerOnDrop {
+            fn drop(&mut self) {
+                // Calling off_event locks ConnectionInner.
+                // If dropped while the reader thread holds ConnectionInner during
+                // remove_session, this deadlocks the reader thread.
+                self.conn.off_event("s1", "some.method", 9999);
+                let _ = self.done_tx.send(());
+            }
+        }
+
+        let dropper = ReacquireInnerOnDrop {
+            conn: Arc::clone(&conn),
+            done_tx,
+        };
+
+        // Register a handler on session "s1" that holds dropper
+        conn.on_event(
+            "s1",
+            "Page.frameAttached",
+            Arc::new(move |_| {
+                let _ = &dropper;
+            }),
+        );
+
+        // Send Browser.detachedFromTarget for s1
+        let detach_msg = RawMessage {
+            id: None,
+            method: Some("Browser.detachedFromTarget".into()),
+            params: Some(json!({
+                "sessionId": "s1",
+                "targetId": "t1",
+            })),
+            result: None,
+            error: None,
+            session_id: None,
+        };
+        in_tx.send(detach_msg).unwrap();
+
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "dropping session handlers must not deadlock reader thread"
+        );
+    }
+
+    #[test]
+    fn reader_exit_rejects_pending_sends_and_disconnects_waiters() {
+        let mut h = setup();
+        let session = h.conn.root_session();
+
+        // 1. In-flight send
+        let session_clone = session.clone();
+        let send_handle = thread::spawn(move || session_clone.send("Browser.enable", json!({})));
+
+        // Ensure the request reached out_rx (it is now in-flight)
+        let _sent = recv_out(&h.out_rx);
+
+        // 2. An mpsc waiter registered via on_event
+        let (waiter_tx, waiter_rx) = mpsc::channel::<()>();
+        h.conn.on_event(
+            "s1",
+            "Custom.event",
+            Arc::new(move |_| {
+                let _ = waiter_tx.send(());
+            }),
+        );
+
+        // 3. Drop in_tx to simulate transport EOF / closing
+        drop(h.in_tx);
+
+        // Pending send must fail promptly with Closed
+        let send_result = send_handle.join().unwrap();
+        assert!(send_result.is_err());
+        assert_eq!(send_result.unwrap_err().kind, ProtocolErrorKind::Closed);
+
+        // Waiter channel must observe Disconnected promptly because the router was taken and dropped
+        assert_eq!(
+            waiter_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Disconnected),
+            "mpsc waiter should observe Disconnected on reader exit"
+        );
+
+        h.conn.wait_closed();
+    }
+
+    #[test]
+    fn off_event_global_removes_handler() {
+        let mut h = setup();
+        let (event_tx, event_rx) = mpsc::channel();
+
+        let tx = event_tx.clone();
+        let handler_id = h.conn.on_event_global(Arc::new(move |event| {
+            let _ = tx.send(event.method.clone());
+        }));
+
+        assert_eq!(h.conn.handler_count(), 1);
+
+        // Fire event 1 -> received
+        h.in_tx.send(event_message("Test.event1", None)).unwrap();
+        assert_eq!(
+            event_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok("Test.event1".to_string())
+        );
+
+        // Remove the handler
+        h.conn.off_event_global(handler_id);
+        assert_eq!(h.conn.handler_count(), 0);
+
+        // Fire event 2 -> handler should NOT receive it
+        h.in_tx.send(event_message("Test.event2", None)).unwrap();
+
+        // Round-trip a request to guarantee the reader thread processed event 2
+        let session = h.conn.root_session();
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+        let responder = thread::spawn(move || {
+            let sent = recv_out(&out_rx);
+            let id = sent["id"].as_i64().unwrap();
+            in_tx.send(success_response(id, None)).unwrap();
+        });
+        assert!(session.send("Browser.enable", json!({})).is_ok());
+        responder.join().unwrap();
+
+        // Channel should be empty
+        assert_eq!(
+            event_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "handler should not have received event after off_event_global"
+        );
+
+        drop(h.in_tx);
+        h.conn.wait_closed();
+    }
+
+    #[test]
+    fn detached_from_target_and_page_crashed_reject_in_flight_sends() {
+        let h = setup();
+
+        // 1. Browser.detachedFromTarget rejects session sends with Closed
+        let page1 = h.conn.create_session("session-detached".to_owned());
+        let p1 = page1.clone();
+        let h1 = thread::spawn(move || p1.send("Page.navigate", json!({})));
+        let _sent1 = recv_out(&h.out_rx);
+
+        let detach_event = RawMessage {
+            id: None,
+            method: Some("Browser.detachedFromTarget".into()),
+            params: Some(json!({"sessionId": "session-detached"})),
+            result: None,
+            error: None,
+            session_id: None,
+        };
+        h.in_tx.send(detach_event).unwrap();
+
+        let r1 = h1.join().unwrap();
+        assert!(r1.is_err());
+        assert_eq!(r1.unwrap_err().kind, ProtocolErrorKind::Closed);
+
+        // Session removed from map
+        {
+            let guard = h.conn.inner.lock().unwrap();
+            assert!(!guard.sessions.contains_key("session-detached"));
+        }
+
+        // 2. Page.crashed rejects session sends with Crashed
+        let page2 = h.conn.create_session("session-crashed".to_owned());
+        let p2 = page2.clone();
+        let h2 = thread::spawn(move || p2.send("Page.evaluate", json!({})));
+        let _sent2 = recv_out(&h.out_rx);
+
+        let crash_event = RawMessage {
+            id: None,
+            method: Some("Page.crashed".into()),
+            params: Some(json!({})),
+            result: None,
+            error: None,
+            session_id: Some("session-crashed".into()),
+        };
+        h.in_tx.send(crash_event).unwrap();
+
+        let r2 = h2.join().unwrap();
+        assert!(r2.is_err());
+        assert_eq!(r2.unwrap_err().kind, ProtocolErrorKind::Crashed);
+        assert!(page2.is_crashed());
+        assert!(!page2.is_closed());
+        assert!(page1.is_closed());
+
+        // Future sends on crashed session fail with Crashed
+        assert_eq!(
+            page2.send("Page.navigate", json!({})).unwrap_err().kind,
+            ProtocolErrorKind::Crashed
+        );
+
+        teardown(h);
+    }
+
+    struct BlockingReader;
+    impl TransportReader for BlockingReader {
+        fn receive(&mut self) -> Result<RawMessage, TransportError> {
+            loop {
+                thread::park();
+            }
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+    }
+
+    struct DummyWriter;
+    impl TransportWriter for DummyWriter {
+        fn send(&mut self, _msg: &serde_json::Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+    }
+
+    struct BlockingTransport;
+    impl Transport for BlockingTransport {
+        fn into_split(self: Box<Self>) -> (Box<dyn TransportWriter>, Box<dyn TransportReader>) {
+            (Box::new(DummyWriter), Box::new(BlockingReader))
+        }
+    }
+
+    #[test]
+    fn connection_drop_does_not_hang_when_reader_blocked() {
+        let conn = Connection::new(Box::new(BlockingTransport));
+        let start = std::time::Instant::now();
+
+        drop(conn);
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "Connection::drop took too long: {elapsed:?}"
+        );
+    }
+    #[test]
+    fn s3_reader_can_drop_last_connection_without_waiting_for_itself() {
+        for wait_first in [false, true] {
+            let h = setup();
+            let holder = Arc::new(Mutex::new(None::<Arc<Connection>>));
+            let holder_in_handler = holder.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let conn = Arc::new(h.conn);
+            conn.on_event(
+                "",
+                "Test.dropLastConnection",
+                Arc::new(move |_| {
+                    let last = holder_in_handler.lock().unwrap().take().unwrap();
+                    let mut last = Arc::try_unwrap(last)
+                        .ok()
+                        .expect("handler must own the last connection");
+                    let start = std::time::Instant::now();
+                    if wait_first {
+                        last.wait_closed();
+                    }
+                    drop(last);
+                    done_tx.send(start.elapsed()).unwrap();
+                }),
+            );
+            *holder.lock().unwrap() = Some(conn.clone());
+            drop(conn);
+            h.in_tx
+                .send(event_message("Test.dropLastConnection", None))
+                .unwrap();
+            let elapsed = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reader-thread drop stalled");
+            assert!(
+                elapsed < READER_JOIN_TIMEOUT / 2,
+                "reader waited for itself (wait_closed={wait_first}): {elapsed:?}"
+            );
+            drop(h.in_tx);
+        }
+    }
+
+    #[test]
+    fn s6_crashed_page_close_is_sent_without_waiting_for_a_reply() {
+        let h = setup();
+        let page = h.conn.create_session("crashed".into());
+        page.mark_crashed();
+        assert!(page.is_crashed());
+        page.close_page_best_effort();
+        let request = recv_out(&h.out_rx);
+        assert_eq!(request["method"], "Page.close");
+        assert_eq!(request["sessionId"], "crashed");
+        assert_eq!(
+            h.conn.inner.lock().unwrap().sessions["crashed"]
+                .pending
+                .len(),
+            0
+        );
+        teardown(h);
+    }
+    #[test]
+    fn s5_crash_query_recovers_poisoned_connection_lock() {
+        let h = setup();
+        let page = h.conn.create_session("s-poison".into());
+        page.mark_crashed();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner = h.conn.inner.lock().unwrap();
+            panic!("poison connection lock");
+        }));
+        assert!(page.is_crashed());
+        teardown(h);
     }
 }

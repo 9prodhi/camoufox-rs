@@ -4,9 +4,15 @@
 //! context, and pages. The `InstanceManager` provides the high-level
 //! operations that CLI commands map to.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
 
 use serde_json::json;
@@ -14,10 +20,60 @@ use serde_json::json;
 use crate::api::main_frame::{
     KeyEventParams, MouseEventParams, NavigateOptions, NavigateOutcome, Rect, ScreenshotOptions,
 };
-use crate::api::{Browser, BrowserOptions, ContextOptions, CookieOptions, MainFrame};
+use crate::api::selectors::js_query;
+use crate::api::{
+    Browser, BrowserOptions, ContextOptions, CookieOptions, DialogInfo, DialogPolicy, MainFrame,
+};
 use crate::config::LaunchConfig;
 use crate::protocol::client::Connection;
+use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 use crate::transport::pipe::PipeTransport;
+
+fn screenshot_path(
+    instance_id: &str,
+    page_id: &str,
+    format: Option<&str>,
+    explicit: Option<&str>,
+) -> Result<String, String> {
+    if let Some(path) = explicit {
+        return Ok(path.to_owned());
+    }
+    let dir = crate::cli::socket::ensure_runtime_dir()?;
+    Ok(default_screenshot_path(&dir, instance_id, page_id, format)
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn default_screenshot_path(
+    dir: &Path,
+    instance_id: &str,
+    page_id: &str,
+    format: Option<&str>,
+) -> PathBuf {
+    let ext = if matches!(format, Some("jpeg" | "jpg" | "image/jpeg")) {
+        "jpg"
+    } else {
+        "png"
+    };
+    dir.join(format!("screenshot-{instance_id}-{page_id}.{ext}"))
+}
+
+fn write_screenshot(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("failed to open screenshot: {e}"))?;
+    // Also secure an existing file rather than preserving world-readable mode.
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("failed to secure screenshot: {e}"))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("failed to write screenshot: {e}"))
+}
 
 fn default_executable() -> String {
     std::env::var("CAMOUFOX_BIN").unwrap_or_else(|_| {
@@ -71,10 +127,115 @@ fn user_agent_env(executable: &Path, inherited_env_keys: &[String]) -> HashMap<S
 /// escapes U+2028/U+2029, which are legal in JSON strings but terminate a
 /// line in (pre-ES2019) JavaScript source.
 fn js_literal(s: &str) -> String {
-    serde_json::Value::String(s.to_owned())
-        .to_string()
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
+    crate::api::main_frame::escape_js_json_literal(s)
+}
+
+fn resolve_frame_chain(
+    main: String,
+    frames: &[String],
+    timeout: Duration,
+    mut hop: impl FnMut(&str, &str, Duration) -> Result<String, ProtocolError>,
+) -> Result<String, ProtocolError> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut current = main;
+    for selector in frames {
+        current = hop(
+            &current,
+            selector,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        )?;
+    }
+    Ok(current)
+}
+
+// Poll interval is separate from the protocol budget: slow frame hops get all
+// remaining time, and every deadline exit uses the same user-facing message.
+fn poll_selector(
+    mut poll: impl FnMut(Duration) -> Result<bool, ProtocolError>,
+    selector: &str,
+    timeout: Duration,
+) -> Result<u128, String> {
+    let started = std::time::Instant::now();
+    let deadline = started + timeout;
+    let mut last_transient = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let result = poll(remaining);
+        match result {
+            Ok(true) => return Ok(started.elapsed().as_millis()),
+            Ok(false) => {}
+            Err(e) if e.kind == ProtocolErrorKind::ScriptException => {
+                return Err(if e.method.as_deref() == Some("Selector.validate") {
+                    e.message
+                } else {
+                    format!("invalid selector {selector:?}: {}", e.message)
+                });
+            }
+            Err(e) if e.kind == ProtocolErrorKind::NotIframe => return Err(e.message),
+            Err(e)
+                if matches!(
+                    e.kind,
+                    ProtocolErrorKind::Closed
+                        | ProtocolErrorKind::Crashed
+                        | ProtocolErrorKind::DialogOpened
+                        | ProtocolErrorKind::Transport
+                ) =>
+            {
+                return Err(e.message)
+            }
+            Err(e)
+                if e.kind == ProtocolErrorKind::Timeout && !e.message.starts_with("--frame ") => {}
+            Err(e) => {
+                last_transient = Some(e.message);
+            }
+        }
+        std::thread::sleep(
+            Duration::from_millis(150)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
+    let mut message = format!(
+        "timed out after {}s waiting for selector: {selector}",
+        timeout.as_secs()
+    );
+    if let Some(error) = last_transient {
+        message.push_str(&format!("; last transient error: {error}"));
+    }
+    Err(message)
+}
+
+fn scope_message(frames: &[String], message: String) -> String {
+    if let Some(sel) = frames.last() {
+        let prefix = format!("--frame {sel}: ");
+        if message.starts_with(&prefix) {
+            message
+        } else {
+            format!("{prefix}{message}")
+        }
+    } else {
+        message
+    }
+}
+
+fn operation_error(frames: &[String], operation: &str, mut error: ProtocolError) -> String {
+    error.message = format!("{operation} failed: {}", error.message);
+    scoped_error(frames, error)
+}
+
+fn dialog_message(instance: &str, page: &str, info: &DialogInfo) -> String {
+    format!("page {page} has an open {} dialog: {:?} — run `camoufox dialog {instance} {page} accept|dismiss [--text T]`", info.kind, info.message)
+}
+
+fn scoped_error(frames: &[String], error: ProtocolError) -> String {
+    let message = if error.kind == ProtocolErrorKind::FrameDetached && !frames.is_empty() {
+        "frame was detached".to_owned()
+    } else {
+        error.message
+    };
+    scope_message(frames, message)
 }
 
 /// Map a key name to the `(code, key, key_code)` triple Juggler expects.
@@ -186,24 +347,218 @@ pub struct ManagedMainFrame {
 // Instance
 // ---------------------------------------------------------------------------
 
+/// Every `camoufox launch` flag, in one place.
+///
+/// New launch flags add a field here (and on `DaemonRequest::Launch`), so
+/// `launch_with`'s signature never changes. Flags that configure the browser
+/// context are mapped in `LaunchOptions::context_options`.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchOptions {
+    /// `None` means headless.
+    pub headless: Option<bool>,
+    /// Camoufox executable; `None` uses the default install location.
+    pub executable: Option<String>,
+    /// Directory to save downloads to.
+    pub downloads_dir: Option<PathBuf>,
+    /// Disable page Content-Security-Policy.
+    pub bypass_csp: bool,
+    /// Policy for JavaScript dialogs.
+    pub dialogs: DialogPolicy,
+}
+
+impl LaunchOptions {
+    /// Browser-context options derived from the launch flags.
+    pub(crate) fn context_options(&self) -> ContextOptions {
+        ContextOptions {
+            download_options: self.downloads_dir.as_ref().map(|dir| {
+                crate::api::context::DownloadOptions {
+                    behavior: Some("saveToDisk".to_string()),
+                    downloads_dir: Some(dir.to_string_lossy().into_owned()),
+                }
+            }),
+            bypass_csp: self.bypass_csp,
+            dialog_policy: self.dialogs,
+            ..Default::default()
+        }
+    }
+}
+
+/// Result of a trusted user interaction.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct InteractionOutcome {
+    /// Dialog opened by the interaction, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialog: Option<DialogInfo>,
+}
+
+fn interaction_error(error: ProtocolError, operation: &str) -> Result<InteractionOutcome, String> {
+    if error.kind == ProtocolErrorKind::DialogOpened {
+        let dialog = error
+            .data
+            .as_deref()
+            .and_then(|data| serde_json::from_str(data).ok());
+        Ok(InteractionOutcome { dialog })
+    } else {
+        Err(format!("{operation} failed: {}", error.message))
+    }
+}
+
 /// A running Camoufox browser instance managed by the daemon.
 pub struct Instance {
+    instance_id: String,
     pub browser: Browser,
     pub child: Child,
     pub version: Option<String>,
     pub pid: u32,
     _profile_dir: tempfile::TempDir,
     pages: HashMap<String, ManagedMainFrame>,
+    closed_pages: HashSet<String>,
+    closed_pages_order: VecDeque<String>,
     page_counter: u32,
+    close_timeout: Duration,
+    registry: Arc<crate::api::page_registry::PageRegistry>,
 }
 
 impl Instance {
+    fn record_closed_page(&mut self, id: String) {
+        if self.closed_pages.insert(id.clone()) {
+            self.closed_pages_order.push_back(id);
+            if self.closed_pages_order.len() > 1024 {
+                if let Some(old) = self.closed_pages_order.pop_front() {
+                    self.closed_pages.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn page_any(&self, id: &str) -> Result<&ManagedMainFrame, String> {
+        if self.closed_pages.contains(id) {
+            return Err(format!("page {id} was closed"));
+        }
+        let mp = self
+            .pages
+            .get(id)
+            .ok_or_else(|| format!("page {id} not found"))?;
+        if mp.main_frame.is_crashed() {
+            return Err(format!("page {id} crashed"));
+        }
+        if mp.main_frame.is_closed() || self.registry.is_detached(mp.main_frame.target_id()) {
+            return Err(format!("page {id} was closed"));
+        }
+        Ok(mp)
+    }
+
+    fn page_checked(&self, id: &str) -> Result<&ManagedMainFrame, ProtocolError> {
+        let terminal = |kind, message| ProtocolError::new(kind, Some("page".into()), message);
+        if self.closed_pages.contains(id) {
+            return Err(terminal(
+                ProtocolErrorKind::Closed,
+                format!("page {id} was closed"),
+            ));
+        }
+        let mp = self
+            .pages
+            .get(id)
+            .ok_or_else(|| terminal(ProtocolErrorKind::Closed, format!("page {id} not found")))?;
+        if mp.main_frame.is_crashed() {
+            return Err(terminal(
+                ProtocolErrorKind::Crashed,
+                format!("page {id} crashed"),
+            ));
+        }
+        if mp.main_frame.is_closed() || self.registry.is_detached(mp.main_frame.target_id()) {
+            return Err(terminal(
+                ProtocolErrorKind::Closed,
+                format!("page {id} was closed"),
+            ));
+        }
+        if let Some(info) = mp.main_frame.pending_dialog() {
+            return Err(terminal(
+                ProtocolErrorKind::DialogOpened,
+                dialog_message(&self.instance_id, id, &info),
+            ));
+        }
+        Ok(mp)
+    }
+
+    fn dialog_error(&self, page_id: &str, mut error: ProtocolError) -> ProtocolError {
+        if error.kind == ProtocolErrorKind::DialogOpened {
+            let info = self
+                .pages
+                .get(page_id)
+                .and_then(|page| page.main_frame.pending_dialog())
+                .or_else(|| {
+                    error
+                        .data
+                        .as_deref()
+                        .and_then(|data| serde_json::from_str::<DialogInfo>(data).ok())
+                });
+            if let Some(info) = info {
+                error.message = dialog_message(&self.instance_id, page_id, &info);
+            }
+        }
+        error
+    }
+
+    fn page(&self, id: &str) -> Result<&ManagedMainFrame, String> {
+        self.page_checked(id).map_err(String::from)
+    }
+
+    /// Adopt any ready popups opened by this instance's pages.
+    pub fn adopt_popups(&mut self, context: &crate::api::BrowserContext) {
+        let mut closed_ids = Vec::new();
+        for (page_id, mp) in &self.pages {
+            if mp.main_frame.is_closed() || self.registry.is_detached(mp.main_frame.target_id()) {
+                closed_ids.push(page_id.clone());
+            }
+        }
+        for id in closed_ids {
+            self.pages.remove(&id);
+            self.record_closed_page(id);
+        }
+
+        let policy = context.dialog_policy();
+        for main_frame in context.take_popups() {
+            main_frame.set_dialog_policy(policy);
+            self.page_counter += 1;
+            let page_id = format!("p{}", self.page_counter);
+            self.pages.insert(
+                page_id,
+                ManagedMainFrame {
+                    main_frame,
+                    headers: Vec::new(),
+                },
+            );
+        }
+    }
+
+    fn page_mut(&mut self, id: &str) -> Result<&mut ManagedMainFrame, String> {
+        self.page(id)?;
+        self.pages
+            .get_mut(id)
+            .ok_or_else(|| format!("page {id} not found"))
+    }
+
+    /// Look up the CLI page ID (e.g. "p1") whose main frame target ID matches `target_id`.
+    pub fn page_id_for_target(&self, target_id: &str) -> Option<String> {
+        self.pages.iter().find_map(|(page_id, mp)| {
+            if mp.main_frame.target_id() == target_id
+                && !mp.main_frame.is_closed()
+                && !self.registry.is_detached(target_id)
+            {
+                Some(page_id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Create a new page in this instance's context, fully wired with
     /// session, top frame id, and execution context tracking.
     pub fn create_page(&mut self, context: &crate::api::BrowserContext) -> Result<String, String> {
         let main_frame = context
             .new_main_frame()
-            .map_err(|e| format!("failed to create page: {e}"))?;
+            .map_err(|e| format!("failed to create page: {}", e.message))?;
 
         self.page_counter += 1;
         let page_id = format!("p{}", self.page_counter);
@@ -239,13 +594,7 @@ impl Instance {
         timeout: Duration,
         wait_until: Option<&str>,
     ) -> Result<NavigateOutcome, String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
-
-        // Force `evaluate` to wait for a fresh post-navigation context.
-        *mp.main_frame.execution_context_handle().lock().unwrap() = None;
+        let mp = self.page(page_id)?;
 
         let options = NavigateOptions {
             wait_until: wait_until.map(|s| s.to_owned()),
@@ -254,7 +603,7 @@ impl Instance {
 
         mp.main_frame
             .navigate(url, options, timeout)
-            .map_err(|e| format!("navigate failed: {e}"))
+            .map_err(|e| format!("navigate failed: {}", e.message))
     }
 
     /// Evaluate JavaScript on a page.
@@ -264,29 +613,189 @@ impl Instance {
         expression: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
-        let result = mp
-            .main_frame
-            .evaluate(expression, timeout)
-            .map_err(|e| format!("evaluate failed: {e}"))?;
+        self.evaluate_scoped(page_id, expression, false, &[], timeout)
+    }
 
-        // Unwrap `{result: {value: …}}` to just the value, matching today's
-        // CLI output shape.
-        let value = result
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .or_else(|| result.get("value"))
-            .cloned()
-            .unwrap_or(result);
-        Ok(value)
+    /// Evaluate an expression, optionally in a child frame or main world.
+    pub fn evaluate_scoped(
+        &self,
+        page_id: &str,
+        expression: &str,
+        main_world: bool,
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        if frames.is_empty() {
+            if main_world {
+                self.evaluate_main_world(page_id, expression, remaining())
+            } else {
+                self.eval_checked(page_id, expression, remaining())
+            }
+        } else {
+            let target_frame_id = self.resolve_frames(page_id, frames, remaining())?;
+            let mp = self.page(page_id)?;
+            if main_world {
+                mp.main_frame
+                    .evaluate_main_world_in_frame(&target_frame_id, expression, remaining())
+                    .map_err(|e| scoped_error(frames, e))
+            } else {
+                self.eval_checked_frame(page_id, Some(&target_frame_id), expression, remaining())
+                    .map_err(|e| scoped_error(frames, e))
+            }
+        }
+    }
+
+    /// Evaluate a synchronous expression in the page's main world.
+    pub fn evaluate_main_world(
+        &self,
+        page_id: &str,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
+        self.page(page_id)?
+            .main_frame
+            .evaluate_main_world(expression, timeout)
+            .map_err(|e| format!("evaluate failed: {}", e.message))
     }
 
     // -----------------------------------------------------------------------
     // Shared evaluate helpers
     // -----------------------------------------------------------------------
+
+    fn validate_selectors(
+        &self,
+        page_id: &str,
+        selector: &str,
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
+        let entries = frames
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(selector))
+            .map(|selector| {
+                crate::api::selectors::tokenize(selector)
+                    .map(|segments| serde_json::json!({"selector":selector, "segments":segments}))
+                    .map_err(|error| {
+                        ProtocolError::new(
+                            ProtocolErrorKind::ScriptException,
+                            Some("Selector.validate".into()),
+                            format!("invalid selector {selector:?}: {error}"),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let entries = js_literal(&serde_json::to_string(&entries).unwrap());
+        let expression = format!("(() => {{ const entries = JSON.parse({entries}); const root = document.createDocumentFragment(); for (const entry of entries) {{ for (const segment of entry.segments) {{ try {{ root.querySelector(segment); }} catch (e) {{ return {{bad:entry.selector, error:String(e)}}; }} }} }} return null; }})()");
+        let result = self.eval_checked_frame(page_id, None, &expression, timeout)?;
+        if let Some(bad) = result.get("bad").and_then(|v| v.as_str()) {
+            return Err(ProtocolError::new(
+                ProtocolErrorKind::ScriptException,
+                Some("Selector.validate".into()),
+                format!(
+                    "invalid selector {bad:?}: {}",
+                    result["error"].as_str().unwrap_or("invalid CSS")
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_frames(
+        &self,
+        page_id: &str,
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<String, ProtocolError> {
+        self.resolve_frames_with_focus(page_id, frames, timeout, false)
+    }
+
+    fn resolve_frames_with_focus(
+        &self,
+        page_id: &str,
+        frames: &[String],
+        timeout: Duration,
+        focus: bool,
+    ) -> Result<String, ProtocolError> {
+        let mp = self.page_checked(page_id)?;
+        resolve_frame_chain(
+            mp.main_frame.frame_id(),
+            frames,
+            timeout,
+            |parent, sel, budget| {
+                let deadline = std::time::Instant::now() + budget;
+                let child = mp.main_frame.resolve_child_frame(parent, sel, budget)?;
+                if focus {
+                    let q = js_query(sel);
+                    self.eval_checked_frame(page_id, Some(parent), &format!("(() => {{ const el = {q}; if (!el) throw new Error('iframe disappeared'); el.focus(); }})()"), deadline.saturating_duration_since(std::time::Instant::now()))
+                    .map_err(|mut e| {e.message = format!("--frame {sel}: {}", e.message); e})?;
+                }
+                Ok(child)
+            },
+        )
+    }
+
+    fn focus_frame(
+        &self,
+        page_id: &str,
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let fid = self.resolve_frames_with_focus(page_id, frames, timeout, true)?;
+        let expression = "(() => { window.focus(); const el = document.activeElement; return !!el && el !== document.body && el !== document.documentElement; })()";
+        let active = self
+            .eval_checked_frame(
+                page_id,
+                Some(&fid),
+                expression,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )
+            .map_err(|e| scoped_error(frames, e))?;
+        if active != true {
+            return Err(format!("--frame {}: nothing is focused inside the frame; click or fill an element inside it first", frames.last().unwrap()));
+        }
+        Ok(())
+    }
+
+    fn eval_checked_frame(
+        &self,
+        page_id: &str,
+        frame_id: Option<&str>,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let mp = self.page_checked(page_id)?;
+        let evaluated = match frame_id {
+            Some(fid) => mp.main_frame.evaluate_in_frame(fid, expression, timeout),
+            None => mp.main_frame.evaluate(expression, timeout),
+        };
+
+        let raw = evaluated.map_err(|mut e| {
+            if e.kind == ProtocolErrorKind::DialogOpened {
+                e = self.dialog_error(page_id, e);
+            } else {
+                e.message = format!("evaluate failed: {}", e.message);
+            }
+            e
+        })?;
+
+        if let Some(exc) = raw.get("exceptionDetails") {
+            return Err(crate::api::selectors::selector_exception(exc));
+        }
+
+        Ok(raw
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
 
     /// Evaluate `expression` and return the plain JS value, turning a thrown
     /// page-side exception into an `Err` instead of leaking the raw protocol
@@ -299,29 +808,8 @@ impl Instance {
         expression: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
-        let raw = mp
-            .main_frame
-            .evaluate(expression, timeout)
-            .map_err(|e| format!("evaluate failed: {e}"))?;
-
-        if let Some(exc) = raw.get("exceptionDetails") {
-            let msg = exc
-                .get("text")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_owned())
-                .unwrap_or_else(|| exc.to_string());
-            return Err(format!("page script error: {msg}"));
-        }
-
-        Ok(raw
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .cloned()
-            .unwrap_or(serde_json::Value::Null))
+        self.eval_checked_frame(page_id, None, expression, timeout)
+            .map_err(String::from)
     }
 
     /// Resolve a CSS selector to its viewport-space bounding box, scrolling it
@@ -331,20 +819,24 @@ impl Instance {
         &self,
         page_id: &str,
         selector: &str,
+        frame_id: Option<&str>,
         timeout: Duration,
-    ) -> Result<(Rect, f64, f64), String> {
+    ) -> Result<(Rect, f64, f64), ProtocolError> {
+        let q = js_query(selector);
         let expr = format!(
-            "(() => {{ const el = document.querySelector({sel}); if (!el) return null; \
+            "(() => {{ const el = {q}; if (!el) return null; \
              try {{ el.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}}); }} \
              catch (e) {{ el.scrollIntoView(); }} \
              const r = el.getBoundingClientRect(); \
-             return [r.x, r.y, r.width, r.height, window.scrollX, window.scrollY]; }})()",
-            sel = js_literal(selector)
+             return [r.x, r.y, r.width, r.height, window.scrollX, window.scrollY]; }})()"
         );
-        let value = self.eval_checked(page_id, &expr, timeout)?;
-        let arr = value
-            .as_array()
-            .ok_or_else(|| format!("selector not found: {selector}"))?;
+        let value = self.eval_checked_frame(page_id, frame_id, &expr, timeout)?;
+        let arr = value.as_array().ok_or_else(|| {
+            ProtocolError::response_msg(
+                "Runtime.evaluate",
+                format!("selector not found: {selector}"),
+            )
+        })?;
         let n = |i: usize| arr.get(i).and_then(|v| v.as_f64()).unwrap_or(0.0);
         let rect = Rect {
             x: n(0),
@@ -353,8 +845,9 @@ impl Instance {
             height: n(3),
         };
         if rect.width <= 0.0 && rect.height <= 0.0 {
-            return Err(format!(
-                "element {selector} has a zero-size box (hidden or not laid out)"
+            return Err(ProtocolError::response_msg(
+                "Runtime.evaluate",
+                format!("element {selector} has a zero-size box (hidden or not laid out)"),
             ));
         }
         Ok((rect, n(4), n(5)))
@@ -366,34 +859,44 @@ impl Instance {
 
     /// Extract the page's rendered text (`innerText`), optionally scoped to a
     /// CSS selector.
-    ///
-    /// `innerText` — not `textContent` — because it is what a reader actually
-    /// sees: inline `<script>`/`<style>` source is excluded and block layout
-    /// becomes line breaks. Note that per spec `innerText` already falls back
-    /// to `textContent` for an element that is not being rendered, so a
-    /// `display: none` subtree still yields its text. An element that *is*
-    /// rendered but whose only content is unrendered (e.g. a lone `<noscript>`)
-    /// correctly yields `""`.
     pub fn text(
         &self,
         page_id: &str,
         selector: Option<&str>,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<String, String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let target_frame_id = self.resolve_frames(page_id, frames, remaining())?;
+        let frame_arg = if frames.is_empty() {
+            None
+        } else {
+            Some(target_frame_id.as_str())
+        };
         let expr = match selector {
-            Some(sel) => format!(
-                "(() => {{ const el = document.querySelector({sel}); \
-                 return el ? el.innerText : null; }})()",
-                sel = js_literal(sel)
-            ),
+            Some(sel) => {
+                let q = js_query(sel);
+                format!(
+                    "(() => {{ const el = {q}; \
+                     return el ? el.innerText : null; }})()"
+                )
+            }
             None => "(() => (document.body || document.documentElement).innerText)()".to_string(),
         };
-        match self.eval_checked(page_id, &expr, timeout)? {
+        match self
+            .eval_checked_frame(page_id, frame_arg, &expr, remaining())
+            .map_err(|e| scoped_error(frames, e))?
+        {
             serde_json::Value::String(s) => Ok(s),
-            serde_json::Value::Null => Err(match selector {
-                Some(sel) => format!("selector not found: {sel}"),
-                None => "page has no text content".to_string(),
-            }),
+            serde_json::Value::Null => Err(scope_message(
+                frames,
+                match selector {
+                    Some(sel) => format!("selector not found: {sel}"),
+                    None => "page has no text content".to_string(),
+                },
+            )),
             other => Ok(other.to_string()),
         }
     }
@@ -404,22 +907,40 @@ impl Instance {
         &self,
         page_id: &str,
         selector: Option<&str>,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<String, String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let target_frame_id = self.resolve_frames(page_id, frames, remaining())?;
+        let frame_arg = if frames.is_empty() {
+            None
+        } else {
+            Some(target_frame_id.as_str())
+        };
         let expr = match selector {
-            Some(sel) => format!(
-                "(() => {{ const el = document.querySelector({sel}); \
-                 return el ? el.outerHTML : null; }})()",
-                sel = js_literal(sel)
-            ),
+            Some(sel) => {
+                let q = js_query(sel);
+                format!(
+                    "(() => {{ const el = {q}; \
+                     return el ? el.outerHTML : null; }})()"
+                )
+            }
             None => "document.documentElement.outerHTML".to_string(),
         };
-        match self.eval_checked(page_id, &expr, timeout)? {
+        match self
+            .eval_checked_frame(page_id, frame_arg, &expr, remaining())
+            .map_err(|e| scoped_error(frames, e))?
+        {
             serde_json::Value::String(s) => Ok(s),
-            serde_json::Value::Null => Err(match selector {
-                Some(sel) => format!("selector not found: {sel}"),
-                None => "page has no document element".to_string(),
-            }),
+            serde_json::Value::Null => Err(scope_message(
+                frames,
+                match selector {
+                    Some(sel) => format!("selector not found: {sel}"),
+                    None => "page has no document element".to_string(),
+                },
+            )),
             other => Ok(other.to_string()),
         }
     }
@@ -430,10 +951,20 @@ impl Instance {
         &self,
         page_id: &str,
         selector: Option<&str>,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let target_frame_id = self.resolve_frames(page_id, frames, remaining())?;
+        let frame_arg = if frames.is_empty() {
+            None
+        } else {
+            Some(target_frame_id.as_str())
+        };
         let root = match selector {
-            Some(sel) => format!("document.querySelector({})", js_literal(sel)),
+            Some(sel) => js_query(sel),
             None => "document".to_string(),
         };
         let expr = format!(
@@ -442,11 +973,17 @@ impl Instance {
              text: (a.innerText || a.textContent || '').trim().replace(/\\s+/g, ' '), \
              href: a.href }})); }})()"
         );
-        match self.eval_checked(page_id, &expr, timeout)? {
-            serde_json::Value::Null => Err(match selector {
-                Some(sel) => format!("selector not found: {sel}"),
-                None => "no links found".to_string(),
-            }),
+        match self
+            .eval_checked_frame(page_id, frame_arg, &expr, remaining())
+            .map_err(|e| scoped_error(frames, e))?
+        {
+            serde_json::Value::Null => Err(scope_message(
+                frames,
+                match selector {
+                    Some(sel) => format!("selector not found: {sel}"),
+                    None => "no links found".to_string(),
+                },
+            )),
             other => Ok(other),
         }
     }
@@ -523,35 +1060,26 @@ impl Instance {
 
     /// Go back one session-history entry. Returns `false` if there was none.
     pub fn go_back(&self, page_id: &str) -> Result<bool, String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
         mp.main_frame
             .go_back()
-            .map_err(|e| format!("go back failed: {e}"))
+            .map_err(|e| format!("go back failed: {}", e.message))
     }
 
     /// Go forward one session-history entry. Returns `false` if there was none.
     pub fn go_forward(&self, page_id: &str) -> Result<bool, String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
         mp.main_frame
             .go_forward()
-            .map_err(|e| format!("go forward failed: {e}"))
+            .map_err(|e| format!("go forward failed: {}", e.message))
     }
 
     /// Reload the page.
     pub fn reload(&self, page_id: &str) -> Result<(), String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
         mp.main_frame
             .reload()
-            .map_err(|e| format!("reload failed: {e}"))
+            .map_err(|e| format!("reload failed: {}", e.message))
     }
 
     /// Poll until `selector` matches an element, or `timeout` elapses.
@@ -561,41 +1089,49 @@ impl Instance {
         &self,
         page_id: &str,
         selector: &str,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<u128, String> {
-        let expr = format!("!!document.querySelector({})", js_literal(selector));
-        let started = std::time::Instant::now();
-        let deadline = started + timeout;
-        // Each poll gets the remaining budget so an unresponsive page can't
-        // stretch the overall wait past `timeout` by more than one poll.
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let poll_budget = remaining.max(Duration::from_secs(1));
-            match self.eval_checked(page_id, &expr, poll_budget) {
-                Ok(serde_json::Value::Bool(true)) => return Ok(started.elapsed().as_millis()),
-                Ok(_) => {}
-                // A page-script error means `querySelector` itself threw — an
-                // invalid CSS selector. That is permanent: polling will never
-                // make it valid, so fail fast with the real error instead of
-                // burning the whole timeout (and holding the daemon lock) only
-                // to report a generic "timed out".
-                Err(e) if e.starts_with("page script error:") => {
-                    return Err(format!("invalid selector {selector:?}: {e}"));
-                }
-                // Any other error (an in-flight navigation tears down the
-                // execution context) is transient; keep polling until the
-                // deadline rather than failing immediately.
-                Err(e) if std::time::Instant::now() >= deadline => return Err(e),
-                Err(_) => {}
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out after {}s waiting for selector: {selector}",
-                    timeout.as_secs()
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(150));
-        }
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let mut validated = false;
+        let expr = format!("!!({})", js_query(selector));
+        poll_selector(
+            |remaining| {
+                let result = (|| {
+                    self.page_checked(page_id)?;
+                    if self.browser.connection().rejects_sends() {
+                        return Err(ProtocolError::closed(None));
+                    }
+                    let deadline = std::time::Instant::now() + remaining;
+                    if !validated {
+                        self.validate_selectors(page_id, selector, frames, remaining)?;
+                        validated = true;
+                    }
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let fid = if frames.is_empty() {
+                        None
+                    } else {
+                        Some(self.resolve_frames(page_id, frames, remaining)?)
+                    };
+                    self.eval_checked_frame(
+                        page_id,
+                        fid.as_deref(),
+                        &expr,
+                        deadline.saturating_duration_since(std::time::Instant::now()),
+                    )
+                    .map_err(|mut e| {
+                        if let Some(sel) = frames.last() {
+                            e.message = format!("--frame {sel}: {}", e.message);
+                        }
+                        e
+                    })
+                    .map(|v| v == true)
+                })();
+                result.map_err(|e| self.dialog_error(page_id, e))
+            },
+            selector,
+            timeout,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -611,10 +1147,7 @@ impl Instance {
         name: &str,
         value: &str,
     ) -> Result<Vec<(String, String)>, String> {
-        let mp = self
-            .pages
-            .get_mut(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page_mut(page_id)?;
 
         mp.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
         mp.headers.push((name.to_string(), value.to_string()));
@@ -626,7 +1159,7 @@ impl Instance {
             .collect();
         mp.main_frame
             .set_extra_http_headers(&borrowed)
-            .map_err(|e| format!("set header failed: {e}"))?;
+            .map_err(|e| format!("set header failed: {}", e.message))?;
 
         Ok(mp.headers.clone())
     }
@@ -643,13 +1176,21 @@ impl Instance {
         &self,
         page_id: &str,
         selector: &str,
+        frames: &[String],
         timeout: Duration,
-    ) -> Result<(i32, i32), String> {
-        let (rect, _, _) = self.element_rect(page_id, selector, timeout)?;
-        let x = (rect.x + rect.width / 2.0).round().max(0.0) as i32;
-        let y = (rect.y + rect.height / 2.0).round().max(0.0) as i32;
-        self.click(page_id, x, y)?;
-        Ok((x, y))
+    ) -> Result<(i32, i32, InteractionOutcome), String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let (click_x, click_y) = self.pointer_position(page_id, selector, frames, timeout)?;
+        let outcome = self
+            .click_with_timeout(
+                page_id,
+                click_x,
+                click_y,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )
+            .map_err(|e| scope_message(frames, e))?;
+        Ok((click_x, click_y, outcome))
     }
 
     /// Move the mouse over the element matching `selector` without clicking.
@@ -657,39 +1198,108 @@ impl Instance {
         &self,
         page_id: &str,
         selector: &str,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<(i32, i32), String> {
-        let (rect, _, _) = self.element_rect(page_id, selector, timeout)?;
-        let x = (rect.x + rect.width / 2.0).round().max(0.0) as i32;
-        let y = (rect.y + rect.height / 2.0).round().max(0.0) as i32;
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let (x, y) = self.pointer_position(page_id, selector, frames, timeout)?;
 
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
         mp.main_frame
-            .dispatch_mouse_event(MouseEventParams {
-                r#type: "mousemove".to_string(),
-                button: 0,
-                buttons: 0,
-                x,
-                y,
-                modifiers: 0,
-                click_count: None,
-            })
-            .map_err(|e| format!("hover failed: {e}"))?;
+            .dispatch_mouse_event_with_timeout(
+                MouseEventParams {
+                    r#type: "mousemove".to_string(),
+                    button: 0,
+                    buttons: 0,
+                    x,
+                    y,
+                    modifiers: 0,
+                    click_count: None,
+                },
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )
+            .map_err(|mut e| {
+                e.message = format!("hover failed: {}", e.message);
+                scoped_error(frames, e)
+            })?;
         Ok((x, y))
     }
 
+    // Scroll outermost-first, then the target. Only afterwards measure every hop.
+    fn pointer_position(
+        &self,
+        page_id: &str,
+        selector: &str,
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<(i32, i32), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let mp = self.page(page_id)?;
+        let mut fid = mp.main_frame.frame_id();
+        let mut hops = Vec::new();
+        for sel in frames {
+            let q = js_query(sel);
+            let rendered = self.eval_checked_frame(page_id, Some(&fid), &format!("(() => {{ const el = {q}; if(el) {{ if (!el.offsetWidth || !el.offsetHeight || !el.getClientRects().length) return false; el.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}}); }} return true; }})()"), remaining())
+                .map_err(|e| scoped_error(std::slice::from_ref(sel), e))?;
+            if rendered == false {
+                return Err(format!("--frame {sel}: iframe is not rendered"));
+            }
+            let child = mp
+                .main_frame
+                .resolve_child_frame(&fid, sel, remaining())
+                .map_err(|e| scoped_error(std::slice::from_ref(sel), e))?;
+            hops.push((fid, sel));
+            fid = child;
+        }
+        let (rect, _, _) = self
+            .element_rect(
+                page_id,
+                selector,
+                if frames.is_empty() { None } else { Some(&fid) },
+                remaining(),
+            )
+            .map_err(|e| scoped_error(frames, e))?;
+        let (mut x, mut y) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        for (parent, sel) in hops.iter().rev() {
+            let q = js_query(sel);
+            let expr = format!("(() => {{ const el = {q}; if (!el) return null; const r = el.getBoundingClientRect(); if (!el.offsetWidth || !el.offsetHeight || !r.width || !r.height) return 'not-rendered'; const cs = getComputedStyle(el); const sx = r.width / el.offsetWidth, sy = r.height / el.offsetHeight; return [r.left + ((el.clientLeft || 0) + (parseFloat(cs.paddingLeft) || 0)) * sx, r.top + ((el.clientTop || 0) + (parseFloat(cs.paddingTop) || 0)) * sy, sx, sy]; }})()");
+            let v = self
+                .eval_checked_frame(page_id, Some(parent), &expr, remaining())
+                .map_err(|e| scoped_error(std::slice::from_ref(*sel), e))?;
+            if v == "not-rendered" {
+                return Err(format!("--frame {sel}: iframe is not rendered"));
+            }
+            let a = v
+                .as_array()
+                .ok_or_else(|| format!("--frame {sel}: frame was detached"))?;
+            let n = |i: usize| a[i].as_f64().unwrap_or(0.0);
+            x = n(0) + x * n(2);
+            y = n(1) + y * n(3);
+        }
+        Ok((x.round() as i32, y.round() as i32))
+    }
+
     /// Insert text into whichever element currently has focus.
-    pub fn insert_text(&self, page_id: &str, text: &str) -> Result<(), String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+    pub fn insert_text(
+        &self,
+        page_id: &str,
+        text: &str,
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let mp = self.page(page_id)?;
+        self.focus_frame(page_id, frames, remaining())?;
         mp.main_frame
-            .insert_text(text)
-            .map_err(|e| format!("type failed: {e}"))
+            .insert_text_with_timeout(text, remaining())
+            .map_err(|mut e| {
+                e.message = format!("type failed: {}", e.message);
+                scoped_error(frames, e)
+            })
     }
 
     /// Focus the element matching `selector`, clear it, then type `value`.
@@ -700,34 +1310,65 @@ impl Instance {
         page_id: &str,
         selector: &str,
         value: &str,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<String, String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let target_frame_id = self.resolve_frames(page_id, frames, remaining())?;
+        let frame_arg = if frames.is_empty() {
+            None
+        } else {
+            Some(target_frame_id.as_str())
+        };
+        let q = js_query(selector);
         let expr = format!(
-            "(() => {{ const el = document.querySelector({sel}); if (!el) return null; \
+            "(() => {{ const el = {q}; if (!el) return null; \
              try {{ el.scrollIntoView({{block:'center', behavior:'instant'}}); }} \
              catch (e) {{ el.scrollIntoView(); }} \
              el.focus(); \
              if ('value' in el) {{ el.value = ''; \
                el.dispatchEvent(new Event('input', {{bubbles: true}})); }} \
              else if (el.isContentEditable) {{ el.textContent = ''; }} \
-             return el.tagName.toLowerCase(); }})()",
-            sel = js_literal(selector)
+             return el.tagName.toLowerCase(); }})()"
         );
-        let tag = match self.eval_checked(page_id, &expr, timeout)? {
+        let tag = match self
+            .eval_checked_frame(page_id, frame_arg, &expr, remaining())
+            .map_err(|e| scoped_error(frames, e))?
+        {
             serde_json::Value::String(s) => s,
-            _ => return Err(format!("selector not found: {selector}")),
+            _ => {
+                return Err(scope_message(
+                    frames,
+                    format!("selector not found: {selector}"),
+                ))
+            }
         };
-        self.insert_text(page_id, value)?;
+        self.page(page_id)?
+            .main_frame
+            .insert_text_with_timeout(value, remaining())
+            .map_err(|mut e| {
+                e.message = format!("type failed: {}", e.message);
+                scoped_error(frames, e)
+            })?;
         Ok(tag)
     }
 
     /// Press a named key (keydown followed by keyup).
-    pub fn press(&self, page_id: &str, key: &str) -> Result<(), String> {
+    pub fn press(
+        &self,
+        page_id: &str,
+        key: &str,
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<InteractionOutcome, String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
         let (code, key_name, key_code) = key_descriptor(key)?;
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let mp = self.page(page_id)?;
+        self.focus_frame(page_id, frames, remaining())?;
 
         // `text` is deliberately omitted — see `key_descriptor`.
         let make = |kind: &str| KeyEventParams {
@@ -740,13 +1381,27 @@ impl Instance {
             text: None,
         };
 
-        mp.main_frame
-            .dispatch_key_event(make("keydown"))
-            .map_err(|e| format!("press (keydown) failed: {e}"))?;
-        mp.main_frame
-            .dispatch_key_event(make("keyup"))
-            .map_err(|e| format!("press (keyup) failed: {e}"))?;
-        Ok(())
+        if let Err(e) = mp
+            .main_frame
+            .dispatch_key_event_with_timeout(make("keydown"), remaining())
+        {
+            if e.kind == ProtocolErrorKind::DialogOpened {
+                return interaction_error(e, "press (keydown)");
+            }
+            return Err(operation_error(frames, "press (keydown)", e));
+        }
+        if let Err(e) = mp
+            .main_frame
+            .dispatch_key_event_with_timeout(make("keyup"), remaining())
+        {
+            if e.kind == ProtocolErrorKind::DialogOpened {
+                return interaction_error(e, "press (keyup)");
+            }
+            return Err(operation_error(frames, "press (keyup)", e));
+        }
+        Ok(InteractionOutcome {
+            dialog: mp.main_frame.pending_dialog(),
+        })
     }
 
     /// Choose an option in a `<select>` by value, label, or visible text.
@@ -755,10 +1410,21 @@ impl Instance {
         page_id: &str,
         selector: &str,
         value: &str,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let target_frame_id = self.resolve_frames(page_id, frames, remaining())?;
+        let frame_arg = if frames.is_empty() {
+            None
+        } else {
+            Some(target_frame_id.as_str())
+        };
+        let q = js_query(selector);
         let expr = format!(
-            "(() => {{ const el = document.querySelector({sel}); \
+            "(() => {{ const el = {q}; \
              if (!el) return {{ok: false, reason: 'selector not found'}}; \
              if (el.tagName.toLowerCase() !== 'select') \
                return {{ok: false, reason: 'element is a <' + el.tagName.toLowerCase() + '>, not a <select>'}}; \
@@ -771,16 +1437,20 @@ impl Instance {
              el.dispatchEvent(new Event('input', {{bubbles: true}})); \
              el.dispatchEvent(new Event('change', {{bubbles: true}})); \
              return {{ok: true, value: el.value, text: (m.text || '').trim()}}; }})()",
-            sel = js_literal(selector),
             val = js_literal(value)
         );
-        let result = self.eval_checked(page_id, &expr, timeout)?;
+        let result = self
+            .eval_checked_frame(page_id, frame_arg, &expr, remaining())
+            .map_err(|e| scoped_error(frames, e))?;
         if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             let reason = result
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("select failed");
-            return Err(format!("select {selector}: {reason}"));
+            return Err(scope_message(
+                frames,
+                format!("select {selector}: {reason}"),
+            ));
         }
         Ok(result)
     }
@@ -793,15 +1463,18 @@ impl Instance {
         selector: Option<&str>,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
         let expr = match selector {
-            Some(sel) => format!(
-                "(() => {{ const el = document.querySelector({sel}); if (!el) return null; \
-                 try {{ el.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}}); }} \
-                 catch (e) {{ el.scrollIntoView(); }} \
-                 return {{scrollX: window.scrollX, scrollY: window.scrollY, \
-                   scrollHeight: document.documentElement.scrollHeight}}; }})()",
-                sel = js_literal(sel)
-            ),
+            Some(sel) => {
+                let q = js_query(sel);
+                format!(
+                    "(() => {{ const el = {q}; if (!el) return null; \
+                     try {{ el.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}}); }} \
+                     catch (e) {{ el.scrollIntoView(); }} \
+                     return {{scrollX: window.scrollX, scrollY: window.scrollY, \
+                       scrollHeight: document.documentElement.scrollHeight}}; }})()"
+                )
+            }
             None => "(() => { window.scrollTo(0, document.documentElement.scrollHeight); \
                  return {scrollX: window.scrollX, scrollY: window.scrollY, \
                    scrollHeight: document.documentElement.scrollHeight}; })()"
@@ -825,33 +1498,72 @@ impl Instance {
     pub fn tabs(&self, timeout: Duration) -> Vec<serde_json::Value> {
         self.page_ids()
             .into_iter()
-            .map(|page_id| match self.url(&page_id, timeout) {
-                Ok((url, title)) => json!({"page_id": page_id, "url": url, "title": title}),
-                Err(_) => json!({"page_id": page_id, "url": null, "title": null}),
+            .map(|page_id| {
+                // Metadata remains available even when page_any rejects commands
+                // because the renderer crashed.
+                let mp = self.pages.get(&page_id);
+                let dialog = mp.as_ref().and_then(|p| p.main_frame.pending_dialog());
+                let opener = mp.as_ref().and_then(|p| {
+                    p.main_frame
+                        .opener_id()
+                        .and_then(|tid| self.page_id_for_target(tid))
+                });
+                let mut tab = match self.url(&page_id, timeout) {
+                    Ok((url, title)) => json!({"page_id": page_id, "url": url, "title": title}),
+                    Err(_) => json!({"page_id": page_id, "url": null, "title": null}),
+                };
+                tab["opener"] = json!(opener);
+                if mp.is_some_and(|p| p.main_frame.is_crashed()) {
+                    tab["crashed"] = json!(true);
+                }
+                if let Some(dialog) = dialog {
+                    tab["dialog"] = json!(dialog);
+                }
+                tab
             })
             .collect()
     }
 
     /// Close a page and forget it.
     pub fn close_tab(&mut self, page_id: &str) -> Result<(), String> {
+        if self.closed_pages.contains(page_id) {
+            return Err(format!("page {page_id} was closed"));
+        }
         let mp = self
             .pages
             .remove(page_id)
             .ok_or_else(|| format!("page {page_id} not found"))?;
+        self.record_closed_page(page_id.to_string());
+        if mp.main_frame.is_crashed() {
+            let _ = mp.main_frame.close();
+            return Ok(());
+        }
+        if mp.main_frame.is_closed() || self.registry.is_detached(mp.main_frame.target_id()) {
+            return Err(format!("page {page_id} was closed"));
+        }
         mp.main_frame
             .close()
-            .map_err(|e| format!("close tab failed: {e}"))
+            .map_err(|e| format!("close tab failed: {}", e.message))
     }
 
     /// Dispatch a trusted left-click (mousemove → mousedown → mouseup) at
     /// viewport coordinates (x, y). Trusted browser-level input, so it drives
     /// cross-origin / closed-shadow widgets (e.g. Cloudflare Turnstile) that
     /// synthetic JS events cannot reach.
-    pub fn click(&self, page_id: &str, x: i32, y: i32) -> Result<(), String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+    pub fn click(&self, page_id: &str, x: i32, y: i32) -> Result<InteractionOutcome, String> {
+        self.click_with_timeout(page_id, x, y, Duration::from_secs(60))
+    }
+
+    fn click_with_timeout(
+        &self,
+        page_id: &str,
+        x: i32,
+        y: i32,
+        timeout: Duration,
+    ) -> Result<InteractionOutcome, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let mp = self.page(page_id)?;
 
         let mv = MouseEventParams {
             r#type: "mousemove".to_string(),
@@ -862,9 +1574,12 @@ impl Instance {
             modifiers: 0,
             click_count: None,
         };
-        mp.main_frame
-            .dispatch_mouse_event(mv)
-            .map_err(|e| format!("click (move) failed: {e}"))?;
+        if let Err(e) = mp
+            .main_frame
+            .dispatch_mouse_event_with_timeout(mv, remaining())
+        {
+            return interaction_error(e, "click (move)");
+        }
 
         let down = MouseEventParams {
             r#type: "mousedown".to_string(),
@@ -875,9 +1590,12 @@ impl Instance {
             modifiers: 0,
             click_count: Some(1),
         };
-        mp.main_frame
-            .dispatch_mouse_event(down)
-            .map_err(|e| format!("click (down) failed: {e}"))?;
+        if let Err(e) = mp
+            .main_frame
+            .dispatch_mouse_event_with_timeout(down, remaining())
+        {
+            return interaction_error(e, "click (down)");
+        }
 
         let up = MouseEventParams {
             r#type: "mouseup".to_string(),
@@ -888,11 +1606,16 @@ impl Instance {
             modifiers: 0,
             click_count: Some(1),
         };
-        mp.main_frame
-            .dispatch_mouse_event(up)
-            .map_err(|e| format!("click (up) failed: {e}"))?;
+        if let Err(e) = mp
+            .main_frame
+            .dispatch_mouse_event_with_timeout(up, remaining())
+        {
+            return interaction_error(e, "click (up)");
+        }
 
-        Ok(())
+        Ok(InteractionOutcome {
+            dialog: mp.main_frame.pending_dialog(),
+        })
     }
 
     /// Take a screenshot of a page.
@@ -917,10 +1640,8 @@ impl Instance {
         clip: Option<[f64; 4]>,
         timeout: Duration,
     ) -> Result<(Vec<u8>, String, Rect), String> {
-        let mp = self
-            .pages
-            .get(page_id)
-            .ok_or_else(|| format!("page {page_id} not found"))?;
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let mp = self.page_any(page_id)?;
 
         let rect = match (clip, selector) {
             (Some([x, y, width, height]), _) => Rect {
@@ -930,7 +1651,7 @@ impl Instance {
                 height,
             },
             (None, Some(sel)) => {
-                let (r, scroll_x, scroll_y) = self.element_rect(page_id, sel, timeout)?;
+                let (r, scroll_x, scroll_y) = self.element_rect(page_id, sel, None, timeout)?;
                 Rect {
                     x: r.x + scroll_x,
                     y: r.y + scroll_y,
@@ -977,50 +1698,43 @@ impl Instance {
         let bytes = mp
             .main_frame
             .screenshot(options)
-            .map_err(|e| format!("screenshot failed: {e}"))?;
+            .map_err(|e| format!("screenshot failed: {}", e.message))?;
 
-        let ext = if mime == "image/jpeg" { "jpg" } else { "png" };
-        let out_path = match path {
-            Some(p) => p.to_string(),
-            None => format!("/tmp/screenshot-{page_id}.{ext}"),
-        };
-
-        std::fs::write(&out_path, &bytes)
-            .map_err(|e| format!("failed to write screenshot: {e}"))?;
+        let out_path = screenshot_path(&self.instance_id, page_id, Some(mime), path)?;
+        write_screenshot(Path::new(&out_path), &bytes)?;
 
         Ok((bytes, out_path, rect))
     }
 
-    /// Get page IDs.
+    /// Get page IDs for active (non-detached) pages.
     pub fn page_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.pages.keys().cloned().collect();
+        let mut ids: Vec<String> = self
+            .pages
+            .iter()
+            .filter(|(_, mp)| {
+                !mp.main_frame.is_closed() && !self.registry.is_detached(mp.main_frame.target_id())
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
         ids.sort();
         ids
     }
 
-    /// Shut down this instance.
+    /// Shut down this instance. Browser.close is followed by pipe EOF, which makes Camoufox exit.
     pub fn stop(self) -> Result<(), String> {
         let Instance {
-            browser, mut child, ..
+            browser,
+            mut child,
+            close_timeout,
+            _profile_dir,
+            ..
         } = self;
         let _ = browser.close();
-
-        // Wait for graceful exit, kill if needed.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Ok(());
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(_) => return Ok(()),
-            }
-        }
+        let result = crate::process::lifecycle::graceful_shutdown(&mut child, close_timeout)
+            .map_err(|e| format!("failed to stop browser: {e}"));
+        // Keep the profile alive through kill + wait, including error paths.
+        drop(_profile_dir);
+        result
     }
 }
 
@@ -1028,36 +1742,105 @@ impl Instance {
 // InstanceManager
 // ---------------------------------------------------------------------------
 
+/// One daemon-managed instance. Everything that must be reachable WITHOUT
+/// taking the per-instance mutex (so it can interrupt a running command)
+/// lives beside `managed`, not inside it.
+#[derive(Clone)]
+struct InstanceEntry {
+    managed: Arc<Mutex<ManagedInstance>>,
+    /// Closes the protocol connection: rejects in-flight requests and makes
+    /// Camoufox exit (pipe EOF). Used by stop/shutdown.
+    closer: Arc<Connection>,
+    /// Download events for this instance's context. `downloads --wait`
+    /// blocks on it without taking the instance mutex.
+    downloads: Arc<crate::cli::downloads::DownloadLog>,
+}
+
 /// Manages all browser instances for the daemon.
 #[derive(Default)]
 pub struct InstanceManager {
-    instances: HashMap<String, Instance>,
-    /// Per-instance context stored separately so we can borrow mutably.
-    contexts: HashMap<String, crate::api::BrowserContext>,
-    counter: u32,
+    instances: Mutex<HashMap<String, InstanceEntry>>,
+    closing: AtomicBool,
+    counter: AtomicU64,
+}
+
+struct ManagedInstance {
+    instance: Option<Instance>,
+    context: crate::api::BrowserContext,
+    /// Keeps the download-log event subscriptions alive for the instance.
+    _download_guards: Vec<crate::api::main_frame::SubscriptionGuard>,
 }
 
 impl InstanceManager {
     pub fn new() -> Self {
         InstanceManager {
-            instances: HashMap::new(),
-            contexts: HashMap::new(),
-            counter: 0,
+            instances: Mutex::new(HashMap::new()),
+            counter: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
         }
     }
 
-    /// Launch a new browser instance.
+    /// Launch a new browser instance. Retains the mutable receiver for existing
+    /// callers; daemon workers use the shared-receiver implementation.
     pub fn launch(
         &mut self,
         headless: Option<bool>,
         executable: Option<&str>,
     ) -> Result<(String, Option<String>, u32), String> {
+        self.launch_with(&LaunchOptions {
+            headless,
+            executable: executable.map(str::to_owned),
+            ..Default::default()
+        })
+    }
+
+    /// Launch a new browser instance from the full set of `launch` flags.
+    pub fn launch_with(
+        &self,
+        options: &LaunchOptions,
+    ) -> Result<(String, Option<String>, u32), String> {
+        if self.is_closing() {
+            return Err("daemon shutting down".into());
+        }
+        if let Some(ref dir) = options.downloads_dir {
+            if !dir.is_absolute() {
+                return Err("--downloads-dir must be an absolute path".to_string());
+            }
+            if !dir.exists() {
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    format!("failed to create downloads dir {}: {e}", dir.display())
+                })?;
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+            let probe = dir.join(format!(".camoufox-probe-{}", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+            {
+                Ok(file) => {
+                    drop(file);
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "downloads dir {} is not writable: {e}",
+                        dir.display()
+                    ));
+                }
+            }
+        }
+
+        let instance_id = format!("{:08x}", self.counter.fetch_add(1, Ordering::Relaxed) + 1);
         let profile_dir =
             tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+        let headless = options.headless;
 
         let executable = PathBuf::from(
-            executable
-                .map(|s| s.to_owned())
+            options
+                .executable
+                .clone()
                 .unwrap_or_else(default_executable),
         );
         let inherited_env_keys: Vec<String> = std::env::vars_os()
@@ -1068,46 +1851,75 @@ impl InstanceManager {
             executable,
             profile_dir: Some(profile_dir.path().to_owned()),
             headless: headless.unwrap_or(true),
+            close_timeout: Duration::from_secs(10),
             ..Default::default()
         };
 
-        let mut launched = crate::process::unix::spawn(&config)
+        let launched = crate::process::unix::spawn(&config)
             .map_err(|e| format!("failed to spawn browser: {e}"))?;
 
-        let pid = launched.child.id();
+        let mut child = crate::process::ChildGuard::new(launched.child);
+        let pid = child.child_mut().id();
 
-        let _ = crate::process::readiness::wait_for_ready(&mut launched.child, config.timeout)
+        let _ = crate::process::readiness::wait_for_ready(child.child_mut(), config.timeout)
             .map_err(|e| format!("browser did not become ready: {e}"))?;
 
         let transport = PipeTransport::new(launched.command_pipe, launched.response_pipe);
         let conn = Connection::new(Box::new(transport));
         let session = conn.root_session();
         let browser = Browser::connect(conn, session, BrowserOptions::default())
-            .map_err(|e| format!("bootstrap failed: {e}"))?;
+            .map_err(|e| format!("bootstrap failed: {}", e.message))?;
 
         let version = browser.version().map(|s| s.to_owned());
 
         // Create a default context.
         let context = browser
-            .new_context(ContextOptions::default())
-            .map_err(|e| format!("failed to create context: {e}"))?;
+            .new_context(options.context_options())
+            .map_err(|e| format!("failed to create context: {}", e.message))?;
 
-        // Assign instance ID.
-        self.counter += 1;
-        let instance_id = format!("{:08x}", self.counter);
+        let closer = Arc::clone(browser.connection());
+        let download_log = crate::cli::downloads::DownloadLog::new(
+            context.id().to_string(),
+            options.downloads_dir.clone(),
+        );
+        let download_guards = download_log.subscribe(browser.connection());
 
         let instance = Instance {
+            instance_id: instance_id.clone(),
             browser,
-            child: launched.child,
+            child: child.into_child(),
             version: version.clone(),
             pid,
             _profile_dir: profile_dir,
             pages: HashMap::new(),
+            closed_pages: HashSet::new(),
+            closed_pages_order: VecDeque::new(),
             page_counter: 0,
+            close_timeout: config.close_timeout,
+            registry: Arc::clone(context.registry()),
         };
 
-        self.instances.insert(instance_id.clone(), instance);
-        self.contexts.insert(instance_id.clone(), context);
+        let mut instances = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_closing() {
+            drop(instances);
+            let _ = instance.stop();
+            return Err("daemon shutting down".into());
+        }
+        instances.insert(
+            instance_id.clone(),
+            InstanceEntry {
+                managed: Arc::new(Mutex::new(ManagedInstance {
+                    instance: Some(instance),
+                    context,
+                    _download_guards: download_guards,
+                })),
+                closer,
+                downloads: download_log,
+            },
+        );
 
         Ok((instance_id, version, pid))
     }
@@ -1115,13 +1927,25 @@ impl InstanceManager {
     /// List all instances.
     pub fn list(&self) -> Vec<serde_json::Value> {
         let mut result = Vec::new();
-        for (id, inst) in &self.instances {
-            result.push(json!({
-                "instance_id": id,
-                "pid": inst.pid,
-                "version": inst.version,
-                "pages": inst.page_ids(),
-            }));
+        let entries: Vec<_> = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(id, e)| (id.clone(), Arc::clone(&e.managed)))
+            .collect();
+        for (id, entry) in entries {
+            let entry = entry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(inst) = &entry.instance {
+                result.push(json!({
+                    "instance_id": id,
+                    "pid": inst.pid,
+                    "version": inst.version,
+                    "pages": inst.page_ids(),
+                }));
+            }
         }
         result.sort_by(|a, b| {
             a.get("instance_id")
@@ -1132,28 +1956,32 @@ impl InstanceManager {
     }
 
     /// Stop an instance.
-    pub fn stop(&mut self, instance_id: &str) -> Result<(), String> {
-        let inst = self
+    pub fn stop(&self, instance_id: &str) -> Result<(), String> {
+        let InstanceEntry {
+            managed: entry,
+            closer,
+            ..
+        } = self
             .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        self.contexts.remove(instance_id);
+            .ok_or_else(|| Self::missing(instance_id))?;
+        // Interrupt any command running on this instance first, so the
+        // instance mutex below frees promptly.
+        let _ = closer.close();
+        let inst = entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .instance
+            .take()
+            .ok_or_else(|| Self::missing(instance_id))?;
         inst.stop()
     }
 
     /// Create a new page in an instance.
-    pub fn new_page(&mut self, instance_id: &str) -> Result<String, String> {
-        let context = self
-            .contexts
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        // We need a raw pointer dance because we need &mut Instance and &BrowserContext
-        // at the same time, but they're in different HashMaps so this is safe.
-        let inst = self
-            .instances
-            .get_mut(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.create_page(context)
+    pub fn new_page(&self, instance_id: &str) -> Result<String, String> {
+        self.with_instance(instance_id, |inst, context| inst.create_page(context))
     }
 
     /// Navigate a page.
@@ -1167,11 +1995,9 @@ impl InstanceManager {
         timeout: Duration,
         wait_until: Option<&str>,
     ) -> Result<NavigateOutcome, String> {
-        let inst = self
-            .instances
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.navigate(page_id, url, timeout, wait_until)
+        self.with_instance(instance_id, |inst, _| {
+            inst.navigate(page_id, url, timeout, wait_until)
+        })
     }
 
     /// Evaluate JavaScript.
@@ -1182,20 +2008,44 @@ impl InstanceManager {
         expression: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        let inst = self
-            .instances
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.evaluate(page_id, expression, timeout)
+        self.evaluate_scoped(instance_id, page_id, expression, false, &[], timeout)
+    }
+
+    /// Evaluate a synchronous expression in the page's main world.
+    pub fn evaluate_main_world(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
+        self.evaluate_scoped(instance_id, page_id, expression, true, &[], timeout)
+    }
+
+    /// Evaluate JavaScript, optionally scoped to frames and main world.
+    pub fn evaluate_scoped(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        expression: &str,
+        main_world: bool,
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
+        self.with_instance(instance_id, |inst, _| {
+            inst.evaluate_scoped(page_id, expression, main_world, frames, timeout)
+        })
     }
 
     /// Dispatch a trusted left-click at viewport coordinates (x, y).
-    pub fn click(&self, instance_id: &str, page_id: &str, x: i32, y: i32) -> Result<(), String> {
-        let inst = self
-            .instances
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.click(page_id, x, y)
+    pub fn click(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        x: i32,
+        y: i32,
+    ) -> Result<InteractionOutcome, String> {
+        self.with_instance(instance_id, |inst, _| inst.click(page_id, x, y))
     }
 
     /// Take a screenshot.
@@ -1211,25 +2061,111 @@ impl InstanceManager {
         clip: Option<[f64; 4]>,
         timeout: Duration,
     ) -> Result<(Vec<u8>, String, Rect), String> {
-        let inst = self
+        self.with_instance(instance_id, |inst, _| {
+            inst.screenshot(page_id, format, quality, path, selector, clip, timeout)
+        })
+    }
+
+    fn missing(id: &str) -> String {
+        format!("instance {id} not found")
+    }
+
+    /// Snapshot the entry under the map lock, then lock only this instance.
+    fn with_instance<T>(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut Instance, &crate::api::BrowserContext) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let entry = self
             .instances
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        inst.screenshot(page_id, format, quality, path, selector, clip, timeout)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .map(|e| Arc::clone(&e.managed))
+            .ok_or_else(|| Self::missing(id))?;
+        let mut entry = entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ManagedInstance {
+            instance, context, ..
+        } = &mut *entry;
+        let inst = instance.as_mut().ok_or_else(|| Self::missing(id))?;
+        inst.adopt_popups(context);
+        f(inst, context)
     }
 
-    /// Borrow an instance by id, or report a clear "not found" error.
-    fn instance(&self, instance_id: &str) -> Result<&Instance, String> {
+    /// Access the download log for an instance without locking the instance.
+    pub fn download_log(
+        &self,
+        instance_id: &str,
+    ) -> Option<Arc<crate::cli::downloads::DownloadLog>> {
         self.instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))
+            .map(|entry| Arc::clone(&entry.downloads))
     }
 
-    /// Mutably borrow an instance by id.
-    fn instance_mut(&mut self, instance_id: &str) -> Result<&mut Instance, String> {
-        self.instances
-            .get_mut(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))
+    /// Fill CLI page IDs (e.g. "p1") on download entries via a brief instance lock.
+    pub fn populate_download_pages(
+        &self,
+        instance_id: &str,
+        entries: &mut [crate::cli::downloads::DownloadEntry],
+    ) {
+        // try_lock: `downloads` must not wait behind a long-running command on
+        // this instance. If the instance is busy, `page` stays None.
+        let Some(managed) = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(instance_id)
+            .map(|e| Arc::clone(&e.managed))
+        else {
+            return;
+        };
+        let guard = match managed.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        if let Some(inst) = &guard.instance {
+            for entry in entries.iter_mut() {
+                if entry.page.is_none() {
+                    entry.page = inst.page_id_for_target(&entry.page_target_id);
+                }
+            }
+        }
+    }
+
+    /// View or wait for downloads on an instance.
+    ///
+    /// The condvar wait runs outside the per-instance mutex so it never blocks
+    /// other commands on this instance.
+    pub fn downloads(
+        &self,
+        instance_id: &str,
+        wait: Option<Duration>,
+    ) -> Result<Vec<crate::cli::downloads::DownloadEntry>, String> {
+        let entry = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| Self::missing(instance_id))?;
+        let log = Arc::clone(&entry.downloads);
+
+        let mut entries = match wait {
+            Some(timeout) => {
+                let seq = log.snapshot().0;
+                let (_, entries) = log.wait_change(seq, timeout);
+                entries
+            }
+            None => log.snapshot().1,
+        };
+
+        self.populate_download_pages(instance_id, &mut entries);
+        Ok(entries)
     }
 
     // -----------------------------------------------------------------------
@@ -1242,9 +2178,12 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
         selector: Option<&str>,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<String, String> {
-        self.instance(instance_id)?.text(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.text(page_id, selector, frames, timeout)
+        })
     }
 
     /// Extract page HTML.
@@ -1253,9 +2192,12 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
         selector: Option<&str>,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<String, String> {
-        self.instance(instance_id)?.html(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.html(page_id, selector, frames, timeout)
+        })
     }
 
     /// Collect page links.
@@ -1264,10 +2206,12 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
         selector: Option<&str>,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        self.instance(instance_id)?
-            .links(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.links(page_id, selector, frames, timeout)
+        })
     }
 
     /// Extract structured page metadata.
@@ -1280,8 +2224,9 @@ impl InstanceManager {
         meta: bool,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        self.instance(instance_id)?
-            .data(page_id, og, jsonld, meta, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.data(page_id, og, jsonld, meta, timeout)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1295,22 +2240,22 @@ impl InstanceManager {
         page_id: &str,
         timeout: Duration,
     ) -> Result<(String, String), String> {
-        self.instance(instance_id)?.url(page_id, timeout)
+        self.with_instance(instance_id, |inst, _| inst.url(page_id, timeout))
     }
 
     /// Go back one history entry.
     pub fn go_back(&self, instance_id: &str, page_id: &str) -> Result<bool, String> {
-        self.instance(instance_id)?.go_back(page_id)
+        self.with_instance(instance_id, |inst, _| inst.go_back(page_id))
     }
 
     /// Go forward one history entry.
     pub fn go_forward(&self, instance_id: &str, page_id: &str) -> Result<bool, String> {
-        self.instance(instance_id)?.go_forward(page_id)
+        self.with_instance(instance_id, |inst, _| inst.go_forward(page_id))
     }
 
     /// Reload a page.
     pub fn reload(&self, instance_id: &str, page_id: &str) -> Result<(), String> {
-        self.instance(instance_id)?.reload(page_id)
+        self.with_instance(instance_id, |inst, _| inst.reload(page_id))
     }
 
     /// Wait for a selector to appear.
@@ -1319,10 +2264,12 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
         selector: &str,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<u128, String> {
-        self.instance(instance_id)?
-            .wait_for_selector(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.wait_for_selector(page_id, selector, frames, timeout)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1347,59 +2294,55 @@ impl InstanceManager {
         http_only: bool,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        let ctx = self
-            .contexts
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-
-        let resolved_url = match (url, domain) {
-            (Some(u), _) => Some(u.to_string()),
-            (None, Some(_)) => None,
-            (None, None) => {
-                let (page_url, _) = self.instance(instance_id)?.url(page_id, timeout)?;
-                if !page_url.starts_with("http") {
-                    return Err(format!(
-                        "page {page_id} is at {page_url:?}; pass --url or --domain to \
+        self.with_instance(instance_id, |inst, ctx| {
+            let resolved_url = match (url, domain) {
+                (Some(u), _) => Some(u.to_string()),
+                (None, Some(_)) => None,
+                (None, None) => {
+                    let (page_url, _) = inst.url(page_id, timeout)?;
+                    if !page_url.starts_with("http") {
+                        return Err(format!(
+                            "page {page_id} is at {page_url:?}; pass --url or --domain to \
                          say where the cookie belongs"
-                    ));
+                        ));
+                    }
+                    Some(page_url)
                 }
-                Some(page_url)
-            }
-        };
+            };
 
-        let options = CookieOptions {
-            name: name.to_string(),
-            value: value.to_string(),
-            url: resolved_url.clone(),
-            domain: domain.map(|d| d.to_string()),
-            path: path.map(|p| p.to_string()),
-            secure: if secure { Some(true) } else { None },
-            http_only: if http_only { Some(true) } else { None },
-            same_site: None,
-            expires: None,
-        };
+            let options = CookieOptions {
+                name: name.to_string(),
+                value: value.to_string(),
+                url: resolved_url.clone(),
+                domain: domain.map(|d| d.to_string()),
+                path: path.map(|p| p.to_string()),
+                secure: if secure { Some(true) } else { None },
+                http_only: if http_only { Some(true) } else { None },
+                same_site: None,
+                expires: None,
+            };
 
-        ctx.set_cookies(std::slice::from_ref(&options))
-            .map_err(|e| format!("set_cookies failed: {e}"))?;
+            ctx.set_cookies(std::slice::from_ref(&options))
+                .map_err(|e| format!("set_cookies failed: {}", e.message))?;
 
-        Ok(json!({
-            "cookie_set": name,
-            "value": value,
-            "url": resolved_url,
-            "domain": domain,
-        }))
+            Ok(json!({
+                "cookie_set": name,
+                "value": value,
+                "url": resolved_url,
+                "domain": domain,
+            }))
+        })
     }
 
     /// Add an extra HTTP request header to a page.
     pub fn set_header(
-        &mut self,
+        &self,
         instance_id: &str,
         page_id: &str,
         name: &str,
         value: &str,
     ) -> Result<Vec<(String, String)>, String> {
-        self.instance_mut(instance_id)?
-            .set_header(page_id, name, value)
+        self.with_instance(instance_id, |inst, _| inst.set_header(page_id, name, value))
     }
 
     // -----------------------------------------------------------------------
@@ -1412,10 +2355,12 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
         selector: &str,
+        frames: &[String],
         timeout: Duration,
-    ) -> Result<(i32, i32), String> {
-        self.instance(instance_id)?
-            .click_selector(page_id, selector, timeout)
+    ) -> Result<(i32, i32, InteractionOutcome), String> {
+        self.with_instance(instance_id, |inst, _| {
+            inst.click_selector(page_id, selector, frames, timeout)
+        })
     }
 
     /// Hover an element by CSS selector.
@@ -1424,10 +2369,12 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
         selector: &str,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<(i32, i32), String> {
-        self.instance(instance_id)?
-            .hover(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.hover(page_id, selector, frames, timeout)
+        })
     }
 
     /// Fill an element by CSS selector.
@@ -1437,20 +2384,60 @@ impl InstanceManager {
         page_id: &str,
         selector: &str,
         value: &str,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<String, String> {
-        self.instance(instance_id)?
-            .fill(page_id, selector, value, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.fill(page_id, selector, value, frames, timeout)
+        })
     }
 
     /// Insert text into the focused element.
-    pub fn insert_text(&self, instance_id: &str, page_id: &str, text: &str) -> Result<(), String> {
-        self.instance(instance_id)?.insert_text(page_id, text)
+    pub fn insert_text(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        text: &str,
+        frames: &[String],
+    ) -> Result<(), String> {
+        self.insert_text_with_timeout(instance_id, page_id, text, frames, Duration::from_secs(30))
+    }
+
+    pub fn insert_text_with_timeout(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        text: &str,
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.with_instance(instance_id, |inst, _| {
+            inst.insert_text(page_id, text, frames, timeout)
+        })
     }
 
     /// Press a named key.
-    pub fn press(&self, instance_id: &str, page_id: &str, key: &str) -> Result<(), String> {
-        self.instance(instance_id)?.press(page_id, key)
+    pub fn press(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        key: &str,
+        frames: &[String],
+    ) -> Result<InteractionOutcome, String> {
+        self.press_with_timeout(instance_id, page_id, key, frames, Duration::from_secs(30))
+    }
+
+    pub fn press_with_timeout(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        key: &str,
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<InteractionOutcome, String> {
+        self.with_instance(instance_id, |inst, _| {
+            inst.press(page_id, key, frames, timeout)
+        })
     }
 
     /// Select an option in a `<select>`.
@@ -1460,10 +2447,12 @@ impl InstanceManager {
         page_id: &str,
         selector: &str,
         value: &str,
+        frames: &[String],
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        self.instance(instance_id)?
-            .select_option(page_id, selector, value, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.select_option(page_id, selector, value, frames, timeout)
+        })
     }
 
     /// Scroll an element into view, or to the page bottom.
@@ -1474,8 +2463,9 @@ impl InstanceManager {
         selector: Option<&str>,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
-        self.instance(instance_id)?
-            .scroll(page_id, selector, timeout)
+        self.with_instance(instance_id, |inst, _| {
+            inst.scroll(page_id, selector, timeout)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1488,12 +2478,31 @@ impl InstanceManager {
         instance_id: &str,
         timeout: Duration,
     ) -> Result<Vec<serde_json::Value>, String> {
-        Ok(self.instance(instance_id)?.tabs(timeout))
+        self.with_instance(instance_id, |inst, _| Ok(inst.tabs(timeout)))
+    }
+
+    /// Accept or dismiss the pending dialog on a page.
+    pub fn dialog(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        accept: bool,
+        text: Option<&str>,
+    ) -> Result<DialogInfo, String> {
+        self.with_instance(instance_id, |inst, _| {
+            let page = inst.page_any(page_id)?;
+            let info = page
+                .main_frame
+                .pending_dialog()
+                .ok_or_else(|| format!("no dialog is open on page {page_id}"))?;
+            page.main_frame.handle_dialog(&info.id, accept, text);
+            Ok(info)
+        })
     }
 
     /// Close a page.
-    pub fn close_tab(&mut self, instance_id: &str, page_id: &str) -> Result<(), String> {
-        self.instance_mut(instance_id)?.close_tab(page_id)
+    pub fn close_tab(&self, instance_id: &str, page_id: &str) -> Result<(), String> {
+        self.with_instance(instance_id, |inst, _| inst.close_tab(page_id))
     }
 
     /// Export all cookies for an instance's browser context (including HttpOnly).
@@ -1502,30 +2511,84 @@ impl InstanceManager {
     /// `browserContextId`. HttpOnly cookies are included — the Juggler protocol
     /// returns them in the same array as ordinary cookies.
     pub fn cookies(&self, instance_id: &str) -> Result<Vec<serde_json::Value>, String> {
-        let ctx = self
-            .contexts
-            .get(instance_id)
-            .ok_or_else(|| format!("instance {instance_id} not found"))?;
-        let cookies = ctx
-            .get_cookies()
-            .map_err(|e| format!("get_cookies failed: {e}"))?;
-        let values: Vec<serde_json::Value> = cookies
-            .iter()
-            .map(|c| serde_json::to_value(c).expect("Cookie is always serializable"))
-            .collect();
-        Ok(values)
+        self.with_instance(instance_id, |_, ctx| {
+            let cookies = ctx
+                .get_cookies()
+                .map_err(|e| format!("get_cookies failed: {}", e.message))?;
+            let values: Vec<serde_json::Value> = cookies
+                .iter()
+                .map(|c| serde_json::to_value(c).expect("Cookie is always serializable"))
+                .collect();
+            Ok(values)
+        })
     }
 
     /// Number of running instances.
     pub fn instance_count(&self) -> usize {
-        self.instances.len()
+        self.instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
-    /// Shut down all instances.
-    pub fn shutdown_all(&mut self) {
-        let ids: Vec<String> = self.instances.keys().cloned().collect();
-        for id in ids {
-            let _ = self.stop(&id);
+    pub(crate) fn begin_shutdown(&self) {
+        let _guard = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.closing.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn close_all_connections(&self) {
+        let closers: Vec<_> = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|e| Arc::clone(&e.closer))
+            .collect();
+        for closer in closers {
+            let _ = closer.close();
+        }
+    }
+
+    /// Shut down all instances in parallel.
+    pub fn shutdown_all(&self) {
+        let entries: Vec<_> = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(_, entry)| entry)
+            .collect();
+        let workers: Vec<_> = entries
+            .into_iter()
+            .map(
+                |InstanceEntry {
+                     managed: entry,
+                     closer,
+                     ..
+                 }| {
+                    std::thread::spawn(move || {
+                        let _ = closer.close();
+                        let mut entry = entry
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(instance) = entry.instance.take() {
+                            let _ = instance.stop();
+                        }
+                    })
+                },
+            )
+            .collect();
+        for worker in workers {
+            if worker.join().is_err() {
+                log::warn!("instance shutdown worker panicked");
+            }
         }
     }
 }
@@ -1535,8 +2598,173 @@ impl InstanceManager {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod phase_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_chain_shares_budget_across_delayed_hops() {
+        let mut budgets = Vec::new();
+        let result = resolve_frame_chain(
+            "main".into(),
+            &["outer".into(), "inner".into()],
+            Duration::from_secs(1),
+            |_, sel, budget| {
+                budgets.push(budget);
+                let delay = Duration::from_millis(650);
+                std::thread::sleep(delay.min(budget));
+                if budget < delay {
+                    Err(ProtocolError::timeout("resolve", budget))
+                } else {
+                    Ok(sel.into())
+                }
+            },
+        );
+        assert!(
+            result.is_err(),
+            "each hop must not receive a fresh full timeout"
+        );
+        assert_eq!(budgets.len(), 2);
+        assert!(budgets[1] < Duration::from_millis(500), "{budgets:?}");
+    }
+
+    #[test]
+    fn wait_accepts_frame_resolution_slower_than_quarter_second() {
+        let result = poll_selector(
+            |budget| {
+                resolve_frame_chain(
+                    "main".into(),
+                    &["outer".into(), "inner".into()],
+                    budget,
+                    |_, sel, remaining| {
+                        let delay = Duration::from_millis(180);
+                        std::thread::sleep(delay.min(remaining));
+                        if remaining < delay {
+                            Err(ProtocolError::timeout("resolve", remaining))
+                        } else {
+                            Ok(sel.into())
+                        }
+                    },
+                )?;
+                Ok(true)
+            },
+            "#ready",
+            Duration::from_secs(1),
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn wait_deadline_normalizes_a_final_protocol_timeout() {
+        let err = poll_selector(
+            |budget| {
+                std::thread::sleep(budget);
+                Err(ProtocolError::timeout("Runtime.evaluate", budget))
+            },
+            "#never",
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert_eq!(err, "timed out after 0s waiting for selector: #never");
+    }
+
+    #[test]
+    fn satisfied_or_terminal_poll_wins_at_deadline() {
+        let duration = Duration::from_millis(10);
+        assert!(poll_selector(
+            |budget| {
+                std::thread::sleep(budget);
+                Ok(true)
+            },
+            "#ready",
+            duration
+        )
+        .is_ok());
+        for kind in [
+            ProtocolErrorKind::Closed,
+            ProtocolErrorKind::Crashed,
+            ProtocolErrorKind::DialogOpened,
+        ] {
+            let error = poll_selector(
+                |budget| {
+                    std::thread::sleep(budget);
+                    Err(ProtocolError::new(
+                        kind,
+                        Some("page".into()),
+                        "terminal page failure",
+                    ))
+                },
+                "#ready",
+                duration,
+            )
+            .unwrap_err();
+            assert_eq!(error, "terminal page failure", "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn launch_options_default_context_is_unchanged() {
+        let opts = LaunchOptions::default();
+        assert!(opts.headless.is_none());
+        assert!(!opts.context_options().bypass_csp);
+        assert!(opts.context_options().download_options.is_none());
+        assert!(
+            LaunchOptions {
+                bypass_csp: true,
+                ..Default::default()
+            }
+            .context_options()
+            .bypass_csp
+        );
+    }
+
+    #[test]
+    fn screenshot_runtime_path_and_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = default_screenshot_path(dir.path(), "00000001", "p1", None);
+        assert_eq!(path, dir.path().join("screenshot-00000001-p1.png"));
+        assert_ne!(
+            path,
+            default_screenshot_path(dir.path(), "00000002", "p1", None)
+        );
+        assert_eq!(
+            default_screenshot_path(&crate::cli::socket::runtime_dir(), "i", "p1", Some("jpeg"))
+                .parent()
+                .unwrap(),
+            crate::cli::socket::runtime_dir()
+        );
+        write_screenshot(&path, b"png").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_screenshot(&path, b"new").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn manager_recovers_poisoned_map() {
+        let manager = InstanceManager::new();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = manager.instances.lock().unwrap();
+            panic!("test poison");
+        });
+        assert_eq!(manager.instance_count(), 0);
+        assert!(manager.list().is_empty());
+        assert!(manager
+            .new_page("missing")
+            .unwrap_err()
+            .contains("not found"));
+        manager.shutdown_all();
+    }
 
     /// `js_literal` produces a quoted literal that survives being pasted into
     /// a JavaScript expression — quotes, backslashes and newlines escaped.
@@ -1696,5 +2924,145 @@ mod tests {
     fn user_agent_env_sets_nothing_when_browser_version_unknown() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(user_agent_env(&dir.path().join("camoufox"), &[]).is_empty());
+    }
+
+    #[test]
+    fn downloads_dir_relative_rejected() {
+        let mgr = InstanceManager::new();
+        let res = mgr.launch_with(&LaunchOptions {
+            downloads_dir: Some("rel/dir".into()),
+            ..Default::default()
+        });
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .contains("--downloads-dir must be an absolute path"));
+    }
+    #[test]
+    fn s6_crashed_tab_is_listed_and_close_succeeds_best_effort() {
+        use crate::protocol::RawMessage;
+        use crate::transport::errors::TransportError;
+        use crate::transport::{Transport, TransportReader, TransportWriter};
+        use std::sync::mpsc;
+
+        struct Writer {
+            incoming: Option<mpsc::Sender<RawMessage>>,
+            records: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+        impl TransportWriter for Writer {
+            fn send(&mut self, value: &serde_json::Value) -> Result<(), TransportError> {
+                self.records.lock().unwrap().push(value.clone());
+                // Bootstrap responses; crashed-page close deliberately gets none.
+                if value["method"] != "Page.close" {
+                    self.incoming
+                        .as_ref()
+                        .unwrap()
+                        .send(RawMessage {
+                            id: value["id"].as_i64(),
+                            result: Some(json!({})),
+                            method: None,
+                            params: None,
+                            error: None,
+                            session_id: None,
+                        })
+                        .unwrap();
+                }
+                Ok(())
+            }
+            fn close(&mut self) -> Result<(), TransportError> {
+                self.incoming.take();
+                Ok(())
+            }
+            fn is_closed(&self) -> bool {
+                self.incoming.is_none()
+            }
+        }
+        struct Reader(mpsc::Receiver<RawMessage>);
+        impl TransportReader for Reader {
+            fn receive(&mut self) -> Result<RawMessage, TransportError> {
+                self.0.recv().map_err(|_| TransportError::Closed)
+            }
+            fn is_closed(&self) -> bool {
+                false
+            }
+        }
+        struct MockTransport(Writer, Reader);
+        impl Transport for MockTransport {
+            fn into_split(self: Box<Self>) -> (Box<dyn TransportWriter>, Box<dyn TransportReader>) {
+                (Box::new(self.0), Box::new(self.1))
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let connection = Connection::new(Box::new(MockTransport(
+            Writer {
+                incoming: Some(tx.clone()),
+                records: records.clone(),
+            },
+            Reader(rx),
+        )));
+        let root = connection.root_session();
+        let browser = Browser::connect(connection, root, BrowserOptions::default()).unwrap();
+        let conn = browser.connection().clone();
+        let context =
+            crate::api::BrowserContext::new("ctx".into(), &conn.root_session(), conn.clone());
+        tx.send(RawMessage { id: None, method: Some("Browser.attachedToTarget".into()), params: Some(json!({ "sessionId": "s", "targetInfo": { "type": "page", "targetId": "t", "browserContextId": "ctx" } })), result: None, error: None, session_id: None }).unwrap();
+        tx.send(RawMessage {
+            id: None,
+            method: Some("Page.frameAttached".into()),
+            params: Some(json!({ "frameId": "f" })),
+            result: None,
+            error: None,
+            session_id: Some("s".into()),
+        })
+        .unwrap();
+        let page = context
+            .registry()
+            .claim("t", Duration::from_secs(2))
+            .unwrap();
+        let main_frame =
+            MainFrame::from_tracked(page, conn.clone(), context.registry().clone()).unwrap();
+        conn.create_session("s".into()).mark_crashed();
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        let mut instance = Instance {
+            instance_id: "test".into(),
+            browser,
+            child,
+            version: None,
+            pid: 0,
+            _profile_dir: tempfile::tempdir().unwrap(),
+            pages: HashMap::from([(
+                "p1".into(),
+                ManagedMainFrame {
+                    main_frame,
+                    headers: Vec::new(),
+                },
+            )]),
+            closed_pages: HashSet::new(),
+            closed_pages_order: VecDeque::new(),
+            page_counter: 1,
+            close_timeout: Duration::from_millis(100),
+            registry: context.registry().clone(),
+        };
+        instance.adopt_popups(&context);
+        assert_eq!(instance.page_ids(), vec!["p1"]);
+        assert_eq!(instance.page_any("p1").err().unwrap(), "page p1 crashed");
+        let tabs = instance.tabs(Duration::from_millis(100));
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0]["crashed"], true);
+        assert!(tabs[0]["url"].is_null());
+        assert!(instance.close_tab("p1").is_ok());
+        assert!(instance.page_ids().is_empty());
+        assert_eq!(instance.page_any("p1").err().unwrap(), "page p1 was closed");
+        assert!(records
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["method"] == "Page.close" && v["sessionId"] == "s"));
+        drop(instance);
+        drop(context);
+        drop(tx);
+        drop(conn);
     }
 }

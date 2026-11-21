@@ -70,6 +70,18 @@ pub fn render(data: Option<&Value>) -> Rendered {
     // carries `url`/`title`, and a `select` result also carries a `text`.
     // -----------------------------------------------------------------------
 
+    if let Some(action) = data.get("dialog_action").and_then(Value::as_str) {
+        let dialog = &data["dialog"];
+        let kind = dialog["kind"].as_str().unwrap_or("dialog");
+        let message = dialog["message"].as_str().unwrap_or("");
+        let verb = if action == "accept" {
+            "accepted"
+        } else {
+            "dismissed"
+        };
+        return Rendered::out(format!("dialog {verb}: {kind} {message:?}"));
+    }
+
     // Structured metadata (`data --og/--jsonld/--meta`).
     if data.get("og").is_some() || data.get("jsonld").is_some() || data.get("meta").is_some() {
         return Rendered::out(pretty(data));
@@ -222,7 +234,7 @@ pub fn render(data: Option<&Value>) -> Rendered {
 
     // Cookies response
     if let Some(cookies) = data.get("cookies").and_then(|v| v.as_array()) {
-        let mut lines: Vec<String> = cookies
+        let lines: Vec<String> = cookies
             .iter()
             .map(|cookie| {
                 let name = cookie.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -230,8 +242,7 @@ pub fn render(data: Option<&Value>) -> Rendered {
                 format!("{name}={value}")
             })
             .collect();
-        lines.push(format!("{} cookie(s)", cookies.len()));
-        return Rendered::out(lines.join("\n"));
+        return Rendered::out(lines.join("\n")).with_note(format!("{} cookie(s)", cookies.len()));
     }
 
     // Navigation response
@@ -248,6 +259,31 @@ pub fn render(data: Option<&Value>) -> Rendered {
         } else {
             format!("ok{status_str}")
         });
+    }
+
+    // Downloads response (standalone `downloads` command, not click outcome)
+    if data.get("clicked").is_none() {
+        if let Some(downloads) = data.get("downloads").and_then(|v| v.as_array()) {
+            if downloads.is_empty() {
+                return Rendered::out("no downloads");
+            }
+            let lines: Vec<String> = downloads
+                .iter()
+                .map(|d| {
+                    let state = d.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+                    let page = d.get("page").and_then(|v| v.as_str()).unwrap_or("-");
+                    let url = d.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(path) = d.get("path").and_then(|v| v.as_str()) {
+                        format!("{state}  {page}  {url}  -> {path}")
+                    } else if let Some(err) = d.get("error").and_then(|v| v.as_str()) {
+                        format!("{state}  {page}  {url}  (error: {err})")
+                    } else {
+                        format!("{state}  {page}  {url}")
+                    }
+                })
+                .collect();
+            return Rendered::out(lines.join("\n"));
+        }
     }
 
     // Fallback: print the data as JSON.
@@ -290,7 +326,7 @@ mod tests {
         );
     }
 
-    /// Human mode lists every cookie (HttpOnly included) plus a count line.
+    /// Human mode lists every cookie on stdout and puts the count on stderr.
     #[test]
     fn human_mode_renders_all_cookies_with_count() {
         let data = json!({
@@ -300,10 +336,15 @@ mod tests {
             ]
         });
         let rendered = render(Some(&data));
-        assert_eq!(
-            rendered.stdout,
-            "session=abc\nPHPSESSID=secret\n2 cookie(s)"
-        );
+        assert_eq!(rendered.stdout, "session=abc\nPHPSESSID=secret");
+        assert_eq!(rendered.stderr, vec!["2 cookie(s)"]);
+    }
+
+    #[test]
+    fn empty_cookies_keep_stdout_clean() {
+        let rendered = render(Some(&json!({ "cookies": [] })));
+        assert_eq!(rendered.stdout, "");
+        assert_eq!(rendered.stderr, vec!["0 cookie(s)"]);
     }
 
     /// `print_response` in JSON mode for an error response does not panic.
@@ -451,5 +492,36 @@ mod tests {
             render(Some(&json!({ "instances": [] }))).stdout,
             "no running instances"
         );
+    }
+
+    #[test]
+    fn downloads_renders_one_line_per_entry_with_path() {
+        let data = json!({
+            "downloads": [
+                {
+                    "state": "completed",
+                    "page": "p1",
+                    "url": "http://x/a.pdf",
+                    "path": "/tmp/dl/u1"
+                },
+                {
+                    "state": "canceled",
+                    "page": "p1",
+                    "url": "http://x/b.pdf",
+                    "path": null
+                }
+            ]
+        });
+        let rendered = render(Some(&data));
+        assert_eq!(
+            rendered.stdout,
+            "completed  p1  http://x/a.pdf  -> /tmp/dl/u1\ncanceled  p1  http://x/b.pdf"
+        );
+    }
+
+    #[test]
+    fn downloads_renders_no_downloads_when_empty() {
+        let rendered = render(Some(&json!({ "downloads": [] })));
+        assert_eq!(rendered.stdout, "no downloads");
     }
 }

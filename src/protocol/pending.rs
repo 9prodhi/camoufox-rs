@@ -114,6 +114,13 @@ impl PendingMap {
         true
     }
 
+    /// Reject all pending requests using an error constructed for each method.
+    pub fn reject_all_with(&mut self, make: impl Fn(&str) -> ProtocolError) {
+        for (_, pending) in self.requests.drain() {
+            let _ = pending.sender.send(Err(make(&pending.method)));
+        }
+    }
+
     /// Reject ALL pending requests in this session.
     ///
     /// Called when:
@@ -129,14 +136,7 @@ impl PendingMap {
             let error = match kind {
                 ProtocolErrorKind::Closed => ProtocolError::closed(Some(pending.method)),
                 ProtocolErrorKind::Crashed => ProtocolError::crashed(Some(pending.method)),
-                _ => ProtocolError {
-                    kind,
-                    method: Some(pending.method),
-                    message: format!("{kind:?}"),
-                    data: None,
-                    source: None,
-                    download_info: None,
-                },
+                _ => ProtocolError::new(kind, Some(pending.method), format!("{kind:?}")),
             };
             let _ = pending.sender.send(Err(error));
         }

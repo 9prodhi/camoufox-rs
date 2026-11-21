@@ -13,20 +13,51 @@ fn main() {
     let sock = socket_path(cli.socket.as_deref());
 
     match cli.command {
-        Command::Serve { foreground } => {
+        Command::Serve => {
             env_logger::init();
-            if let Err(e) = camoufox::cli::daemon::run(&sock, foreground) {
+            if let Err(e) = camoufox::cli::daemon::run(&sock, true) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
         }
 
-        Command::Launch { headed, executable } => {
+        Command::Launch {
+            headed,
+            executable,
+            downloads_dir,
+            bypass_csp,
+            dialogs,
+        } => {
             let request = DaemonRequest::Launch {
                 headless: Some(!headed),
                 executable,
+                downloads_dir,
+                bypass_csp,
+                dialogs: dialogs.into(),
             };
             run_client(&sock, &request, cli.json);
+        }
+
+        Command::Dialog {
+            instance_id,
+            page_id,
+            action,
+            text,
+        } => {
+            let action = match action {
+                camoufox::cli::commands::DialogAction::Accept => "accept",
+                camoufox::cli::commands::DialogAction::Dismiss => "dismiss",
+            };
+            run_client(
+                &sock,
+                &DaemonRequest::Dialog {
+                    instance_id,
+                    page_id,
+                    action: action.into(),
+                    text,
+                },
+                cli.json,
+            );
         }
 
         Command::List => {
@@ -65,7 +96,9 @@ fn main() {
             instance_id,
             page_id,
             expression,
+            main_world,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -73,7 +106,9 @@ fn main() {
                     instance_id,
                     page_id,
                     expression,
+                    main_world,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -88,6 +123,7 @@ fn main() {
             target,
             y,
             timeout,
+            frames,
         } => {
             let request = match y {
                 Some(y) => match target.parse::<i32>() {
@@ -110,6 +146,7 @@ fn main() {
                     page_id,
                     selector: target,
                     timeout_secs: timeout,
+                    frames,
                 },
             };
             run_client(&sock, &request, cli.json);
@@ -125,6 +162,10 @@ fn main() {
             clip,
             timeout,
         } => {
+            let output = output.map(|p| {
+                absolute_output_path(&p)
+                    .unwrap_or_else(|e| fail(cli.json, &format!("resolve screenshot path: {e}")))
+            });
             let clip = match clip.as_deref().map(parse_clip) {
                 Some(Ok(rect)) => Some(rect),
                 Some(Err(e)) => fail(cli.json, &e),
@@ -166,6 +207,7 @@ fn main() {
             page_id,
             selector,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -174,6 +216,7 @@ fn main() {
                     page_id,
                     selector,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -184,6 +227,7 @@ fn main() {
             page_id,
             selector,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -192,6 +236,7 @@ fn main() {
                     page_id,
                     selector,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -202,6 +247,7 @@ fn main() {
             page_id,
             selector,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -210,6 +256,7 @@ fn main() {
                     page_id,
                     selector,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -303,6 +350,7 @@ fn main() {
             page_id,
             selector,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -311,6 +359,7 @@ fn main() {
                     page_id,
                     selector,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -388,6 +437,7 @@ fn main() {
             selector,
             value,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -397,6 +447,7 @@ fn main() {
                     selector,
                     value,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -406,6 +457,8 @@ fn main() {
             instance_id,
             page_id,
             text,
+            frames,
+            timeout,
         } => {
             run_client(
                 &sock,
@@ -413,6 +466,8 @@ fn main() {
                     instance_id,
                     page_id,
                     text,
+                    frames,
+                    timeout_secs: timeout,
                 },
                 cli.json,
             );
@@ -422,6 +477,8 @@ fn main() {
             instance_id,
             page_id,
             key,
+            frames,
+            timeout,
         } => {
             run_client(
                 &sock,
@@ -429,6 +486,8 @@ fn main() {
                     instance_id,
                     page_id,
                     key,
+                    frames,
+                    timeout_secs: timeout,
                 },
                 cli.json,
             );
@@ -439,6 +498,7 @@ fn main() {
             page_id,
             selector,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -447,6 +507,7 @@ fn main() {
                     page_id,
                     selector,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -458,6 +519,7 @@ fn main() {
             selector,
             value,
             timeout,
+            frames,
         } => {
             run_client(
                 &sock,
@@ -467,6 +529,7 @@ fn main() {
                     selector,
                     value,
                     timeout_secs: timeout,
+                    frames,
                 },
                 cli.json,
             );
@@ -520,6 +583,17 @@ fn main() {
                 cli.json,
             );
         }
+
+        Command::Downloads { instance_id, wait } => {
+            run_client(
+                &sock,
+                &DaemonRequest::Downloads {
+                    instance_id,
+                    wait_secs: wait,
+                },
+                cli.json,
+            );
+        }
     }
 }
 
@@ -533,6 +607,17 @@ fn split_once_trimmed(s: &str, sep: char) -> Option<(String, String)> {
         return None;
     }
     Some((name.to_string(), value.trim().to_string()))
+}
+
+/// Resolve screenshot destinations against the client's cwd, not the daemon's.
+fn absolute_output_path(path: &str) -> std::io::Result<String> {
+    let path = std::path::Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(absolute.to_string_lossy().into_owned())
 }
 
 /// Parse a `x,y,width,height` clip string into four floats.
@@ -601,6 +686,26 @@ fn run_client(sock: &std::path::Path, request: &DaemonRequest, json_mode: bool) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn screenshot_paths_resolve_against_client_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            absolute_output_path("shots/page.png").unwrap(),
+            cwd.join("shots/page.png").to_string_lossy()
+        );
+        let absolute = cwd.join("absolute.png");
+        assert_eq!(
+            absolute_output_path(absolute.to_str().unwrap()).unwrap(),
+            absolute.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn serve_rejects_removed_foreground_flag() {
+        assert!(Cli::try_parse_from(["camoufox", "serve"]).is_ok());
+        assert!(Cli::try_parse_from(["camoufox", "serve", "--foreground"]).is_err());
+    }
+
     /// `name=value` / `Name: value` pairs split on the FIRST separator, so a
     /// value may itself contain one (e.g. a URL in a header value).
     #[test]
@@ -652,5 +757,110 @@ mod tests {
         assert!(parse_clip("1,2,x,4").unwrap_err().contains("not a number"));
         assert!(parse_clip("0,0,0,100").unwrap_err().contains("positive"));
         assert!(parse_clip("0,0,100,-1").unwrap_err().contains("positive"));
+    }
+
+    #[test]
+    fn cli_parses_repeatable_frame_flag_for_all_commands() {
+        let test_cases = [
+            (
+                vec![
+                    "camoufox", "text", "inst1", "p1", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "text",
+            ),
+            (
+                vec![
+                    "camoufox", "html", "inst1", "p1", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "html",
+            ),
+            (
+                vec![
+                    "camoufox", "links", "inst1", "p1", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "links",
+            ),
+            (
+                vec![
+                    "camoufox", "click", "inst1", "p1", "button", "--frame", "#f1", "--frame",
+                    "#f2",
+                ],
+                "click",
+            ),
+            (
+                vec![
+                    "camoufox", "fill", "inst1", "p1", "input", "val", "--frame", "#f1", "--frame",
+                    "#f2",
+                ],
+                "fill",
+            ),
+            (
+                vec![
+                    "camoufox", "type", "inst1", "p1", "hello", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "type",
+            ),
+            (
+                vec![
+                    "camoufox", "press", "inst1", "p1", "Enter", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "press",
+            ),
+            (
+                vec![
+                    "camoufox", "hover", "inst1", "p1", "a", "--frame", "#f1", "--frame", "#f2",
+                ],
+                "hover",
+            ),
+            (
+                vec![
+                    "camoufox", "select", "inst1", "p1", "select", "opt", "--frame", "#f1",
+                    "--frame", "#f2",
+                ],
+                "select",
+            ),
+            (
+                vec![
+                    "camoufox",
+                    "wait",
+                    "inst1",
+                    "p1",
+                    "--selector",
+                    "div",
+                    "--frame",
+                    "#f1",
+                    "--frame",
+                    "#f2",
+                ],
+                "wait",
+            ),
+            (
+                vec![
+                    "camoufox", "evaluate", "inst1", "p1", "1+1", "--frame", "#f1", "--frame",
+                    "#f2",
+                ],
+                "evaluate",
+            ),
+        ];
+
+        for (args, name) in test_cases {
+            let cli =
+                Cli::try_parse_from(args).unwrap_or_else(|e| panic!("failed to parse {name}: {e}"));
+            let frames = match cli.command {
+                Command::Text { frames, .. }
+                | Command::Html { frames, .. }
+                | Command::Links { frames, .. }
+                | Command::Click { frames, .. }
+                | Command::Fill { frames, .. }
+                | Command::Type { frames, .. }
+                | Command::Press { frames, .. }
+                | Command::Hover { frames, .. }
+                | Command::Select { frames, .. }
+                | Command::Wait { frames, .. }
+                | Command::Evaluate { frames, .. } => frames,
+                _ => panic!("unexpected command variant for {name}"),
+            };
+            assert_eq!(frames, vec!["#f1", "#f2"], "frames for {name}");
+        }
     }
 }

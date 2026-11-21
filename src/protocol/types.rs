@@ -28,19 +28,19 @@ pub struct Request {
 
 /// An incoming message from the browser. Could be a response or an event.
 /// We parse into this raw form first, then discriminate.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RawMessage {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<MessageId>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorData>,
-    #[serde(default, rename = "sessionId")]
+    #[serde(default, rename = "sessionId", skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
 }
 

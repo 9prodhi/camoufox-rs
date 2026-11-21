@@ -12,7 +12,6 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
 
-use crate::codec::errors::CodecError;
 use crate::codec::nul_json::NulJsonCodec;
 use crate::protocol::types::RawMessage;
 use crate::transport::errors::TransportError;
@@ -90,7 +89,7 @@ impl PipeTransport {
     }
 
     /// Drain the next pending message, if any were buffered from a prior read.
-    fn drain_pending(&mut self) -> Option<RawMessage> {
+    pub fn drain_pending(&mut self) -> Option<RawMessage> {
         self.pending_messages.pop_front()
     }
 
@@ -180,6 +179,18 @@ pub struct PipeReader {
     pending_messages: VecDeque<RawMessage>,
 }
 
+impl PipeReader {
+    /// Drain the next pending message, if any were buffered from a prior read.
+    pub fn drain_pending(&mut self) -> Option<RawMessage> {
+        self.pending_messages.pop_front()
+    }
+
+    /// Mark the reader as closed.
+    pub fn close(&mut self) {
+        self.closed = true;
+    }
+}
+
 impl TransportReader for PipeReader {
     fn receive(&mut self) -> Result<RawMessage, TransportError> {
         if self.closed {
@@ -201,16 +212,16 @@ impl TransportReader for PipeReader {
             let results = self.codec.feed(&buf[..n]);
             for result in results {
                 match result {
-                    Ok(value) => {
-                        let msg: RawMessage = serde_json::from_value(value)
-                            .map_err(|e| TransportError::Codec(CodecError::InvalidJson(e)))?;
-                        self.pending_messages.push_back(msg);
-                    }
-                    Err(e) => {
-                        if let Some(msg) = self.pending_messages.pop_front() {
-                            return Ok(msg);
+                    Ok(value) => match serde_json::from_value::<RawMessage>(value) {
+                        Ok(msg) => {
+                            self.pending_messages.push_back(msg);
                         }
-                        return Err(TransportError::Codec(e));
+                        Err(e) => {
+                            log::warn!("PipeReader: schema-mismatched JSON frame, skipping: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        log::warn!("PipeReader: invalid JSON frame, skipping: {e}");
                     }
                 }
             }
@@ -225,125 +236,17 @@ impl TransportReader for PipeReader {
     }
 }
 
-impl Transport for PipeTransport {
-    fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
-        if self.closed {
-            return Err(TransportError::Closed);
-        }
-
-        // Encode to \0-terminated bytes, chunked to 64KB per write.
-        let chunks = self.codec.encode_chunks(message);
-
-        for chunk in &chunks {
-            // write_all handles short writes and retries on EINTR.
-            self.writer.write_all(chunk).map_err(|e| {
-                self.closed = true;
-                TransportError::Io(e)
-            })?;
-        }
-
-        // Flush the BufWriter to ensure all data reaches the pipe.
-        self.writer.flush().map_err(|e| {
-            self.closed = true;
-            TransportError::Io(e)
-        })?;
-
-        Ok(())
-    }
-
-    fn receive(&mut self) -> Result<RawMessage, TransportError> {
-        if self.closed {
-            return Err(TransportError::Closed);
-        }
-
-        // First, check if we have buffered messages from a prior read.
-        if let Some(msg) = self.drain_pending() {
-            return Ok(msg);
-        }
-
-        // Read from the pipe until we get at least one complete message.
-        let mut buf = [0u8; READ_BUF_SIZE];
-
-        loop {
-            let n = self.reader.read(&mut buf).map_err(|e| {
-                self.closed = true;
-                TransportError::Io(e)
-            })?;
-
-            if n == 0 {
-                // EOF: the browser closed its write end of the pipe.
-                self.closed = true;
-                return Err(TransportError::Closed);
-            }
-
-            let results = self.codec.feed(&buf[..n]);
-
-            // Collect successfully decoded RawMessages from the feed results.
-            // Codec errors on individual messages are propagated as the first
-            // error encountered; valid messages preceding the error are still
-            // queued so they are not lost.
-            for result in results {
-                match result {
-                    Ok(value) => {
-                        let msg: RawMessage = serde_json::from_value(value)
-                            .map_err(|e| TransportError::Codec(CodecError::InvalidJson(e)))?;
-                        self.pending_messages.push_back(msg);
-                    }
-                    Err(e) => {
-                        // If we already buffered some messages, return the
-                        // first one now and the caller will see the error on a
-                        // subsequent call (if it matters).  For simplicity we
-                        // propagate the codec error immediately.
-                        if let Some(msg) = self.drain_pending() {
-                            // Re-push error context?  No — the error is on a
-                            // *different* message.  Return the good one.
-                            // The bad message is simply dropped.
-                            // TODO: log the codec error at warn level.
-                            return Ok(msg);
-                        }
-                        return Err(TransportError::Codec(e));
-                    }
-                }
-            }
-
-            if let Some(msg) = self.drain_pending() {
-                return Ok(msg);
-            }
-
-            // No complete message yet — loop to read more data.
-        }
-    }
-
-    fn close(&mut self) -> Result<(), TransportError> {
-        if self.closed {
-            return Ok(());
-        }
-        self.closed = true;
-
-        // Dropping the writer closes fd 3. Firefox detects the EOF on its
-        // read end and triggers Browser.close internally. We replace the
-        // writer with a dummy to drop the original.
-        //
-        // BufWriter::into_inner flushes and returns the inner File.
-        // We take the writer by replacing it with a writer wrapping /dev/null.
-        // The old writer (and its File) is dropped, closing the fd.
-        //
-        // We use a simpler approach: just drop the inner writer by replacing
-        // self.writer. Since BufWriter doesn't implement a no-op constructor,
-        // we open /dev/null as a stand-in. If that fails, the writer is leaked
-        // but will be cleaned up when the PipeTransport itself is dropped.
-        if let Ok(devnull) = File::open("/dev/null") {
-            let old_writer = std::mem::replace(&mut self.writer, BufWriter::new(devnull));
-            // Dropping old_writer closes the original fd 3.
-            drop(old_writer);
-        }
-        // If /dev/null open fails, the writer will be dropped when PipeTransport drops.
-
-        Ok(())
-    }
-
-    fn is_closed(&self) -> bool {
+impl PipeTransport {
+    /// Whether the transport is closed.
+    pub fn is_closed(&self) -> bool {
         self.closed
+    }
+}
+
+impl Transport for PipeTransport {
+    fn into_split(self: Box<Self>) -> (Box<dyn TransportWriter>, Box<dyn TransportReader>) {
+        let (writer, reader) = (*self).split();
+        (Box::new(writer), Box::new(reader))
     }
 }
 
@@ -394,7 +297,8 @@ mod tests {
 
     #[test]
     fn send_and_verify() {
-        let (mut transport, _browser_write, mut browser_read) = make_test_transport();
+        let (transport, _browser_write, mut browser_read) = make_test_transport();
+        let (mut writer, _reader) = transport.split();
 
         let msg = serde_json::json!({
             "id": 1,
@@ -402,7 +306,7 @@ mod tests {
             "params": {}
         });
 
-        transport.send(&msg).unwrap();
+        writer.send(&msg).unwrap();
 
         // Read what the transport wrote.
         let mut buf = vec![0u8; 4096];
@@ -420,43 +324,46 @@ mod tests {
 
     #[test]
     fn receive_single_message() {
-        let (mut transport, mut browser_write, _browser_read) = make_test_transport();
+        let (transport, mut browser_write, _browser_read) = make_test_transport();
+        let (_writer, mut reader) = transport.split();
 
         // Simulate browser sending a response.
         let response = b"{\"id\":1,\"result\":{}}\0";
         browser_write.write_all(response).unwrap();
         browser_write.flush().unwrap();
 
-        let msg = transport.receive().unwrap();
+        let msg = reader.receive().unwrap();
         assert_eq!(msg.id, Some(1));
         assert!(msg.result.is_some());
     }
 
     #[test]
     fn receive_multiple_messages_in_one_read() {
-        let (mut transport, mut browser_write, _browser_read) = make_test_transport();
+        let (transport, mut browser_write, _browser_read) = make_test_transport();
+        let (_writer, mut reader) = transport.split();
 
         // Simulate browser sending two messages in one write.
         let responses = b"{\"id\":1,\"result\":{}}\0{\"id\":2,\"result\":{}}\0";
         browser_write.write_all(responses).unwrap();
         browser_write.flush().unwrap();
 
-        let msg1 = transport.receive().unwrap();
+        let msg1 = reader.receive().unwrap();
         assert_eq!(msg1.id, Some(1));
 
-        let msg2 = transport.receive().unwrap();
+        let msg2 = reader.receive().unwrap();
         assert_eq!(msg2.id, Some(2));
     }
 
     #[test]
     fn receive_event_message() {
-        let (mut transport, mut browser_write, _browser_read) = make_test_transport();
+        let (transport, mut browser_write, _browser_read) = make_test_transport();
+        let (_writer, mut reader) = transport.split();
 
         let event = b"{\"method\":\"Page.loadFinished\",\"params\":{\"frameId\":\"main\"},\"sessionId\":\"s1\"}\0";
         browser_write.write_all(event).unwrap();
         browser_write.flush().unwrap();
 
-        let msg = transport.receive().unwrap();
+        let msg = reader.receive().unwrap();
         assert!(msg.id.is_none());
         assert_eq!(msg.method.as_deref(), Some("Page.loadFinished"));
         assert_eq!(msg.session_id.as_deref(), Some("s1"));
@@ -464,61 +371,68 @@ mod tests {
 
     #[test]
     fn receive_eof_returns_closed() {
-        let (mut transport, browser_write, _browser_read) = make_test_transport();
+        let (transport, browser_write, _browser_read) = make_test_transport();
+        let (_writer, mut reader) = transport.split();
 
         // Close the browser's write end -- transport should see EOF.
         drop(browser_write);
 
-        let result = transport.receive();
+        let result = reader.receive();
         assert!(result.is_err());
         match result.unwrap_err() {
             TransportError::Closed => {} // expected
             other => panic!("expected Closed, got: {other}"),
         }
-        assert!(transport.is_closed());
+        assert!(reader.is_closed());
     }
 
     #[test]
     fn send_after_close_returns_closed() {
-        let (mut transport, _browser_write, _browser_read) = make_test_transport();
+        let (transport, _browser_write, _browser_read) = make_test_transport();
+        let (mut writer, _reader) = transport.split();
 
-        transport.close().unwrap();
+        writer.close().unwrap();
 
         let msg = serde_json::json!({"id": 1, "method": "Browser.enable"});
-        let result = transport.send(&msg);
+        let result = writer.send(&msg);
         assert!(result.is_err());
         match result.unwrap_err() {
             TransportError::Closed => {} // expected
             other => panic!("expected Closed, got: {other}"),
         }
+        assert!(writer.is_closed());
     }
 
     #[test]
     fn receive_after_close_returns_closed() {
-        let (mut transport, _browser_write, _browser_read) = make_test_transport();
+        let (transport, _browser_write, _browser_read) = make_test_transport();
+        let (_writer, mut reader) = transport.split();
 
-        transport.close().unwrap();
+        reader.close();
 
-        let result = transport.receive();
+        let result = reader.receive();
         assert!(result.is_err());
         match result.unwrap_err() {
             TransportError::Closed => {} // expected
             other => panic!("expected Closed, got: {other}"),
         }
+        assert!(reader.is_closed());
     }
 
     #[test]
     fn close_is_idempotent() {
-        let (mut transport, _browser_write, _browser_read) = make_test_transport();
+        let (transport, _browser_write, _browser_read) = make_test_transport();
+        let (mut writer, _reader) = transport.split();
 
-        transport.close().unwrap();
-        transport.close().unwrap(); // second close should be a no-op
-        assert!(transport.is_closed());
+        writer.close().unwrap();
+        writer.close().unwrap(); // second close should be a no-op
+        assert!(writer.is_closed());
     }
 
     #[test]
     fn receive_partial_then_complete() {
-        let (mut transport, mut browser_write, _browser_read) = make_test_transport();
+        let (transport, mut browser_write, _browser_read) = make_test_transport();
+        let (_writer, mut reader) = transport.split();
 
         // Send a partial message (no \0 yet).
         browser_write.write_all(b"{\"id\":").unwrap();
@@ -533,7 +447,7 @@ mod tests {
             browser_write // return ownership so it isn't dropped prematurely
         });
 
-        let msg = transport.receive().unwrap();
+        let msg = reader.receive().unwrap();
         assert_eq!(msg.id, Some(42));
 
         let _browser_write = handle.join().unwrap();
@@ -554,7 +468,8 @@ mod tests {
         let (resp_write, resp_read) = socket_pair_as_files();
 
         // Transport: writes commands via cmd_write, reads responses via resp_read.
-        let mut transport = PipeTransport::new(cmd_write, resp_read);
+        let transport = PipeTransport::new(cmd_write, resp_read);
+        let (mut writer, mut reader) = transport.split();
 
         // "Browser" side uses cmd_read and resp_write.
         let mut browser_cmd_reader = cmd_read;
@@ -566,7 +481,7 @@ mod tests {
             "method": "Browser.getInfo",
             "params": {}
         });
-        transport.send(&cmd).unwrap();
+        writer.send(&cmd).unwrap();
 
         // "Browser" reads the command.
         let mut buf = vec![0u8; 4096];
@@ -585,7 +500,7 @@ mod tests {
         browser_resp_writer.flush().unwrap();
 
         // Transport receives the response.
-        let msg = transport.receive().unwrap();
+        let msg = reader.receive().unwrap();
         assert_eq!(msg.id, Some(7));
         assert!(msg.result.is_some());
         let result = msg.result.unwrap();
@@ -594,18 +509,38 @@ mod tests {
 
     #[test]
     fn empty_messages_are_skipped() {
-        let (mut transport, mut browser_write, _browser_read) = make_test_transport();
+        let (transport, mut browser_write, _browser_read) = make_test_transport();
+        let (_writer, mut reader) = transport.split();
 
         // Send: msg1 \0 \0 msg2 \0 (empty segment between msg1 and msg2).
         let data = b"{\"id\":1,\"result\":{}}\0\0{\"id\":2,\"result\":{}}\0";
         browser_write.write_all(data).unwrap();
         browser_write.flush().unwrap();
 
-        let msg1 = transport.receive().unwrap();
+        let msg1 = reader.receive().unwrap();
         assert_eq!(msg1.id, Some(1));
 
-        let msg2 = transport.receive().unwrap();
+        let msg2 = reader.receive().unwrap();
         assert_eq!(msg2.id, Some(2));
+    }
+
+    #[test]
+    fn bad_frame_in_middle_of_batch_is_skipped() {
+        let (transport, mut browser_write, _browser_read) = make_test_transport();
+        let (_writer, mut reader) = transport.split();
+
+        // Batch: 1) valid, 2) invalid JSON, 3) schema-mismatched JSON, 4) valid
+        let batch = b"{\"id\":100,\"result\":{\"step\":1}}\0{\"broken json\0\"schema mismatched string\"\0{\"id\":200,\"result\":{\"step\":2}}\0";
+        browser_write.write_all(batch).unwrap();
+        browser_write.flush().unwrap();
+
+        let msg1 = reader.receive().unwrap();
+        assert_eq!(msg1.id, Some(100));
+        assert_eq!(msg1.result.unwrap()["step"], 1);
+
+        let msg2 = reader.receive().unwrap();
+        assert_eq!(msg2.id, Some(200));
+        assert_eq!(msg2.result.unwrap()["step"], 2);
     }
 
     #[test]

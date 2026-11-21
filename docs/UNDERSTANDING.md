@@ -50,13 +50,9 @@ creates two extra anonymous pipes beyond the standard stdin/stdout/stderr:
 | fd 4            | **Read** (receive responses/events) | **Write** (send responses/events) |
 
 **How it works:**
-- The parent calls `Command::new("camoufox")` with stdio configured as
-  `['ignore', 'pipe', 'pipe', 'pipe', 'pipe']` (5 entries: stdin, stdout, stderr, fd3, fd4).
-- In Rust, this means using `std::process::Command` with `.stdin(Stdio::null())`
-  `.stdout(Stdio::piped())` `.stderr(Stdio::piped())` plus two extra pipes passed
-  via platform-specific mechanisms.
-- On Unix: child inherits fd 3 and fd 4 automatically when pipes are set up at those
-  positions in the stdio array.
+- The parent creates two pipe pairs using `libc::pipe2(O_CLOEXEC)` on Linux (or `pipe` + `fcntl(FD_CLOEXEC)` on Apple/macOS targets).
+- In Rust, `std::process::Command` standard stdio handles stdin (fd 0), stdout (fd 1), and stderr (fd 2).
+- On Unix (`src/process/unix.rs`): `pre_exec` runs in the child fork before `execvp`. It uses `fcntl(..., F_DUPFD_CLOEXEC, 5)` to park file descriptors away from 3 and 4, calls `dup2` to attach the read pipe to fd 3 and the write pipe to fd 4, and clears `O_CLOEXEC` on them so Firefox inherits them.
 - On Windows: Handles passed via `PW_PIPE_READ` / `PW_PIPE_WRITE` environment variables.
 
 **Characteristics:**
@@ -129,6 +125,7 @@ Read buffer may contain partial/multiple messages:
 4. Multiple messages can arrive in a single `read()` call
 5. A single message can span multiple `read()` calls (accumulate until `\0`)
 6. Messages are always valid UTF-8 JSON
+7. Client-side frame buffer cap: the Rust client enforces `DEFAULT_MAX_FRAME_SIZE = 256 MiB` in `src/codec/nul_json.rs`, returning `CodecError::FrameTooLarge` if exceeded.
 
 ### Write Chunking
 
@@ -147,8 +144,7 @@ The protocol uses a JSON-RPC-like format (not strict JSON-RPC 2.0). Four message
 {
   "id": 1,
   "method": "Browser.enable",
-  "params": {},
-  "sessionId": ""
+  "params": {}
 }
 ```
 
@@ -157,7 +153,7 @@ The protocol uses a JSON-RPC-like format (not strict JSON-RPC 2.0). Four message
 | `id` | number | Yes | Monotonically incrementing, unique per connection |
 | `method` | string | Yes | Domain-qualified: `"Domain.method"` |
 | `params` | object | No | Method-specific parameters (defaults to `{}`) |
-| `sessionId` | string | No | `""` or absent = root/browser session |
+| `sessionId` | string | No | Target session ID. Absent/omitted for root/browser session |
 
 ### 4.2 Success Response (Browser → Client)
 
@@ -289,9 +285,9 @@ Firefox's `nsRemoteDebuggingPipe.cpp` uses three threads:
 ```
 ┌────────────────┐     dispatch      ┌─────────────────┐
 │  Reader Thread  │  ──────────────► │   Main Thread    │
-│  (reads fd 3)   │   ReceiveMessage │  (Juggler logic) │
+│  (reads fd 3)   │   recv msg       │  (Juggler logic) │
 └────────────────┘                   └────────┬────────┘
-                                              │ SendMessage
+                                              │ send msg
                                      ┌────────▼────────┐
                                      │  Writer Thread   │
                                      │  (writes fd 4)   │
@@ -324,84 +320,44 @@ Firefox's `nsRemoteDebuggingPipe.cpp` uses three threads:
 
 ## 10. Rust Implementation Strategy
 
-### Crate Structure (Zero External Dependencies for Transport)
+### Crate Structure
 
 ```
 camoufox-rs/
 ├── Cargo.toml
 ├── src/
-│   ├── lib.rs              # Public API
-│   ├── transport/
-│   │   ├── mod.rs          # Transport trait
-│   │   ├── pipe.rs         # fd 3/4 pipe transport (Unix)
-│   │   └── frame.rs        # Null-byte message framing
-│   ├── protocol/
-│   │   ├── mod.rs
-│   │   ├── types.rs        # Request, Response, Event, Error types
-│   │   ├── domains.rs      # Browser, Page, Network, Runtime, Heap
-│   │   └── session.rs      # Session multiplexer
-│   ├── connection.rs       # Connection manager (send/receive/dispatch)
-│   ├── launcher.rs         # Process spawning with fd 3/4 setup
-│   └── error.rs            # Error types
+│   ├── lib.rs              # Public module exports
+│   ├── api/                # High-level API (Browser, BrowserContext, MainFrame, dialogs)
+│   ├── codec/              # NUL-delimited JSON frame encoder/decoder with 256 MiB cap
+│   ├── config/             # LaunchConfig, profile layout, chunked CAMOU_CONFIG_*
+│   ├── obs/                # Structured trace logging for protocol events
+│   ├── process/            # Unix process management (pre_exec + dup2, readiness, lifecycle)
+│   ├── protocol/           # Protocol types, errors, session demuxing, state tracking
+│   ├── transport/          # Transport abstractions
+│   └── cli/                # Daemon and CLI subcommands (feature = "cli")
 ```
 
 ### Key Design Decisions
 
-1. **Transport**: Raw `std::os::unix::io::RawFd` + `std::io::Read`/`Write`.
-   No tokio, no async runtime dependency for the core transport.
-2. **Framing**: Custom null-byte scanner over a `BufReader`. Zero-copy where possible.
-3. **Serialization**: `serde` + `serde_json` (the only external dependency — unavoidable
-   for JSON).
-4. **Concurrency**: Reader thread + writer thread pattern mirroring Firefox's model.
-   Channels (`std::sync::mpsc`) for cross-thread message passing.
-5. **Async optional**: Core is sync. Optional `async` feature flag wrapping with
-   `tokio::task::spawn_blocking` or native async I/O.
+1. **Transport**: Raw Unix pipes set up via `libc::pipe2` (Linux) or `pipe` + `fcntl` (Apple) and `pre_exec` + `dup2`.
+   No external pipe wrapper crate like `os_pipe`, and zero network ports.
+2. **Framing**: Dedicated `nul_json` codec enforcing a 256 MiB maximum frame size.
+3. **Serialization**: `serde` + `serde_json` with custom serializers omitting `sessionId` for root commands.
+4. **Concurrency**: Synchronous caller-thread writer `Mutex` + single background reader thread. Incoming events are dispatched to registered callbacks via an internal `EventRouter`.
+5. **Pure Rust**: Synchronous, robust, and unsafe code is strictly confined to POSIX libc calls (`pre_exec` pipe setup, `flock`, socket credentials, and signal masks).
 
 ### Process Spawning (Unix)
 
-```rust
-// Conceptual — exact API in launcher.rs
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::process::{Command, Stdio};
-
-// Create two pipe pairs for fd 3 and fd 4
-let (r3, w3) = os_pipe::pipe()?;  // fd 3: parent writes, child reads
-let (r4, w4) = os_pipe::pipe()?;  // fd 4: child writes, parent reads
-
-let child = Command::new("camoufox")
-    .args(["-no-remote", "-juggler-pipe", "-profile", &profile_path])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    // fd 3 and fd 4 passed via pre_exec or explicit dup2
-    .spawn()?;
-
-// Parent keeps: w3 (write to child's fd 3) and r4 (read from child's fd 4)
-// Parent closes: r3, w4 (child's ends)
-```
+Process spawning is implemented in `src/process/unix.rs`:
+- Creates pipe pairs via `libc::pipe2(O_CLOEXEC)` on Linux (or `pipe` + `fcntl(FD_CLOEXEC)` on Apple/macOS).
+- In child `pre_exec`, calls `dup2` to attach the read pipe to fd 3 and write pipe to fd 4.
+- Clears `O_CLOEXEC` on fd 3 and fd 4 so Firefox inherits them.
 
 ### Message Framing
 
-```rust
-// Read: accumulate until \0
-fn read_message(reader: &mut BufReader<impl Read>) -> Result<String> {
-    let mut buf = Vec::new();
-    reader.read_until(b'\0', &mut buf)?;
-    if buf.last() == Some(&b'\0') {
-        buf.pop(); // remove delimiter
-    }
-    String::from_utf8(buf).map_err(|e| Error::InvalidUtf8(e))
-}
-
-// Write: JSON bytes + \0, chunked to 64KB
-fn write_message(writer: &mut impl Write, msg: &[u8]) -> Result<()> {
-    for chunk in msg.chunks(65536) {
-        writer.write_all(chunk)?;
-    }
-    writer.write_all(b"\0")?;
-    writer.flush()
-}
-```
+The null-byte message framing is implemented in `src/codec/nul_json.rs` via `NulJsonCodec`:
+- Decodes incoming frames by scanning for `\0` with a 256 MiB buffer limit.
+- Encodes outgoing JSON byte payloads and appends the `\0` delimiter.
 
 ---
 
@@ -417,4 +373,4 @@ fn write_message(writer: &mut impl Write, msg: &[u8]) -> Result<()> {
 | Firefox `Dispatcher.js` | `github.com/microsoft/playwright/.../Dispatcher.js` |
 | Firefox `Protocol.js` | `github.com/microsoft/playwright/.../Protocol.js` |
 | Camoufox GitHub | `github.com/daijro/camoufox` |
-| Camoufox DeepWiki | `deepwiki.com/daijro/camoufox/6.1-juggler-system` |
+| Camoufox Wiki | `github.com/daijro/camoufox/wiki` |

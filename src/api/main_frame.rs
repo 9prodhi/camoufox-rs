@@ -7,14 +7,18 @@
 //! Created via
 //! [`BrowserContext::new_main_frame`](crate::api::context::BrowserContext::new_main_frame).
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
 use crate::api::browser::Session;
+use crate::api::exec_ctx::ExecContextTracker;
+use crate::api::selectors::js_query;
 use crate::protocol::client::Connection;
-use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
+use crate::protocol::errors::{DownloadInfo, ProtocolError, ProtocolErrorKind};
 use crate::protocol::events::HandlerId;
 
 /// Upper bound (ms) on how long `navigate` spins waiting for the main-document
@@ -26,6 +30,67 @@ use crate::protocol::events::HandlerId;
 const MAX_STATUS_WAIT_MS: u64 = 500;
 #[cfg(test)]
 const MAX_STATUS_WAIT_MS: u64 = 80;
+
+/// Upper bound (ms) on how long `navigate` waits for `Browser.downloadCreated`
+/// after an attachment response is detected on the main-document request.
+#[cfg(not(test))]
+const MAX_ATTACHMENT_WAIT_MS: u64 = 2000;
+#[cfg(test)]
+const MAX_ATTACHMENT_WAIT_MS: u64 = 200;
+
+/// Upper bound (ms) on how long `navigate` waits for the final status when
+/// a redirect is in flight (e.g. after receiving a 3xx or chaining forward).
+#[cfg(not(test))]
+const MAX_REDIRECT_WAIT_MS: u64 = 2000;
+#[cfg(test)]
+const MAX_REDIRECT_WAIT_MS: u64 = 200;
+
+#[derive(Debug, Clone)]
+enum LifecycleSignal {
+    Event,
+    Download(DownloadInfo),
+}
+
+#[derive(Default)]
+struct DownloadState {
+    info: Option<DownloadInfo>,
+    lifecycle_tx: Option<std::sync::mpsc::Sender<LifecycleSignal>>,
+}
+
+fn is_attachment_type(val: &str) -> bool {
+    let token = val.split(';').next().unwrap_or("").trim();
+    token.eq_ignore_ascii_case("attachment")
+}
+
+fn has_attachment_disposition(params: &serde_json::Value) -> bool {
+    let headers_val = params
+        .get("headers")
+        .or_else(|| params.get("response").and_then(|r| r.get("headers")));
+    let Some(headers) = headers_val else {
+        return false;
+    };
+    if let Some(arr) = headers.as_array() {
+        for h in arr {
+            let name = h.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.eq_ignore_ascii_case("content-disposition") {
+                let val = h.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if is_attachment_type(val) {
+                    return true;
+                }
+            }
+        }
+    } else if let Some(map) = headers.as_object() {
+        for (name, val) in map {
+            if name.eq_ignore_ascii_case("content-disposition") {
+                let val_str = val.as_str().unwrap_or("");
+                if is_attachment_type(val_str) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 // ---------------------------------------------------------------------------
 // Supporting types
@@ -208,22 +273,50 @@ pub struct Point {
 
 /// RAII guard that deregisters an event handler when dropped.
 ///
-/// Holding one of these guarantees the `(session_key, method, id)` handler is
-/// removed from the connection's [`EventRouter`](crate::protocol::events::EventRouter)
-/// on every exit path of the enclosing scope — normal return, early return,
-/// or panic — so transient subscriptions (e.g. a single-shot lifecycle wait)
+/// Holding one of these guarantees the handler is removed from the connection's
+/// [`EventRouter`](crate::protocol::events::EventRouter) on every exit path —
+/// normal return, early return, or panic — so transient subscriptions
 /// can never leak a dead closure.
-struct SubscriptionGuard<'a> {
-    connection: &'a Connection,
-    session_key: &'a str,
+pub(crate) struct SubscriptionGuard {
+    connection: Arc<Connection>,
+    session_key: String,
     method: &'static str,
     id: HandlerId,
+    active: bool,
+    #[cfg(test)]
+    pub(crate) on_drop: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
-impl Drop for SubscriptionGuard<'_> {
+impl SubscriptionGuard {
+    pub(crate) fn session(
+        connection: Arc<Connection>,
+        session_key: impl Into<String>,
+        method: &'static str,
+        id: HandlerId,
+    ) -> Self {
+        Self {
+            connection,
+            session_key: session_key.into(),
+            method,
+            id,
+            active: true,
+            #[cfg(test)]
+            on_drop: None,
+        }
+    }
+}
+
+impl Drop for SubscriptionGuard {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.on_drop {
+            hook();
+        }
         self.connection
-            .off_event(self.session_key, self.method, self.id);
+            .off_event(&self.session_key, self.method, self.id);
     }
 }
 
@@ -243,32 +336,117 @@ pub struct MainFrame {
     session: Session,
     /// Server-assigned target ID; the target has `type == "page"`.
     target_id: String,
-    /// Top frame ID, populated at construction time.
-    frame_id: String,
+    /// Opener target ID, if opened by another page.
+    opener_id: Option<String>,
+    /// Last observed top-frame ID, retained after page removal.
+    frame_id: Mutex<String>,
     /// Latest known main-world execution context ID for this frame.
     /// Updated by a `Runtime.executionContextCreated` listener registered
     /// in `BrowserContext::new_main_frame`, filtered on `auxData.frameId`.
-    execution_context_id: Arc<Mutex<Option<String>>>,
+    execution_context_id: Arc<ExecContextTracker>,
     /// Shared connection — used for `on_event` subscriptions (e.g. lifecycle wait).
     connection: Arc<Connection>,
+    registry: Arc<crate::api::page_registry::PageRegistry>,
+    dialog: Arc<crate::api::dialog::DialogTracker>,
+    /// RAII guards for event subscriptions owned by this frame (e.g. executionContextCreated/Destroyed).
+    _context_guards: Vec<SubscriptionGuard>,
 }
 
 impl MainFrame {
-    /// Internal constructor used by `BrowserContext::new_main_frame`.
+    /// Internal constructor used by tests.
+    #[cfg(test)]
     pub(crate) fn new(
         session: Session,
         target_id: String,
         frame_id: String,
-        execution_context_id: Arc<Mutex<Option<String>>>,
+        execution_context_id: Arc<ExecContextTracker>,
         connection: Arc<Connection>,
+        mut context_guards: Vec<SubscriptionGuard>,
+        dialog_policy: crate::api::dialog::DialogPolicy,
     ) -> Self {
+        let registry = crate::api::page_registry::PageRegistry::install(
+            &connection,
+            "test-context",
+            dialog_policy,
+        );
+        let dialog = crate::api::dialog::DialogTracker::new(dialog_policy);
+        context_guards.extend(dialog.install(&connection, &session));
         MainFrame {
+            dialog,
             session,
             target_id,
-            frame_id,
+            opener_id: None,
+            frame_id: Mutex::new(frame_id),
             execution_context_id,
             connection,
+            registry,
+            _context_guards: context_guards,
         }
+    }
+
+    /// Construct from a claimed or adopted [`TrackedPage`].
+    pub(crate) fn from_tracked(
+        tracked: crate::api::page_registry::TrackedPage,
+        connection: Arc<Connection>,
+        registry: Arc<crate::api::page_registry::PageRegistry>,
+    ) -> Result<Self, ProtocolError> {
+        let frame_id = tracked.main_frame_id.clone().ok_or_else(|| {
+            ProtocolError::closed_with("Page.frameAttached", "tracked page has no main frame")
+        })?;
+        Ok(MainFrame {
+            dialog: tracked.dialog,
+            session: tracked.session,
+            target_id: tracked.target_id,
+            opener_id: tracked.opener_id,
+            frame_id: Mutex::new(frame_id),
+            execution_context_id: tracked.main_ctx,
+            connection,
+            registry,
+            _context_guards: tracked.session_guards,
+        })
+    }
+
+    /// Check whether this page's session has been closed or detached.
+    pub fn is_closed(&self) -> bool {
+        self.session.is_closed()
+    }
+
+    /// Check whether a frame with the given ID exists on this page.
+    pub fn has_frame(&self, frame_id: &str) -> bool {
+        self.frame_ctx(frame_id).is_some()
+    }
+
+    /// Look up the execution context tracker for a specific frame of this page.
+    pub(crate) fn frame_ctx(&self, frame_id: &str) -> Option<Arc<ExecContextTracker>> {
+        self.registry
+            .frame_ctx(self.session.key(), frame_id)
+            .or_else(|| {
+                if frame_id == self.frame_id() {
+                    Some(Arc::clone(&self.execution_context_id))
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// List frames for this page as `(frame_id, parent_id)` pairs.
+    pub fn frames(&self) -> Vec<(String, Option<String>)> {
+        self.registry.frames(self.session.key())
+    }
+
+    /// Currently open JavaScript dialog, if any.
+    pub fn pending_dialog(&self) -> Option<crate::api::dialog::DialogInfo> {
+        self.dialog.pending()
+    }
+
+    /// Most recently closed JavaScript dialog, if any.
+    pub fn last_dialog(&self) -> Option<crate::api::dialog::DialogInfo> {
+        self.dialog.last()
+    }
+
+    /// Set the policy for subsequently opened dialogs.
+    pub fn set_dialog_policy(&self, policy: crate::api::dialog::DialogPolicy) {
+        self.dialog.set_policy(policy);
     }
 
     /// Returns the target ID for this page.
@@ -276,15 +454,35 @@ impl MainFrame {
         &self.target_id
     }
 
-    /// Returns the top frame ID.
-    pub fn frame_id(&self) -> &str {
-        &self.frame_id
+    /// Returns the opener target ID for this page, if any.
+    pub fn opener_id(&self) -> Option<&str> {
+        self.opener_id.as_deref()
+    }
+
+    /// Returns the live top-frame ID, following replacement attachments.
+    /// During a detach/reattach gap this is the last attached main-frame ID;
+    /// after page removal the last observed ID is retained for diagnostics.
+    pub fn frame_id(&self) -> String {
+        let live = self.registry.main_frame_id(self.session.key());
+        let mut last = self
+            .frame_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(id) = live {
+            *last = id;
+        }
+        last.clone()
+    }
+
+    /// Whether the renderer crashed (distinct from a closed/detached page).
+    pub fn is_crashed(&self) -> bool {
+        self.session.is_crashed()
     }
 
     /// Shared handle to the cached execution context id. Updated by the
     /// listener registered in `BrowserContext::new_main_frame`.
-    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
-    pub(crate) fn execution_context_handle(&self) -> Arc<Mutex<Option<String>>> {
+    #[allow(dead_code)]
+    pub(crate) fn execution_context_handle(&self) -> Arc<ExecContextTracker> {
         Arc::clone(&self.execution_context_id)
     }
 
@@ -308,17 +506,13 @@ impl MainFrame {
         match value {
             "load" => Ok("load"),
             "domcontentloaded" => Ok("DOMContentLoaded"),
-            other => Err(ProtocolError {
-                kind: ProtocolErrorKind::Response,
-                method: Some("Page.navigate".into()),
-                message: format!(
+            other => Err(ProtocolError::response_msg(
+                "Page.navigate",
+                format!(
                     "unsupported --wait-until value {:?}; supported values are: load, domcontentloaded",
                     other
                 ),
-                data: None,
-                source: None,
-                download_info: None,
-            }),
+            )),
         }
     }
 
@@ -333,7 +527,7 @@ impl MainFrame {
     /// # Handler cleanup (no leak)
     ///
     /// The handler is registered via [`Connection::on_event`], which returns a
-    /// `HandlerId`. An RAII guard ([`SubscriptionGuard`]) deregisters the
+    /// `HandlerId`. An RAII guard (`SubscriptionGuard`) deregisters the
     /// handler via [`Connection::off_event`] on **every** exit path — success,
     /// timeout, error, or panic — so a `--wait-until` navigate never leaks a
     /// closure into the `EventRouter`.
@@ -352,17 +546,40 @@ impl MainFrame {
         event_name: &str,
         timeout: Duration,
     ) -> Result<(), ProtocolError> {
+        let frame_id = self.frame_id();
+        self.wait_for_lifecycle_internal(&frame_id, event_name, timeout, None)
+    }
+
+    fn wait_for_lifecycle_internal(
+        &self,
+        frame_id: &str,
+        event_name: &str,
+        timeout: Duration,
+        external_download_state: Option<&Arc<Mutex<DownloadState>>>,
+    ) -> Result<(), ProtocolError> {
         use std::sync::mpsc;
 
-        let (tx, rx) = mpsc::channel::<()>();
-        let frame_id = self.frame_id.clone();
+        if let Some(dl_state) = external_download_state {
+            let st = dl_state.lock().unwrap();
+            if let Some(ref info) = st.info {
+                return Err(ProtocolError::navigation_became_download(
+                    Some("Page.navigate".into()),
+                    info.clone(),
+                ));
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<LifecycleSignal>();
+        let frame_id = frame_id.to_owned();
         let expected_name = event_name.to_owned();
         let session_key = self.session.key().to_owned();
 
-        let handler_id = self.connection.on_event(
+        let tx_event = tx.clone();
+        let frame_id_event = frame_id.clone();
+        let event_handler_id = self.connection.on_event(
             &session_key,
             "Page.eventFired",
-            Box::new(move |event| {
+            Arc::new(move |event| {
                 let ev_name = event
                     .params
                     .get("name")
@@ -373,47 +590,101 @@ impl MainFrame {
                     .get("frameId")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if ev_name == expected_name && ev_frame == frame_id {
-                    // Ignore send error: the receiver may have already dropped
-                    // (e.g. timeout path ran first). This is benign.
-                    let _ = tx.send(());
+                if ev_name == expected_name && ev_frame == frame_id_event {
+                    let _ = tx_event.send(LifecycleSignal::Event);
                 }
             }),
         );
+        let _guard_event = SubscriptionGuard::session(
+            Arc::clone(&self.connection),
+            &session_key,
+            "Page.eventFired",
+            event_handler_id,
+        );
 
-        // RAII: deregister the handler on every exit path (success, timeout,
-        // error, panic) so the closure cannot leak in the router.
-        let _guard = SubscriptionGuard {
-            connection: &self.connection,
-            session_key: &session_key,
-            method: "Page.eventFired",
-            id: handler_id,
-        };
+        struct ResetLifecycleTx<'a>(&'a Mutex<DownloadState>);
+        impl<'a> Drop for ResetLifecycleTx<'a> {
+            fn drop(&mut self) {
+                let mut st = self.0.lock().unwrap();
+                st.lifecycle_tx = None;
+            }
+        }
+
+        let _guard_dl: Option<SubscriptionGuard>;
+        let _reset_guard: Option<ResetLifecycleTx>;
+
+        if let Some(dl_state) = external_download_state {
+            {
+                let mut st = dl_state.lock().unwrap();
+                if let Some(ref info) = st.info {
+                    return Err(ProtocolError::navigation_became_download(
+                        Some("Page.navigate".into()),
+                        info.clone(),
+                    ));
+                }
+                st.lifecycle_tx = Some(tx.clone());
+            }
+            _reset_guard = Some(ResetLifecycleTx(dl_state.as_ref()));
+            _guard_dl = None;
+        } else {
+            let tx_dl = tx.clone();
+            let frame_id_dl = frame_id.clone();
+            let dl_handler_id = self.connection.on_event(
+                "",
+                "Browser.downloadCreated",
+                Arc::new(move |event| {
+                    let ev_frame = event.params.get("frameId").and_then(|v| v.as_str());
+                    if ev_frame != Some(&frame_id_dl) {
+                        return;
+                    }
+                    let url = event
+                        .params
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let download_id = event
+                        .params
+                        .get("uuid")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_owned());
+                    let info = DownloadInfo {
+                        url,
+                        frame_id: Some(frame_id_dl.clone()),
+                        download_id,
+                    };
+                    let _ = tx_dl.send(LifecycleSignal::Download(info));
+                }),
+            );
+            _guard_dl = Some(SubscriptionGuard::session(
+                Arc::clone(&self.connection),
+                "",
+                "Browser.downloadCreated",
+                dl_handler_id,
+            ));
+            _reset_guard = None;
+        }
 
         match rx.recv_timeout(timeout) {
-            Ok(()) => Ok(()),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ProtocolError {
-                kind: ProtocolErrorKind::Timeout,
-                method: Some("Page.navigate".into()),
-                message: format!(
+            Ok(LifecycleSignal::Event) => Ok(()),
+            Ok(LifecycleSignal::Download(info)) => Err(ProtocolError::navigation_became_download(
+                Some("Page.navigate".into()),
+                info,
+            )),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ProtocolError::timeout_msg(
+                "Page.navigate",
+                format!(
                     "timed out waiting for lifecycle event {:?} after {:?}",
                     event_name, timeout
                 ),
-                data: None,
-                source: None,
-                download_info: None,
-            }),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProtocolError {
-                kind: ProtocolErrorKind::Closed,
-                method: Some("Page.navigate".into()),
-                message: format!(
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProtocolError::closed_with(
+                "Page.navigate",
+                format!(
                     "channel disconnected while waiting for lifecycle event {:?}",
                     event_name
                 ),
-                data: None,
-                source: None,
-                download_info: None,
-            }),
+            )),
         }
     }
 
@@ -440,7 +711,7 @@ impl MainFrame {
     /// remains, so navigate+wait can never exceed `timeout`. If the renderer
     /// never responds (e.g. the response was a download and no DOM was
     /// created), the call returns
-    /// [`ProtocolErrorKind::Timeout`](crate::protocol::errors::ProtocolErrorKind::Timeout)
+    /// [`ProtocolErrorKind::Timeout`]
     /// rather than hanging.
     ///
     /// Invalidates the cached execution context on cross-document navigation
@@ -465,7 +736,53 @@ impl MainFrame {
         let deadline = Instant::now() + timeout;
 
         let session_key = self.session.key().to_owned();
-        let frame_id = self.frame_id.clone();
+        let frame_id = self.frame_id();
+
+        // -----------------------------------------------------------------------
+        // Download detection: Subscribe to Browser.downloadCreated on the ROOT
+        // session ("") BEFORE sending Page.navigate, filtered to this frame.
+        // -----------------------------------------------------------------------
+        let download_state: Arc<Mutex<DownloadState>> =
+            Arc::new(Mutex::new(DownloadState::default()));
+        let frame_id_dl = frame_id.clone();
+        let dl_state = Arc::clone(&download_state);
+        let dl_id = self.connection.on_event(
+            "",
+            "Browser.downloadCreated",
+            Arc::new(move |event| {
+                let ev_frame = event.params.get("frameId").and_then(|v| v.as_str());
+                if ev_frame != Some(&frame_id_dl) {
+                    return;
+                }
+                let url = event
+                    .params
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let download_id = event
+                    .params
+                    .get("uuid")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned());
+                let info = DownloadInfo {
+                    url,
+                    frame_id: Some(frame_id_dl.clone()),
+                    download_id,
+                };
+                let mut st = dl_state.lock().unwrap();
+                st.info = Some(info.clone());
+                if let Some(ref tx) = st.lifecycle_tx {
+                    let _ = tx.send(LifecycleSignal::Download(info));
+                }
+            }),
+        );
+        let _guard_dl = SubscriptionGuard::session(
+            Arc::clone(&self.connection),
+            "",
+            "Browser.downloadCreated",
+            dl_id,
+        );
 
         // -----------------------------------------------------------------------
         // G4: Subscribe Network event handlers BEFORE issuing Page.navigate.
@@ -501,6 +818,15 @@ impl MainFrame {
             /// Status of the most recent matching response. Overwritten as the
             /// redirect chain progresses so the FINAL hop's status is reported.
             status: Option<u16>,
+            /// True when the tracked main-document response specifies an attachment
+            /// in its Content-Disposition header.
+            is_attachment: bool,
+            /// True when a redirect continuation is in flight (e.g. 3xx status received
+            /// or chain forwarded via redirectedFrom, but final response not yet received).
+            redirect_in_flight: bool,
+            /// Map of requestId -> (status, is_attachment) buffering responses in case
+            /// responseReceived arrives before requestWillBeSent chains forward.
+            responses: HashMap<String, (u16, bool)>,
         }
         let net_state: Arc<Mutex<NetState>> = Arc::new(Mutex::new(NetState::default()));
         // Populated after Page.navigate returns; handlers read it under the same Mutex.
@@ -513,7 +839,7 @@ impl MainFrame {
         let rws_id = self.connection.on_event(
             &session_key,
             "Network.requestWillBeSent",
-            Box::new(move |event| {
+            Arc::new(move |event| {
                 let req_id = match event.params.get("requestId").and_then(|v| v.as_str()) {
                     Some(id) => id.to_owned(),
                     None => return,
@@ -524,6 +850,36 @@ impl MainFrame {
                     if !ev_frame.is_empty() && ev_frame != frame_id_rws {
                         return;
                     }
+                }
+
+                let redirected_from = event.params.get("redirectedFrom").and_then(|v| v.as_str());
+
+                let mut st = state_rws.lock().unwrap();
+
+                // CHAIN FORWARD: a redirect hop's continuation request whose
+                // `redirectedFrom` is the request we're tracking. Advance the
+                // tracked id to this hop so the final response's status wins.
+                // Checked BEFORE nav_id_ok because a redirect continuation is
+                // definitively part of our chain by definition.
+                if let Some(from) = redirected_from {
+                    if st.main_request_id.as_deref() == Some(from) {
+                        st.main_request_id = Some(req_id.clone());
+                        st.redirect_in_flight = true;
+                        // If response for this new hop arrived out-of-order before
+                        // requestWillBeSent, apply it immediately.
+                        if let Some(&(resp_status, is_attach)) = st.responses.get(&req_id) {
+                            st.status = Some(resp_status);
+                            st.is_attachment = is_attach;
+                            st.redirect_in_flight = (300..400).contains(&resp_status);
+                        } else {
+                            // New hop in flight; clear previous hop's intermediate 3xx.
+                            st.status = None;
+                        }
+                        return;
+                    }
+                    // A `redirectedFrom` that does not match our chain belongs to
+                    // some other request; ignore it (cannot hijack the chain).
+                    return;
                 }
 
                 let ev_nav_id = event
@@ -543,25 +899,6 @@ impl MainFrame {
                     return;
                 }
 
-                let redirected_from = event.params.get("redirectedFrom").and_then(|v| v.as_str());
-
-                let mut st = state_rws.lock().unwrap();
-
-                // CHAIN FORWARD: a redirect hop's continuation request whose
-                // `redirectedFrom` is the request we're tracking. Advance the
-                // tracked id to this hop so the final response's status wins.
-                // Checked before the document-cause gate because redirect
-                // continuations are tied to the chain, not re-discovered.
-                if let Some(from) = redirected_from {
-                    if st.main_request_id.as_deref() == Some(from) {
-                        st.main_request_id = Some(req_id);
-                        return;
-                    }
-                    // A `redirectedFrom` that does not match our chain belongs to
-                    // some other request; ignore it (cannot hijack the chain).
-                    return;
-                }
-
                 // LOCK: only the FIRST document-type request (no redirectedFrom)
                 // establishes the chain head. Accept both the spec-mapped value
                 // ("document") and the raw Firefox type names emitted in practice
@@ -576,121 +913,212 @@ impl MainFrame {
                     "document" | "TYPE_DOCUMENT" | "TYPE_SUBDOCUMENT" | "TYPE_REFRESH"
                 );
                 if is_document_cause && st.main_request_id.is_none() {
-                    st.main_request_id = Some(req_id);
+                    st.main_request_id = Some(req_id.clone());
+                    if let Some(&(resp_status, is_attach)) = st.responses.get(&req_id) {
+                        st.status = Some(resp_status);
+                        st.is_attachment = is_attach;
+                        if (300..400).contains(&resp_status) {
+                            st.redirect_in_flight = true;
+                        }
+                    }
                 }
             }),
         );
-        let _guard_rws = SubscriptionGuard {
-            connection: &self.connection,
-            session_key: &session_key,
-            method: "Network.requestWillBeSent",
-            id: rws_id,
-        };
+        let _guard_rws = SubscriptionGuard::session(
+            Arc::clone(&self.connection),
+            &session_key,
+            "Network.requestWillBeSent",
+            rws_id,
+        );
 
         // Handler 2: Network.responseReceived
         let state_rr = Arc::clone(&net_state);
         let rr_id = self.connection.on_event(
             &session_key,
             "Network.responseReceived",
-            Box::new(move |event| {
+            Arc::new(move |event| {
                 let req_id = match event.params.get("requestId").and_then(|v| v.as_str()) {
-                    Some(id) => id,
+                    Some(id) => id.to_owned(),
                     None => return,
                 };
+                let status = event
+                    .params
+                    .get("status")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|s| u16::try_from(s).ok());
+                let is_attach = has_attachment_disposition(&event.params);
+
                 let mut st = state_rr.lock().unwrap();
-                // Capture for the CURRENT tracked request and ALLOW OVERWRITE so
-                // that on a redirect chain (A→B), the final hop's status wins:
-                // respReceived A sets 301, then after the chain advances to B,
-                // respReceived B overwrites to the final 200/404.
-                if st.main_request_id.as_deref() == Some(req_id) {
-                    if let Some(s) = event.params.get("status").and_then(|v| v.as_u64()) {
-                        st.status = u16::try_from(s).ok();
+                if let Some(s) = status {
+                    // Buffer response in case requestWillBeSent arrives out-of-order.
+                    st.responses.insert(req_id.clone(), (s, is_attach));
+
+                    if st.main_request_id.as_deref() == Some(&req_id) {
+                        let current_is_final =
+                            matches!(st.status, Some(code) if !(300..400).contains(&code));
+                        let new_is_final = !(300..400).contains(&s);
+
+                        // Once a final (non-3xx) status has been captured, do not allow
+                        // an out-of-order 3xx response to overwrite it.
+                        if !current_is_final || new_is_final {
+                            st.status = Some(s);
+                            st.is_attachment = is_attach;
+                            st.redirect_in_flight = (300..400).contains(&s);
+                        }
                     }
                 }
             }),
         );
-        let _guard_rr = SubscriptionGuard {
-            connection: &self.connection,
-            session_key: &session_key,
-            method: "Network.responseReceived",
-            id: rr_id,
-        };
+        let _guard_rr = SubscriptionGuard::session(
+            Arc::clone(&self.connection),
+            &session_key,
+            "Network.responseReceived",
+            rr_id,
+        );
 
         // -----------------------------------------------------------------------
 
         let mut params = json!({
             "url": url,
-            "frameId": self.frame_id,
+            "frameId": frame_id,
         });
         if let Some(ref referer) = options.referer {
             params["referer"] = json!(referer);
         }
 
-        let result = self.session().send_navigate_with_timeout(
-            "Page.navigate",
-            params,
-            &self.frame_id,
-            timeout,
-        )?;
-        let nav_id = result
-            .get("navigationId")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned());
+        let nav_token = self.execution_context_id.begin_navigation();
 
-        // Publish the nav_id so the requestWillBeSent handler can validate
-        // any speculatively accepted request.
-        *expected_nav_id.lock().unwrap() = nav_id.clone();
+        let navigate_inner = || -> Result<NavigateOutcome, ProtocolError> {
+            let result = self.session().send_navigate_with_timeout(
+                "Page.navigate",
+                params,
+                &frame_id,
+                timeout,
+            )?;
 
-        // Cross-document navigation invalidates the pre-nav exec context.
-        // Clear the cache so subsequent evaluate() calls wait for the new
-        // document's main-world context.
-        if nav_id.is_some() {
-            *self.execution_context_id.lock().unwrap() = None;
-        }
+            // If Browser.downloadCreated arrived before/with ack, short-circuit immediately.
+            if let Some(info) = download_state.lock().unwrap().info.clone() {
+                return Err(ProtocolError::navigation_became_download(
+                    Some("Page.navigate".into()),
+                    info,
+                ));
+            }
 
-        // If a lifecycle event was requested, block until it fires — but only
-        // for the time remaining against the single navigate deadline.
-        if let Some(event_name) = lifecycle_event {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            self.wait_for_lifecycle(event_name, remaining)?;
-        }
+            let nav_id = result
+                .get("navigationId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_owned());
 
-        // Poll briefly for the status code. The response typically arrives
-        // near-instantly after the navigate ack (or during the lifecycle wait).
-        // Cap at 500 ms so we don't meaningfully delay callers without
-        // --wait-until when Network events don't flow.
-        //
-        // Redirect-aware: a 3xx status means the chain is still in flight (the
-        // browser will issue the redirect-target request next), so we keep
-        // polling until a FINAL (non-3xx) status arrives or the cap elapses —
-        // otherwise we'd return the redirect hop's status (e.g. 301) instead of
-        // the final 200/404.
-        const MAX_STATUS_WAIT: Duration = Duration::from_millis(MAX_STATUS_WAIT_MS);
-        let status_cap = Instant::now() + MAX_STATUS_WAIT;
-        let effective_deadline = status_cap.min(deadline);
-        let is_final = |s: Option<u16>| matches!(s, Some(code) if !(300..400).contains(&code));
-        let status_code = loop {
-            {
-                let st = net_state.lock().unwrap();
-                if is_final(st.status) {
-                    break st.status;
+            // Publish the nav_id so the requestWillBeSent handler can validate
+            // any speculatively accepted request.
+            *expected_nav_id.lock().unwrap() = nav_id.clone();
+
+            // If a lifecycle event was requested, block until it fires or a downloadCreated
+            // event short-circuits the wait — but only for the time remaining against
+            // the single navigate deadline.
+            if let Some(event_name) = lifecycle_event {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                self.wait_for_lifecycle_internal(
+                    &frame_id,
+                    event_name,
+                    remaining,
+                    Some(&download_state),
+                )?;
+            }
+
+            // Poll briefly for the status code. The response typically arrives
+            // near-instantly after the navigate ack (or during the lifecycle wait).
+            // Cap at 500 ms so we don't meaningfully delay callers without
+            // --wait-until when Network events don't flow.
+            //
+            // Redirect-aware: a 3xx status or in-flight redirect continuation waits
+            // up to MAX_REDIRECT_WAIT_MS for the final (non-3xx) status, breaking
+            // immediately as soon as the final status arrives.
+            //
+            // Download-aware: if the main-document response specifies an attachment,
+            // we wait for Browser.downloadCreated (bounded by remaining deadline,
+            // up to MAX_ATTACHMENT_WAIT_MS). Non-download responses return as fast
+            // as before.
+            const MAX_STATUS_WAIT: Duration = Duration::from_millis(MAX_STATUS_WAIT_MS);
+            const MAX_ATTACHMENT_WAIT: Duration = Duration::from_millis(MAX_ATTACHMENT_WAIT_MS);
+            const MAX_REDIRECT_WAIT: Duration = Duration::from_millis(MAX_REDIRECT_WAIT_MS);
+            let status_cap = Instant::now() + MAX_STATUS_WAIT;
+            let is_final = |s: Option<u16>| matches!(s, Some(code) if !(300..400).contains(&code));
+            let mut attachment_deadline: Option<Instant> = None;
+            let mut redirect_deadline: Option<Instant> = None;
+
+            let status_code = loop {
+                if let Some(info) = download_state.lock().unwrap().info.clone() {
+                    return Err(ProtocolError::navigation_became_download(
+                        Some("Page.navigate".into()),
+                        info,
+                    ));
                 }
+
+                let (status, is_attachment, redirect_in_flight) = {
+                    let st = net_state.lock().unwrap();
+                    (st.status, st.is_attachment, st.redirect_in_flight)
+                };
+
+                if is_attachment {
+                    let dl_deadline = *attachment_deadline.get_or_insert_with(|| {
+                        (Instant::now() + MAX_ATTACHMENT_WAIT).min(deadline)
+                    });
+                    if Instant::now() >= dl_deadline {
+                        break status;
+                    }
+                } else if is_final(status) {
+                    break status;
+                } else if redirect_in_flight {
+                    let r_deadline = *redirect_deadline
+                        .get_or_insert_with(|| (Instant::now() + MAX_REDIRECT_WAIT).min(deadline));
+                    if Instant::now() >= r_deadline {
+                        break status;
+                    }
+                } else if Instant::now() >= status_cap.min(deadline) {
+                    // Return whatever we have (or None if no network events flowed).
+                    break status;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+
+            if let Some(info) = download_state.lock().unwrap().info.clone() {
+                return Err(ProtocolError::navigation_became_download(
+                    Some("Page.navigate".into()),
+                    info,
+                ));
             }
-            if Instant::now() >= effective_deadline {
-                // Return whatever we have (could be a 3xx if a redirect never
-                // resolved within the budget, or None if nothing arrived).
-                break net_state.lock().unwrap().status;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+
+            Ok(NavigateOutcome {
+                nav_id,
+                status_code,
+            })
         };
 
-        // _guard_rws and _guard_rr drop here — both handlers are deregistered
-        // on every exit path (success, error, timeout, panic).
-        Ok(NavigateOutcome {
-            nav_id,
-            status_code,
-        })
+        let res = navigate_inner();
+
+        match &res {
+            Ok(outcome) if outcome.nav_id.is_none() => {
+                self.execution_context_id.abort_navigation(nav_token);
+            }
+            Err(e)
+                if matches!(
+                    e.kind,
+                    ProtocolErrorKind::NavigationBecameDownload
+                        | ProtocolErrorKind::Timeout
+                        | ProtocolErrorKind::Response
+                        | ProtocolErrorKind::DialogOpened
+                ) =>
+            {
+                self.execution_context_id.abort_navigation(nav_token);
+            }
+            _ => {}
+        }
+
+        // _guard_dl, _guard_rws, and _guard_rr drop here — all handlers are
+        // deregistered on every exit path (success, error, timeout, panic).
+        res
     }
 
     /// Reload the page.
@@ -874,14 +1302,7 @@ impl MainFrame {
 
         // Decode base64 using a simple decoder. We avoid adding a dependency
         // on the `base64` crate by implementing a minimal decoder.
-        decode_base64(b64_data).map_err(|msg| ProtocolError {
-            kind: crate::protocol::errors::ProtocolErrorKind::Response,
-            method: Some("Page.screenshot".into()),
-            message: msg,
-            data: None,
-            source: None,
-            download_info: None,
-        })
+        decode_base64(b64_data).map_err(|msg| ProtocolError::response_msg("Page.screenshot", msg))
     }
 
     /// Describe a DOM node.
@@ -1003,8 +1424,13 @@ impl MainFrame {
     ///
     /// # Errors
     ///
-    /// Returns a [`ProtocolError`] if the command fails.
+    /// Returns a [`ProtocolError`] if the command fails. For a crashed renderer,
+    /// sends a best-effort close without waiting for a response.
     pub fn close(&self) -> Result<(), ProtocolError> {
+        if self.is_crashed() {
+            self.session().close_page_best_effort();
+            return Ok(());
+        }
         self.session().send("Page.close", json!({}))?;
         Ok(())
     }
@@ -1019,6 +1445,15 @@ impl MainFrame {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn dispatch_key_event(&self, params: KeyEventParams) -> Result<(), ProtocolError> {
+        self.dispatch_key_event_with_timeout(params, Duration::from_secs(60))
+    }
+
+    /// Dispatch input within an explicit command budget.
+    pub fn dispatch_key_event_with_timeout(
+        &self,
+        params: KeyEventParams,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
         let mut p = json!({
             "type": params.r#type,
             "keyCode": params.key_code,
@@ -1030,7 +1465,8 @@ impl MainFrame {
         if let Some(ref text) = params.text {
             p["text"] = json!(text);
         }
-        self.session().send("Page.dispatchKeyEvent", p)?;
+        self.session()
+            .send_with_timeout("Page.dispatchKeyEvent", p, timeout)?;
         Ok(())
     }
 
@@ -1040,8 +1476,17 @@ impl MainFrame {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn insert_text(&self, text: &str) -> Result<(), ProtocolError> {
+        self.insert_text_with_timeout(text, Duration::from_secs(60))
+    }
+
+    /// Insert text with an explicit command budget.
+    pub fn insert_text_with_timeout(
+        &self,
+        text: &str,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
         self.session()
-            .send("Page.insertText", json!({ "text": text }))?;
+            .send_with_timeout("Page.insertText", json!({ "text": text }), timeout)?;
         Ok(())
     }
 
@@ -1051,6 +1496,15 @@ impl MainFrame {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn dispatch_mouse_event(&self, params: MouseEventParams) -> Result<(), ProtocolError> {
+        self.dispatch_mouse_event_with_timeout(params, Duration::from_secs(60))
+    }
+
+    /// Dispatch input within an explicit command budget.
+    pub fn dispatch_mouse_event_with_timeout(
+        &self,
+        params: MouseEventParams,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
         let mut p = json!({
             "type": params.r#type,
             "button": params.button,
@@ -1062,7 +1516,8 @@ impl MainFrame {
         if let Some(cc) = params.click_count {
             p["clickCount"] = json!(cc);
         }
-        self.session().send("Page.dispatchMouseEvent", p)?;
+        self.session()
+            .send_with_timeout("Page.dispatchMouseEvent", p, timeout)?;
         Ok(())
     }
 
@@ -1120,7 +1575,9 @@ impl MainFrame {
             if let Some(text) = prompt_text {
                 params["promptText"] = json!(text);
             }
-            s.send_may_fail("Page.handleDialog", params);
+            if s.send_may_fail("Page.handleDialog", params).is_some() {
+                self.dialog.clear(dialog_id);
+            }
         }
     }
 
@@ -1128,7 +1585,13 @@ impl MainFrame {
     // Runtime domain methods
     // -----------------------------------------------------------------------
 
-    /// Evaluate a JavaScript expression in the top-frame main world.
+    /// Evaluate a JavaScript expression in the top-frame execution context.
+    ///
+    /// On Camoufox 158+, `Runtime.evaluate` runs in an **isolated** world.
+    /// The DOM is shared with the page, but JavaScript globals set by page
+    /// scripts (e.g. `window.__my_global`) are not visible here.
+    /// To evaluate expressions in the page's main world, see
+    /// [`evaluate_main_world`](Self::evaluate_main_world).
     ///
     /// Polls the cached execution context (up to `timeout`); if `evaluate`
     /// fails with a "context destroyed" error (typical during SPA
@@ -1151,53 +1614,132 @@ impl MainFrame {
         expression: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, ProtocolError> {
+        self.evaluate_raw(None, expression, true, timeout)
+    }
+
+    /// Evaluate a JavaScript expression in the page's MAIN world via an injected `<script>` bridge.
+    ///
+    /// On Camoufox 158+, [`evaluate`](Self::evaluate) runs in an isolated world where page-defined
+    /// globals (e.g. `window.__click_result`) are not accessible. This method bridges into the
+    /// page's main execution context by injecting a temporary `<script>` element that evaluates
+    /// `expression` with indirect `(0, eval)(...)` in the global scope and returns the result
+    /// via a dataset attribute on `document.documentElement`.
+    ///
+    /// # Synchronous expressions only
+    ///
+    /// This method evaluates synchronous expressions only. Promises are **not** awaited;
+    /// evaluating an expression that returns a Promise yields a Promise object representation
+    /// (typically `{}`), not its resolved value.
+    ///
+    /// # Stealth trade-off
+    ///
+    /// Because this method injects and immediately removes a `<script>` tag into the DOM,
+    /// page-level JavaScript can potentially observe it via a `MutationObserver` or Content
+    /// Security Policy (CSP) violation reports if inline scripts are prohibited.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProtocolError`] if:
+    /// - The main-world script did not execute (e.g. CSP blocked inline scripts or JS is disabled).
+    /// - Evaluating `expression` in the page throws an uncaught JavaScript error (the error message is preserved).
+    /// - Communication with the browser times out or fails.
+    pub fn evaluate_main_world(
+        &self,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.evaluate_main_world_scoped(None, expression, timeout)
+    }
+
+    pub(crate) fn evaluate_in_frame_raw(
+        &self,
+        frame_id: &str,
+        expression: &str,
+        return_by_value: bool,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.evaluate_raw(Some(frame_id), expression, return_by_value, timeout)
+    }
+
+    fn evaluate_raw(
+        &self,
+        frame_id: Option<&str>,
+        expression: &str,
+        return_by_value: bool,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
         const MAX_RETRIES: u32 = 5;
         let deadline = Instant::now() + timeout;
         let mut bad_ctx: Option<String> = None;
 
         for attempt in 0..=MAX_RETRIES {
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 break;
             }
 
-            // Acquire a usable execution context, skipping any known-bad one.
             let exec_ctx = loop {
-                let cur = self.execution_context_id.lock().unwrap().clone();
+                if self.connection.rejects_sends() || self.session().is_closed() {
+                    return Err(ProtocolError::closed(Some("Runtime.evaluate".into())));
+                }
+                let tracker = match frame_id {
+                    Some(id) => self.frame_ctx(id).ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorKind::FrameDetached,
+                            Some("Runtime.evaluate".into()),
+                            "frame was detached",
+                        )
+                    })?,
+                    None => Arc::clone(&self.execution_context_id),
+                };
+                let cur = tracker.current();
                 match cur {
                     Some(c) if bad_ctx.as_ref() != Some(&c) => break c,
                     _ => {
-                        *self.execution_context_id.lock().unwrap() = None;
-                        if Instant::now() >= deadline {
-                            return Err(ProtocolError {
-                                kind: ProtocolErrorKind::Closed,
-                                method: Some("Runtime.evaluate".into()),
-                                message: "timed out waiting for execution context".into(),
-                                data: None,
-                                source: None,
-                                download_info: None,
-                            });
+                        if let Some(ref c) = cur {
+                            tracker.invalidate(c);
                         }
-                        std::thread::sleep(Duration::from_millis(100));
+                        if Instant::now() >= deadline {
+                            return Err(ProtocolError::timeout_msg(
+                                "Runtime.evaluate",
+                                "timed out waiting for execution context",
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(if frame_id.is_none() {
+                            100
+                        } else {
+                            50
+                        }));
                     }
                 }
             };
 
-            match self.session().send(
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                break;
+            }
+
+            match self.session().send_with_timeout(
                 "Runtime.evaluate",
                 json!({
                     "expression": expression,
-                    "returnByValue": true,
+                    "returnByValue": return_by_value,
                     "executionContextId": &exec_ctx,
                 }),
+                remaining,
             ) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     let msg = format!("{e}");
-                    let is_ctx_err =
-                        msg.contains("execution context") || msg.contains("Failed to find");
+                    let is_ctx_err = is_context_error(&msg);
                     if attempt < MAX_RETRIES && is_ctx_err {
                         bad_ctx = Some(exec_ctx);
-                        std::thread::sleep(Duration::from_millis(300));
+                        std::thread::sleep(Duration::from_millis(if frame_id.is_none() {
+                            300
+                        } else {
+                            150
+                        }));
                         continue;
                     }
                     return Err(e);
@@ -1205,14 +1747,181 @@ impl MainFrame {
             }
         }
 
-        Err(ProtocolError {
-            kind: ProtocolErrorKind::Closed,
-            method: Some("Runtime.evaluate".into()),
-            message: format!("evaluate failed after {MAX_RETRIES} retries"),
-            data: None,
-            source: None,
-            download_info: None,
-        })
+        Err(ProtocolError::timeout_msg(
+            "Runtime.evaluate",
+            format!("evaluate failed after {MAX_RETRIES} retries"),
+        ))
+    }
+
+    /// Evaluate a JavaScript expression inside a specific frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProtocolError`] if waiting for the frame context times out or evaluation fails.
+    pub fn evaluate_in_frame(
+        &self,
+        frame_id: &str,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.evaluate_in_frame_raw(frame_id, expression, true, timeout)
+    }
+
+    /// Evaluate a JavaScript expression in a frame's MAIN world via an injected `<script>` bridge.
+    pub fn evaluate_main_world_in_frame(
+        &self,
+        frame_id: &str,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.evaluate_main_world_scoped(Some(frame_id), expression, timeout)
+    }
+
+    fn evaluate_main_world_scoped(
+        &self,
+        frame_id: Option<&str>,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let token = generate_main_world_token();
+        let snippet = build_evaluate_main_world_snippet(expression, &token);
+        let raw = self.evaluate_raw(frame_id, &snippet, true, timeout)?;
+
+        let envelope_val = raw.pointer("/result/value").or_else(|| raw.get("value"));
+
+        let bridge: serde_json::Value = match envelope_val {
+            Some(serde_json::Value::String(s)) => serde_json::from_str(s).map_err(|e| {
+                ProtocolError::response_msg(
+                    "Runtime.evaluate",
+                    format!("failed to parse main-world bridge response: {e}"),
+                )
+            })?,
+            Some(obj @ serde_json::Value::Object(_)) => obj.clone(),
+            Some(serde_json::Value::Null) | None => {
+                return Err(ProtocolError::response_msg(
+                    "Runtime.evaluate",
+                    "main-world script was blocked (likely the page's Content-Security-Policy); relaunch with `camoufox launch --bypass-csp`",
+                ));
+            }
+            Some(other) => {
+                return Err(ProtocolError::response_msg(
+                    "Runtime.evaluate",
+                    format!("unexpected main-world bridge response: {other:?}"),
+                ));
+            }
+        };
+
+        if bridge.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            let err_msg = bridge
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("main-world script evaluation failed");
+            return Err(ProtocolError::response_msg("Runtime.evaluate", err_msg));
+        }
+
+        let value = bridge
+            .get("value")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        Ok(value)
+    }
+
+    /// Resolve a child frame matching `iframe_selector` inside `parent_frame_id`.
+    ///
+    /// Returns the child frame ID, without measuring geometry.
+    pub fn resolve_child_frame(
+        &self,
+        parent_frame_id: &str,
+        iframe_selector: &str,
+        timeout: Duration,
+    ) -> Result<String, ProtocolError> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = Instant::now() + timeout;
+        let q = js_query(iframe_selector);
+
+        let rem = deadline.saturating_duration_since(Instant::now());
+        let prefix = |mut e: ProtocolError| {
+            e.message = format!("--frame {iframe_selector}: {}", e.message);
+            e
+        };
+        let obj_raw = self
+            .evaluate_in_frame_raw(parent_frame_id, &q, false, rem)
+            .map_err(prefix)?;
+        if let Some(exc) = obj_raw.get("exceptionDetails") {
+            let error = crate::api::selectors::selector_exception(exc);
+            return Err(prefix(error));
+        }
+        let object_id = match obj_raw.pointer("/result/objectId").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::FrameNotFound,
+                    Some("Runtime.evaluate".into()),
+                    format!("--frame {iframe_selector}: no element matches"),
+                ));
+            }
+        };
+
+        let desc = self.session().send_with_timeout(
+            "Page.describeNode",
+            json!({"frameId": parent_frame_id, "objectId": object_id}),
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        // Release the remote handle. Juggler requires the owning context id;
+        // without it the call fails and the handle leaks in the page.
+        if let Some(ctx_id) = self.frame_ctx(parent_frame_id).and_then(|t| t.current()) {
+            let _ = self.session().send_with_timeout(
+                "Runtime.disposeObject",
+                json!({"executionContextId": ctx_id, "objectId": object_id}),
+                deadline.saturating_duration_since(Instant::now()),
+            );
+        }
+        let desc = desc.map_err(|mut e| {
+            e.message = format!("--frame {iframe_selector}: {}", e.message);
+            e
+        })?;
+
+        let child_frame_id = match desc.get("contentFrameId").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::NotIframe,
+                    Some("Page.describeNode".into()),
+                    format!("--frame {iframe_selector}: element is not an iframe"),
+                ));
+            }
+        };
+
+        // 3. Wait (bounded by remaining timeout) until child frame tracker has a current context
+        loop {
+            if self.connection.rejects_sends() || self.session().is_closed() {
+                return Err(ProtocolError::closed_with(
+                    "Runtime.evaluate",
+                    format!("--frame {iframe_selector}: Session closed"),
+                ));
+            }
+            if let Some(tracker) = self.frame_ctx(&child_frame_id) {
+                if tracker.current().is_some() {
+                    break;
+                }
+            } else {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::FrameDetached,
+                    Some("Runtime.evaluate".into()),
+                    format!("--frame {iframe_selector}: frame was detached"),
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(ProtocolError::timeout_msg(
+                    "Runtime.evaluate",
+                    format!("--frame {iframe_selector}: frame has no JavaScript context yet"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        Ok(child_frame_id)
     }
 
     /// Call a JavaScript function with arguments.
@@ -1351,14 +2060,8 @@ impl MainFrame {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let body = decode_base64(b64).map_err(|msg| ProtocolError {
-            kind: crate::protocol::errors::ProtocolErrorKind::Response,
-            method: Some("Network.getResponseBody".into()),
-            message: msg,
-            data: None,
-            source: None,
-            download_info: None,
-        })?;
+        let body = decode_base64(b64)
+            .map_err(|msg| ProtocolError::response_msg("Network.getResponseBody", msg))?;
 
         Ok((body, evicted))
     }
@@ -1565,7 +2268,7 @@ impl std::fmt::Debug for MainFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MainFrame")
             .field("target_id", &self.target_id)
-            .field("frame_id", &self.frame_id)
+            .field("frame_id", &self.frame_id())
             .finish_non_exhaustive()
     }
 }
@@ -1623,6 +2326,61 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+/// Context error detection helper for evaluate retry logic (D10.2).
+pub(crate) fn is_context_error(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("execution context") || msg.contains("Failed to find")
+}
+
+static MAIN_WORLD_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn generate_main_world_token() -> String {
+    let count = MAIN_WORLD_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("cfx{time}x{count}")
+}
+
+/// Escape a string into a JSON string literal with U+2028 and U+2029 line terminators escaped.
+pub(crate) fn escape_js_json_literal(s: &str) -> String {
+    let json = serde_json::to_string(s).expect("serde_json::to_string on string is infallible");
+    json.replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Build the isolated-world JavaScript snippet used to evaluate code in the main world (D5).
+fn build_evaluate_main_world_snippet(expression: &str, token: &str) -> String {
+    let expr_literal = escape_js_json_literal(expression);
+    let token_literal = escape_js_json_literal(token);
+
+    format!(
+        "(() => {{\
+           const token = {token_literal};\
+           const src = {expr_literal};\
+           let direct = true;\
+           try {{ new Function(\"return (\" + src + \"\\n)\"); }} catch (_) {{ direct = false; }}\
+           const body = direct \
+             ? \"(function(){{try{{document.documentElement.dataset[\" + JSON.stringify(token) + \"]=JSON.stringify({{ok:true,value:(function(){{return (\" + src + \"\\n)}})()??null}})}}catch(e){{document.documentElement.dataset[\" + JSON.stringify(token) + \"]=JSON.stringify({{ok:false,error:String(e)}})}}}})()\" \
+             : \"(function(){{try{{document.documentElement.dataset[\" + JSON.stringify(token) + \"]=JSON.stringify({{ok:true,value:(0, eval)(\" + JSON.stringify(src) + \")??null}})}}catch(e){{document.documentElement.dataset[\" + JSON.stringify(token) + \"]=JSON.stringify({{ok:false,error:String(e)}})}}}})()\"; \
+           const script = document.createElement(\"script\");\
+           const nonceSrc = document.querySelector(\"script[nonce]\");\
+           if (nonceSrc && nonceSrc.nonce) script.nonce = nonceSrc.nonce;\
+           script.textContent = body;\
+           const parent = document.head || document.documentElement;\
+           if (!parent) return null;\
+           parent.appendChild(script);\
+           script.remove();\
+           const res = document.documentElement.dataset[token];\
+           if (res !== undefined) {{\
+             delete document.documentElement.dataset[token];\
+             return res;\
+           }}\
+           return null;\
+         }})()"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1652,6 +2410,168 @@ mod tests {
         assert!(decode_base64("SGVs!G8=").is_err());
     }
 
+    // -- Context error helper unit test (D10.2) -----------------------------
+
+    #[test]
+    fn test_is_context_error() {
+        assert!(is_context_error("execution context was destroyed"));
+        assert!(is_context_error(
+            "Cannot find execution context with id 123"
+        ));
+        assert!(is_context_error("Failed to find execution context"));
+        assert!(is_context_error("Failed to find world"));
+        assert!(!is_context_error("ReferenceError: foo is not defined"));
+        assert!(!is_context_error("SyntaxError: Unexpected token '<'"));
+        assert!(!is_context_error("Session closed"));
+        assert!(!is_context_error(""));
+    }
+
+    // -- Snippet builder unit tests (D5) ------------------------------------
+
+    #[test]
+    fn test_build_evaluate_main_world_snippet_structure_and_safety() {
+        let token = "cfx_test_token_123";
+        let expr = "window.__click_result = { a: 1 };";
+        let snippet = build_evaluate_main_world_snippet(expr, token);
+
+        // Builder must use textContent, not innerHTML
+        assert!(snippet.contains("script.textContent ="));
+        assert!(!snippet.contains("innerHTML"));
+
+        // Must use indirect eval
+        assert!(snippet.contains("(0, eval)("));
+
+        // Must read and delete dataset attribute
+        assert!(snippet.contains("document.documentElement.dataset[token]"));
+        assert!(snippet.contains("delete document.documentElement.dataset[token]"));
+
+        // Expression appears ONLY as a JSON string literal
+        let expected_literal = serde_json::to_string(expr).unwrap();
+        assert!(snippet.contains(&expected_literal));
+        assert_eq!(
+            snippet.matches(&expected_literal).count(),
+            1,
+            "expression must appear exactly once as a JSON string literal"
+        );
+        // Raw code is never spliced directly
+        assert!(!snippet.contains("eval(window.__click_result"));
+    }
+
+    #[test]
+    fn test_build_evaluate_main_world_snippet_escapes_u2028_u2029() {
+        let token = "cfx_test_u2028";
+        let expr_with_separators = "var msg = 'line1\u{2028}line2\u{2029}line3';";
+        let snippet = build_evaluate_main_world_snippet(expr_with_separators, token);
+
+        assert!(
+            !snippet.contains('\u{2028}'),
+            "U+2028 must be escaped in snippet"
+        );
+        assert!(
+            !snippet.contains('\u{2029}'),
+            "U+2029 must be escaped in snippet"
+        );
+        assert!(snippet.contains(r"\u2028"));
+        assert!(snippet.contains(r"\u2029"));
+
+        // Token with U+2028/U+2029 is also escaped
+        let tricky_token = "tok\u{2028}en\u{2029}";
+        let snippet_token = build_evaluate_main_world_snippet("1", tricky_token);
+        assert!(!snippet_token.contains('\u{2028}'));
+        assert!(!snippet_token.contains('\u{2029}'));
+    }
+
+    #[test]
+    fn test_build_evaluate_main_world_snippet_breakout_resistance() {
+        let token = "cfx_breakout";
+        let tricky_expr = r#"console.log("</script><script>alert('xss')</script>"); let s = "\"quotes\\and\\backslashes\"";"#;
+        let snippet = build_evaluate_main_world_snippet(tricky_expr, token);
+
+        // Builder uses textContent
+        assert!(snippet.contains("script.textContent ="));
+        assert!(!snippet.contains("innerHTML"));
+
+        // Tricky expression appears as valid JSON string literal
+        let tricky_literal = serde_json::to_string(tricky_expr).unwrap();
+        assert!(snippet.contains(&tricky_literal));
+
+        // It does not contain an unescaped breakout
+        assert!(!snippet.contains(
+            "script.textContent = \"(() => { let out; try { const val = (0, eval)(console.log"
+        ));
+    }
+
+    fn extract_page_script_for_test(s: &str) -> String {
+        if let Some(rest) = s.split("script.textContent = \"").nth(1) {
+            if let Some(end) = rest.find("\";") {
+                return rest[..end].to_string();
+            }
+        }
+        if let Some(rest) = s.split("const body = direct ? ").nth(1) {
+            if let Some(end) = rest.find("; const script") {
+                return rest[..end].to_string();
+            }
+        }
+        String::new()
+    }
+
+    #[test]
+    fn bridge_snippet_declares_no_page_scope_bindings() {
+        let s = build_evaluate_main_world_snippet("window.val", "tok");
+        let page_script = extract_page_script_for_test(&s);
+        for kw in ["const ", "let ", "var "] {
+            assert!(
+                !page_script.contains(kw),
+                "page script declares `{kw}`: {page_script}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_uses_direct_form_for_expressions_and_eval_for_statements() {
+        let s = build_evaluate_main_world_snippet("1 + 1", "tok");
+        assert!(
+            s.contains("new Function"),
+            "isolated-world pre-parse must decide the form"
+        );
+    }
+
+    #[test]
+    fn bridge_null_result_reports_csp_hint() {
+        let h = build_mock_frame("page-csp", "frame-csp");
+        h.frame
+            .execution_context_handle()
+            .on_created("ctx-1".into());
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let id = sent["id"].as_i64().unwrap();
+            in_tx
+                .send(RawMessage {
+                    id: Some(id),
+                    method: None,
+                    params: None,
+                    result: Some(serde_json::json!({
+                        "result": { "type": "object", "value": serde_json::Value::Null }
+                    })),
+                    error: None,
+                    session_id: Some("page-csp".into()),
+                })
+                .unwrap();
+        });
+        let err = h
+            .frame
+            .evaluate_main_world("1 + 1", Duration::from_secs(5))
+            .unwrap_err();
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+        assert!(
+            err.to_string().contains("--bypass-csp"),
+            "error must mention --bypass-csp, got: {err}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Regression: `navigate` must honor its `timeout: Duration` parameter.
     //
@@ -1666,10 +2586,53 @@ mod tests {
     use crate::protocol::errors::ProtocolErrorKind;
     use crate::protocol::types::RawMessage;
     use crate::transport::errors::TransportError;
-    use crate::transport::Transport;
+    use crate::transport::{Transport, TransportReader, TransportWriter};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc as StdArc;
+
+    struct SilentMockWriter {
+        closed: StdArc<AtomicBool>,
+        outgoing: mpsc::Sender<serde_json::Value>,
+    }
+
+    impl TransportWriter for SilentMockWriter {
+        fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(TransportError::Closed);
+            }
+            let _ = self.outgoing.send(message.clone());
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    struct SilentMockReader {
+        closed: StdArc<AtomicBool>,
+    }
+
+    impl TransportReader for SilentMockReader {
+        fn receive(&mut self) -> Result<RawMessage, TransportError> {
+            loop {
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(TransportError::Closed);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
 
     /// Silent mock transport: send drops messages, receive blocks until
     /// the transport is closed (then returns Closed).
@@ -1680,30 +2643,16 @@ mod tests {
     }
 
     impl Transport for SilentMockTransport {
-        fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
-            if self.closed.load(Ordering::SeqCst) {
-                return Err(TransportError::Closed);
-            }
-            let _ = self.outgoing.send(message.clone());
-            Ok(())
-        }
-
-        fn receive(&mut self) -> Result<RawMessage, TransportError> {
-            loop {
-                if self.closed.load(Ordering::SeqCst) {
-                    return Err(TransportError::Closed);
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-
-        fn close(&mut self) -> Result<(), TransportError> {
-            self.closed.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn is_closed(&self) -> bool {
-            self.closed.load(Ordering::SeqCst)
+        fn into_split(self: Box<Self>) -> (Box<dyn TransportWriter>, Box<dyn TransportReader>) {
+            (
+                Box::new(SilentMockWriter {
+                    closed: StdArc::clone(&self.closed),
+                    outgoing: self.outgoing,
+                }),
+                Box::new(SilentMockReader {
+                    closed: StdArc::clone(&self.closed),
+                }),
+            )
         }
     }
 
@@ -1718,13 +2667,15 @@ mod tests {
         let conn = Connection::new(Box::new(transport));
         let conn_arc = StdArc::new(conn);
         let session = conn_arc.root_session(); // root session is fine for this test
-        let exec_ctx = StdArc::new(Mutex::new(None));
+        let exec_ctx = StdArc::new(ExecContextTracker::new());
         let main_frame = MainFrame::new(
             session,
             "target-test".to_owned(),
             "frame-test".to_owned(),
             exec_ctx,
             StdArc::clone(&conn_arc),
+            Vec::new(),
+            crate::api::DialogPolicy::Manual,
         );
 
         let start = Instant::now();
@@ -1772,15 +2723,12 @@ mod tests {
     // message injection, mirroring the pattern in protocol::client::tests.
     // -----------------------------------------------------------------------
 
-    /// A full mock transport: `receive()` blocks on a channel of injected
-    /// `RawMessage`s; `send()` forwards to an outgoing channel.
-    struct MockTransport {
-        incoming_rx: mpsc::Receiver<RawMessage>,
+    struct MockWriter {
         outgoing_tx: mpsc::Sender<serde_json::Value>,
         closed: StdArc<AtomicBool>,
     }
 
-    impl Transport for MockTransport {
+    impl TransportWriter for MockWriter {
         fn send(&mut self, message: &serde_json::Value) -> Result<(), TransportError> {
             if self.closed.load(Ordering::SeqCst) {
                 return Err(TransportError::Closed);
@@ -1789,6 +2737,22 @@ mod tests {
             Ok(())
         }
 
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    struct MockReader {
+        incoming_rx: mpsc::Receiver<RawMessage>,
+        closed: StdArc<AtomicBool>,
+    }
+
+    impl TransportReader for MockReader {
         fn receive(&mut self) -> Result<RawMessage, TransportError> {
             loop {
                 if self.closed.load(Ordering::SeqCst) {
@@ -1804,13 +2768,31 @@ mod tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
-            self.closed.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
         fn is_closed(&self) -> bool {
             self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A full mock transport: `receive()` blocks on a channel of injected
+    /// `RawMessage`s; `send()` forwards to an outgoing channel.
+    struct MockTransport {
+        incoming_rx: mpsc::Receiver<RawMessage>,
+        outgoing_tx: mpsc::Sender<serde_json::Value>,
+        closed: StdArc<AtomicBool>,
+    }
+
+    impl Transport for MockTransport {
+        fn into_split(self: Box<Self>) -> (Box<dyn TransportWriter>, Box<dyn TransportReader>) {
+            (
+                Box::new(MockWriter {
+                    outgoing_tx: self.outgoing_tx,
+                    closed: StdArc::clone(&self.closed),
+                }),
+                Box::new(MockReader {
+                    incoming_rx: self.incoming_rx,
+                    closed: StdArc::clone(&self.closed),
+                }),
+            )
         }
     }
 
@@ -1842,13 +2824,15 @@ mod tests {
         let page_session = conn.create_session(session_key.to_owned());
         let conn_arc = StdArc::new(conn);
 
-        let exec_ctx = StdArc::new(Mutex::new(None::<String>));
+        let exec_ctx = StdArc::new(ExecContextTracker::new());
         let frame = MainFrame::new(
             page_session,
             "target-test".to_owned(),
             frame_id.to_owned(),
             StdArc::clone(&exec_ctx),
             StdArc::clone(&conn_arc),
+            Vec::new(),
+            crate::api::DialogPolicy::Manual,
         );
 
         MockFrameHarness {
@@ -1858,6 +2842,194 @@ mod tests {
             out_rx,
             closed,
         }
+    }
+
+    #[test]
+    fn context_wait_returns_closed_promptly_when_connection_closes() {
+        let h = build_mock_frame("closing", "main");
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let evaluate = scope.spawn(|| h.frame.evaluate("1", Duration::from_secs(3)));
+            std::thread::sleep(Duration::from_millis(50));
+            h.conn.close().unwrap();
+            let error = evaluate.join().unwrap().unwrap_err();
+            assert_eq!(error.kind, ProtocolErrorKind::Closed, "{error}");
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+        });
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn frame_describe_failure_preserves_error_and_evaluate_method() {
+        for fail_evaluate in [false, true] {
+            let h = build_mock_frame("errors", "main");
+            h.frame.execution_context_handle().on_created("ctx".into());
+            let tx = h.in_tx.clone();
+            let rx = h.out_rx;
+            let responder = std::thread::spawn(move || loop {
+                let sent = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let method = sent["method"].as_str().unwrap();
+                let (result, error) = match method {
+                    "Runtime.evaluate" if fail_evaluate => {
+                        (Some(json!({"exceptionDetails":{"value":42}})), None)
+                    }
+                    "Runtime.evaluate" if sent["params"]["returnByValue"] == true => {
+                        (Some(json!({"result":{"value":[0,0,1,1]}})), None)
+                    }
+                    "Runtime.evaluate" => (Some(json!({"result":{"objectId":"obj"}})), None),
+                    "Page.describeNode" => (
+                        None,
+                        Some(crate::protocol::types::ErrorData {
+                            message: "session was closed".into(),
+                            data: None,
+                        }),
+                    ),
+                    "Runtime.disposeObject" => (Some(json!({})), None),
+                    _ => panic!("unexpected {method}"),
+                };
+                let done = fail_evaluate || method == "Runtime.disposeObject";
+                tx.send(RawMessage {
+                    id: sent["id"].as_i64(),
+                    method: None,
+                    params: None,
+                    result,
+                    error,
+                    session_id: Some("errors".into()),
+                })
+                .unwrap();
+                if done {
+                    break;
+                }
+            });
+            let err = h
+                .frame
+                .resolve_child_frame("main", "#frame", Duration::from_secs(2))
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("--frame #frame:"), "{msg}");
+            assert!(!msg.contains("not an iframe"), "{msg}");
+            if fail_evaluate {
+                assert!(
+                    msg.contains("Runtime.evaluate") && msg.contains("42"),
+                    "{msg}"
+                );
+            } else {
+                assert!(msg.contains("session was closed"), "{msg}");
+            }
+            responder.join().unwrap();
+            h.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn dialog_event(method: &str, params: serde_json::Value) -> RawMessage {
+        RawMessage {
+            id: None,
+            method: Some(method.into()),
+            params: Some(params),
+            result: None,
+            error: None,
+            session_id: Some("page-d".into()),
+        }
+    }
+
+    #[test]
+    fn dialog_opened_sets_pending_and_rejects_in_flight() {
+        let h = build_mock_frame("page-d", "frame-d");
+        std::thread::scope(|s| {
+            let request = s.spawn(|| {
+                h.frame.navigate(
+                    "http://localhost/",
+                    Default::default(),
+                    Duration::from_secs(5),
+                )
+            });
+            h.out_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            h.in_tx
+                .send(dialog_event(
+                    "Page.dialogOpened",
+                    json!({"dialogId":"d1","type":"confirm","message":"Delete?"}),
+                ))
+                .unwrap();
+            let err = request.join().unwrap().unwrap_err();
+            assert_eq!(err.kind, ProtocolErrorKind::DialogOpened);
+            assert!(err.message.contains("Delete?"));
+        });
+        assert_eq!(h.frame.pending_dialog().unwrap().kind, "confirm");
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn dialog_closed_clears_pending() {
+        let h = build_mock_frame("page-d", "frame-d");
+        h.in_tx
+            .send(dialog_event(
+                "Page.dialogOpened",
+                json!({"dialogId":"d1","type":"alert","message":"hi"}),
+            ))
+            .unwrap();
+        h.in_tx
+            .send(dialog_event("Page.dialogClosed", json!({"dialogId":"d1"})))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while h.frame.last_dialog().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(h.frame.pending_dialog().is_none());
+        assert_eq!(h.frame.last_dialog().unwrap().id, "d1");
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn accept_policy_sends_handle_dialog_off_reader_thread() {
+        let h = build_mock_frame("page-d", "frame-d");
+        h.frame.set_dialog_policy(crate::api::DialogPolicy::Accept);
+        h.in_tx
+            .send(dialog_event(
+                "Page.dialogOpened",
+                json!({"dialogId":"d1","type":"prompt","message":"Name?","defaultValue":"Joe"}),
+            ))
+            .unwrap();
+        let sent = h.out_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(sent["method"], "Page.handleDialog");
+        assert_eq!(
+            sent["params"],
+            json!({"dialogId":"d1","accept":true,"promptText":"Joe"})
+        );
+        h.in_tx
+            .send(dialog_event("Page.dialogClosed", json!({"dialogId":"d1"})))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while h.frame.last_dialog().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(h.frame.last_dialog().unwrap().id, "d1");
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn dialog_listeners_removed_when_frame_dropped() {
+        let h = build_mock_frame("page-d", "frame-d");
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-d", "Page.dialogOpened"),
+            1
+        );
+        drop(h.frame);
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-d", "Page.dialogOpened"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-d", "Page.dialogClosed"),
+            0
+        );
+        h.closed.store(true, Ordering::SeqCst);
     }
 
     /// Helper: build a `Page.navigate` success response for a given request id.
@@ -2097,6 +3269,7 @@ mod tests {
     /// G3 TDD case 3d: IPC serde round-trip — `DaemonRequest::Navigate` with
     /// `wait_until` field serialises and deserialises correctly.
     #[test]
+    #[cfg(feature = "cli")]
     fn navigate_ipc_wait_until_serde_round_trip() {
         use crate::cli::ipc::DaemonRequest;
 
@@ -2529,6 +3702,7 @@ mod tests {
     /// G4 TDD case 3: navigate response IPC serde includes `status_code`.
     /// Absence is backward-compatible (legacy callers ignore unknown fields).
     #[test]
+    #[cfg(feature = "cli")]
     fn navigate_response_serde_includes_status_code() {
         use crate::cli::ipc::DaemonResponse;
 
@@ -2578,6 +3752,7 @@ mod tests {
     /// G4 TDD case 4: `print_response` in human mode prints the status code
     /// when present.
     #[test]
+    #[cfg(feature = "cli")]
     fn print_response_shows_status_code() {
         use crate::cli::ipc::DaemonResponse;
         use crate::cli::output::print_response;
@@ -2855,5 +4030,714 @@ mod tests {
         );
 
         h.closed.store(true, Ordering::SeqCst);
+    }
+
+    // -----------------------------------------------------------------------
+    // Download detection unit tests
+    // -----------------------------------------------------------------------
+
+    fn download_created_msg(frame_id: &str, url: &str, uuid: &str) -> RawMessage {
+        RawMessage {
+            id: None,
+            method: Some("Browser.downloadCreated".to_owned()),
+            params: Some(serde_json::json!({
+                "frameId": frame_id,
+                "url": url,
+                "uuid": uuid,
+            })),
+            result: None,
+            error: None,
+            session_id: None,
+        }
+    }
+
+    fn response_received_with_headers_msg(
+        request_id: &str,
+        status: u16,
+        headers: serde_json::Value,
+        session_key: &str,
+    ) -> RawMessage {
+        RawMessage {
+            id: None,
+            method: Some("Network.responseReceived".to_owned()),
+            params: Some(serde_json::json!({
+                "requestId": request_id,
+                "status": status,
+                "statusText": "OK",
+                "headers": headers,
+                "fromServiceWorker": false,
+            })),
+            result: None,
+            error: None,
+            session_id: Some(session_key.to_owned()),
+        }
+    }
+
+    /// (a) ack, then 200 response with an attachment header, then downloadCreated
+    /// → Err NavigationBecameDownload with url/frame/uuid.
+    #[test]
+    fn navigate_attachment_response_then_download_created_returns_error() {
+        let h = build_mock_frame("page-dla", "frame-dla");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+
+            in_tx
+                .send(navigate_success_response(id, "page-dla"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-dla",
+                    "page-dla",
+                ))
+                .expect("send rws");
+            in_tx
+                .send(response_received_with_headers_msg(
+                    "req-1",
+                    200,
+                    serde_json::json!([
+                        {"name": "Content-Disposition", "value": "attachment; filename=\"report.pdf\""}
+                    ]),
+                    "page-dla",
+                ))
+                .expect("send respReceived with attachment");
+
+            std::thread::sleep(Duration::from_millis(15));
+            in_tx
+                .send(download_created_msg(
+                    "frame-dla",
+                    "https://example.com/report.pdf",
+                    "dl-uuid-123",
+                ))
+                .expect("send downloadCreated");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com/report.pdf",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let err = result.expect_err("navigate to attachment must return Err");
+        assert_eq!(
+            err.kind,
+            ProtocolErrorKind::NavigationBecameDownload,
+            "expected NavigationBecameDownload, got {:?}",
+            err.kind
+        );
+        let info = err.download_info.expect("download_info populated");
+        assert_eq!(info.url, "https://example.com/report.pdf");
+        assert_eq!(info.frame_id.as_deref(), Some("frame-dla"));
+        assert_eq!(info.download_id.as_deref(), Some("dl-uuid-123"));
+
+        // (e) No handlers leak after navigate.
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("", "Browser.downloadCreated"),
+            0,
+            "Browser.downloadCreated handler must not leak"
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dla", "Network.requestWillBeSent"),
+            0,
+            "Network.requestWillBeSent handler must not leak"
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dla", "Network.responseReceived"),
+            0,
+            "Network.responseReceived handler must not leak"
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dla", "Page.eventFired"),
+            0,
+            "Page.eventFired handler must not leak"
+        );
+    }
+
+    /// (b) ack, then downloadCreated during wait_until=load → Err promptly
+    /// (well before the timeout).
+    #[test]
+    fn navigate_download_created_during_wait_until_load_returns_error_promptly() {
+        let h = build_mock_frame("page-dlb", "frame-dlb");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+
+            in_tx
+                .send(navigate_success_response(id, "page-dlb"))
+                .expect("send nav response");
+
+            // Delay slightly so wait_for_lifecycle is actively waiting.
+            std::thread::sleep(Duration::from_millis(20));
+            in_tx
+                .send(download_created_msg(
+                    "frame-dlb",
+                    "https://example.com/invoice.pdf",
+                    "dl-uuid-456",
+                ))
+                .expect("send downloadCreated");
+        });
+
+        let start = Instant::now();
+        let result = h.frame.navigate(
+            "https://example.com/invoice.pdf",
+            NavigateOptions {
+                wait_until: Some("load".to_owned()),
+                ..Default::default()
+            },
+            Duration::from_secs(10),
+        );
+        let elapsed = start.elapsed();
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "download event must short-circuit lifecycle wait promptly, took {elapsed:?}"
+        );
+
+        let err = result.expect_err("navigate with wait_until on download must error");
+        assert_eq!(err.kind, ProtocolErrorKind::NavigationBecameDownload);
+        let info = err.download_info.expect("download_info populated");
+        assert_eq!(info.url, "https://example.com/invoice.pdf");
+        assert_eq!(info.frame_id.as_deref(), Some("frame-dlb"));
+        assert_eq!(info.download_id.as_deref(), Some("dl-uuid-456"));
+
+        // (e) No handlers leak after navigate.
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("", "Browser.downloadCreated"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlb", "Network.requestWillBeSent"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlb", "Network.responseReceived"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlb", "Page.eventFired"),
+            0
+        );
+    }
+
+    /// (c) downloadCreated for a DIFFERENT frameId is ignored and navigate returns Ok.
+    #[test]
+    fn navigate_download_created_for_different_frame_is_ignored() {
+        let h = build_mock_frame("page-dlc", "frame-dlc");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+
+            in_tx
+                .send(navigate_success_response(id, "page-dlc"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-c",
+                    Some("nav-1"),
+                    "frame-dlc",
+                    "page-dlc",
+                ))
+                .expect("send rws");
+            in_tx
+                .send(response_received_msg("req-c", 200, "page-dlc"))
+                .expect("send responseReceived");
+            // Inject a downloadCreated for another frame.
+            in_tx
+                .send(download_created_msg(
+                    "other-frame",
+                    "https://example.com/other.pdf",
+                    "dl-uuid-other",
+                ))
+                .expect("send downloadCreated for other frame");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed ignoring other frame's download");
+        assert_eq!(outcome.status_code, Some(200));
+
+        // (e) No handlers leak after navigate.
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("", "Browser.downloadCreated"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlc", "Network.requestWillBeSent"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlc", "Network.responseReceived"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dlc", "Page.eventFired"),
+            0
+        );
+    }
+
+    /// (d) a normal 200 navigation returns as fast as before, with no added wait.
+    #[test]
+    fn navigate_normal_200_returns_fast_without_added_wait() {
+        let h = build_mock_frame("page-dld", "frame-dld");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+
+            in_tx
+                .send(navigate_success_response(id, "page-dld"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-d",
+                    Some("nav-1"),
+                    "frame-dld",
+                    "page-dld",
+                ))
+                .expect("send rws");
+            in_tx
+                .send(response_received_msg("req-d", 200, "page-dld"))
+                .expect("send responseReceived");
+        });
+
+        let start = Instant::now();
+        let result = h.frame.navigate(
+            "https://example.com",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+        let elapsed = start.elapsed();
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("normal 200 navigation must succeed");
+        assert_eq!(outcome.status_code, Some(200));
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "normal 200 navigation must return immediately without waiting, took {elapsed:?}"
+        );
+
+        // (e) No handlers leak after navigate.
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("", "Browser.downloadCreated"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dld", "Network.requestWillBeSent"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dld", "Network.responseReceived"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dld", "Page.eventFired"),
+            0
+        );
+    }
+
+    /// (e) Standalone wait_for_lifecycle handler leak check and download wake.
+    #[test]
+    fn wait_for_lifecycle_standalone_wakes_on_download_and_does_not_leak() {
+        let h = build_mock_frame("page-dle", "frame-dle");
+        let in_tx = h.in_tx.clone();
+
+        // 1. Download event wakes standalone wait_for_lifecycle promptly.
+        let tx1 = in_tx.clone();
+        let responder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            tx1.send(download_created_msg(
+                "frame-dle",
+                "https://example.com/standalone.pdf",
+                "dl-uuid-standalone",
+            ))
+            .unwrap();
+        });
+
+        let err = h
+            .frame
+            .wait_for_lifecycle("load", Duration::from_secs(5))
+            .expect_err("standalone wait must error on download");
+        assert_eq!(err.kind, ProtocolErrorKind::NavigationBecameDownload);
+        let info = err.download_info.expect("download_info");
+        assert_eq!(info.url, "https://example.com/standalone.pdf");
+        responder.join().unwrap();
+
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("page-dle", "Page.eventFired"),
+            0
+        );
+        assert_eq!(
+            h.conn
+                .event_handler_count_for("", "Browser.downloadCreated"),
+            0
+        );
+
+        h.closed.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn attachment_disposition_type_parsing() {
+        assert!(is_attachment_type("attachment"));
+        assert!(is_attachment_type("Attachment; filename=x"));
+        assert!(!is_attachment_type("inline; filename=\"attachment.pdf\""));
+        assert!(!is_attachment_type("inline"));
+    }
+
+    /// Unit test reproducing the failing redirect race: hop 1 gets 302, hop 2
+    /// request is sent, but hop 2's response is delayed past MAX_STATUS_WAIT_MS
+    /// (50ms in test mode). The redirect_in_flight tracking keeps the loop waiting
+    /// up to MAX_REDIRECT_WAIT_MS (200ms in test mode), so it captures Some(200).
+    #[test]
+    fn navigate_redirect_waits_for_inflight_redirect_response() {
+        let h = build_mock_frame("page-redir-delay", "frame-redir-delay");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+            in_tx
+                .send(navigate_success_response(id, "page-redir-delay"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-delay",
+                    "page-redir-delay",
+                ))
+                .expect("send rws 1");
+            in_tx
+                .send(response_received_msg("req-1", 302, "page-redir-delay"))
+                .expect("send respReceived 1");
+            in_tx
+                .send(redirect_request_msg(
+                    "req-2",
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-delay",
+                    "page-redir-delay",
+                ))
+                .expect("send rws 2");
+
+            // Sleep 70ms: past the 50ms test MAX_STATUS_WAIT_MS, but within 200ms MAX_REDIRECT_WAIT_MS.
+            std::thread::sleep(Duration::from_millis(70));
+            in_tx
+                .send(response_received_msg("req-2", 200, "page-redir-delay"))
+                .expect("send respReceived 2");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com/redirect",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed");
+        assert_eq!(outcome.status_code, Some(200));
+    }
+
+    /// Candidate 3: responseReceived for hop 2 arrives BEFORE requestWillBeSent for hop 2.
+    /// Buffered response is applied when requestWillBeSent chains forward.
+    #[test]
+    fn navigate_redirect_response_arriving_before_request_will_be_sent() {
+        let h = build_mock_frame("page-redir-ooo", "frame-redir-ooo");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+            in_tx
+                .send(navigate_success_response(id, "page-redir-ooo"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-ooo",
+                    "page-redir-ooo",
+                ))
+                .expect("send rws 1");
+            in_tx
+                .send(response_received_msg("req-1", 302, "page-redir-ooo"))
+                .expect("send respReceived 1");
+
+            // Out-of-order: responseReceived for req-2 arrives BEFORE requestWillBeSent for req-2.
+            in_tx
+                .send(response_received_msg("req-2", 200, "page-redir-ooo"))
+                .expect("send respReceived 2 before rws 2");
+            std::thread::sleep(Duration::from_millis(10));
+            in_tx
+                .send(redirect_request_msg(
+                    "req-2",
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-ooo",
+                    "page-redir-ooo",
+                ))
+                .expect("send rws 2");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com/redirect",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed");
+        assert_eq!(outcome.status_code, Some(200));
+    }
+
+    /// Candidate 4: stale 302 response received after final 200 does not overwrite it.
+    #[test]
+    fn navigate_redirect_stale_302_does_not_overwrite_200() {
+        let h = build_mock_frame("page-redir-stale", "frame-redir-stale");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+            in_tx
+                .send(navigate_success_response(id, "page-redir-stale"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-stale",
+                    "page-redir-stale",
+                ))
+                .expect("send rws 1");
+            in_tx
+                .send(redirect_request_msg(
+                    "req-2",
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-stale",
+                    "page-redir-stale",
+                ))
+                .expect("send rws 2");
+            // Hop 2 completes with 200.
+            in_tx
+                .send(response_received_msg("req-2", 200, "page-redir-stale"))
+                .expect("send respReceived 2");
+            // Late/stale 302 response for req-2 does not overwrite 200.
+            in_tx
+                .send(response_received_msg("req-2", 302, "page-redir-stale"))
+                .expect("send late 302");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com/redirect",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed");
+        assert_eq!(outcome.status_code, Some(200));
+    }
+
+    /// Candidate 5: redirect continuation request with missing or different navigationId
+    /// is not rejected by nav_id_ok gate.
+    #[test]
+    fn navigate_redirect_hop_without_matching_nav_id_succeeds() {
+        let h = build_mock_frame("page-redir-navid", "frame-redir-navid");
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Page.navigate not sent");
+            let id = sent["id"].as_i64().expect("id");
+            in_tx
+                .send(navigate_success_response(id, "page-redir-navid"))
+                .expect("send nav response");
+            in_tx
+                .send(request_will_be_sent_msg(
+                    "req-1",
+                    Some("nav-1"),
+                    "frame-redir-navid",
+                    "page-redir-navid",
+                ))
+                .expect("send rws 1");
+            in_tx
+                .send(response_received_msg("req-1", 302, "page-redir-navid"))
+                .expect("send respReceived 1");
+            // Redirect continuation has NO navigationId.
+            in_tx
+                .send(redirect_request_msg(
+                    "req-2",
+                    "req-1",
+                    None,
+                    "frame-redir-navid",
+                    "page-redir-navid",
+                ))
+                .expect("send rws 2");
+            in_tx
+                .send(response_received_msg("req-2", 200, "page-redir-navid"))
+                .expect("send respReceived 2");
+        });
+
+        let result = h.frame.navigate(
+            "https://example.com/redirect",
+            Default::default(),
+            Duration::from_secs(5),
+        );
+
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+
+        let outcome = result.expect("navigate must succeed");
+        assert_eq!(outcome.status_code, Some(200));
+    }
+
+    #[test]
+    fn navigate_download_restores_previous_context() {
+        let h = build_mock_frame("page-r", "frame-r");
+        h.frame
+            .execution_context_handle()
+            .on_created("ctx-old".into());
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let id = sent["id"].as_i64().unwrap();
+            in_tx.send(navigate_success_response(id, "page-r")).unwrap();
+            in_tx
+                .send(download_created_msg("frame-r", "https://e.x/f.pdf", "u1"))
+                .unwrap();
+        });
+        let err = h
+            .frame
+            .navigate(
+                "https://e.x/f.pdf",
+                Default::default(),
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+        assert_eq!(err.kind, ProtocolErrorKind::NavigationBecameDownload);
+        assert_eq!(
+            h.frame.execution_context_handle().current().as_deref(),
+            Some("ctx-old")
+        );
+    }
+
+    #[test]
+    fn same_document_navigation_restores_previous_context() {
+        // Page.navigate ack WITHOUT navigationId (hash change): current must be restored.
+        let h = build_mock_frame("page-s", "frame-s");
+        h.frame
+            .execution_context_handle()
+            .on_created("ctx-old".into());
+        let in_tx = h.in_tx.clone();
+        let out_rx = h.out_rx;
+        let responder = std::thread::spawn(move || {
+            let sent = out_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let id = sent["id"].as_i64().unwrap();
+            in_tx
+                .send(RawMessage {
+                    id: Some(id),
+                    method: None,
+                    params: None,
+                    result: Some(serde_json::json!({})),
+                    error: None,
+                    session_id: Some("page-s".into()),
+                })
+                .unwrap();
+        });
+        h.frame
+            .navigate("https://e.x/#a", Default::default(), Duration::from_secs(5))
+            .unwrap();
+        responder.join().unwrap();
+        h.closed.store(true, Ordering::SeqCst);
+        assert_eq!(
+            h.frame.execution_context_handle().current().as_deref(),
+            Some("ctx-old")
+        );
+    }
+    #[test]
+    fn s5_frame_identity_and_debug_recover_poisoned_cache() {
+        let h = build_mock_frame("s-poison", "f-poison");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _id = h.frame.frame_id.lock().unwrap();
+            panic!("poison frame identity cache");
+        }));
+        assert_eq!(h.frame.frame_id(), "f-poison");
+        let debug = format!("{:?}", h.frame);
+        assert!(debug.contains("frame_id: \"f-poison\""));
+        assert!(!debug.contains("Mutex"));
     }
 }

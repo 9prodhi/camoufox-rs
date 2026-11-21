@@ -7,7 +7,7 @@ use crate::protocol::types::EventMessage;
 /// Handlers receive an immutable reference to the event message. They run
 /// synchronously on the reader thread, so they should be cheap. For heavy
 /// processing, handlers should forward the event to a channel.
-pub type EventHandler = Box<dyn Fn(&EventMessage) + Send>;
+pub type EventHandler = std::sync::Arc<dyn Fn(&EventMessage) + Send + Sync>;
 
 /// A stable identifier for a registered handler, returned by
 /// [`EventRouter::on`] and accepted by [`EventRouter::off`].
@@ -16,6 +16,15 @@ pub type EventHandler = Box<dyn Fn(&EventMessage) + Send>;
 /// so an `(session_key, method, id)` triple unambiguously identifies one
 /// registration even if the same callback shape is registered repeatedly.
 pub type HandlerId = u64;
+
+type HandlerEntries = Vec<((String, String), Vec<(HandlerId, EventHandler)>)>;
+
+/// Removed callbacks must be dropped only after releasing the connection lock.
+#[must_use = "drop removed session handlers after releasing the connection lock"]
+#[derive(Default)]
+pub(crate) struct RemovedSessionHandlers {
+    _handlers: HandlerEntries,
+}
 
 /// Manages event subscriptions per session.
 ///
@@ -32,7 +41,7 @@ pub struct EventRouter {
     handlers: HashMap<(String, String), Vec<(HandlerId, EventHandler)>>,
 
     /// Global catch-all handlers (for logging/debugging).
-    global_handlers: Vec<EventHandler>,
+    global_handlers: Vec<(HandlerId, EventHandler)>,
 
     /// Monotonic counter for assigning [`HandlerId`]s.
     next_id: HandlerId,
@@ -97,21 +106,22 @@ impl EventRouter {
     ///
     /// Global handlers run *after* session-specific and session-wildcard
     /// handlers. They are mainly useful for logging and debugging.
-    pub fn on_global(&mut self, handler: EventHandler) {
-        self.global_handlers.push(handler);
+    pub fn on_global(&mut self, handler: EventHandler) -> HandlerId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.global_handlers.push((id, handler));
+        id
     }
 
-    /// Dispatch an event to all matching handlers.
-    ///
-    /// The dispatch order is:
-    /// 1. Exact-match handlers for `(session_key, method)`.
-    /// 2. Session-wildcard handlers for `(session_key, "*")`.
-    /// 3. Global handlers.
-    ///
-    /// Handlers that panic are not caught here; callers (the reader thread)
-    /// should wrap dispatch in `catch_unwind` if resilience is needed.
-    pub fn dispatch(&self, event: &EventMessage) {
+    /// Deregister a global handler previously registered via [`on_global`](Self::on_global).
+    pub fn off_global(&mut self, id: HandlerId) {
+        self.global_handlers.retain(|(hid, _)| *hid != id);
+    }
+
+    /// Collect clones of all handlers matching this event.
+    pub fn matching_handlers(&self, event: &EventMessage) -> Vec<EventHandler> {
         let session_key = session_key_from_event(event);
+        let mut matched = Vec::new();
 
         // 1. Exact match: (session_key, method)
         if let Some(handlers) = self
@@ -119,42 +129,74 @@ impl EventRouter {
             .get(&(session_key.clone(), event.method.clone()))
         {
             for (_id, handler) in handlers {
-                handler(event);
+                matched.push(std::sync::Arc::clone(handler));
             }
         }
 
         // 2. Session wildcard: (session_key, "*")
         if let Some(handlers) = self.handlers.get(&(session_key, "*".to_owned())) {
             for (_id, handler) in handlers {
-                handler(event);
+                matched.push(std::sync::Arc::clone(handler));
             }
         }
 
         // 3. Global catch-all handlers
-        for handler in &self.global_handlers {
-            handler(event);
+        for (_id, handler) in &self.global_handlers {
+            matched.push(std::sync::Arc::clone(handler));
+        }
+
+        matched
+    }
+
+    /// Dispatch an event to all matching handlers.
+    ///
+    /// Each handler is invoked inside `catch_unwind` to prevent panics from
+    /// propagating.
+    pub fn dispatch(&self, event: &EventMessage) {
+        let handlers = self.matching_handlers(event);
+        for handler in handlers {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler(event);
+            }));
+            if let Err(e) = res {
+                log::error!("event handler panicked during dispatch: {:?}", e);
+            }
         }
     }
 
     /// Remove all handlers associated with a session.
     ///
     /// Called when a session is disposed (page closed or detached). This
-    /// removes both exact-match and wildcard subscriptions for the session.
+    /// removes and drops both exact-match and wildcard subscriptions for the session.
     pub fn remove_session(&mut self, session_key: &str) {
-        self.handlers
-            .retain(|(key, _method), _handlers| key != session_key);
+        drop(self.take_session_handlers(session_key));
+    }
+
+    /// Extract without dropping callbacks; callers must release their lock first.
+    pub(crate) fn take_session_handlers(&mut self, session_key: &str) -> RemovedSessionHandlers {
+        let matching_keys: Vec<(String, String)> = self
+            .handlers
+            .keys()
+            .filter(|(key, _)| key == session_key)
+            .cloned()
+            .collect();
+        let mut removed = Vec::with_capacity(matching_keys.len());
+        for key in matching_keys {
+            if let Some(entry) = self.handlers.remove_entry(&key) {
+                removed.push(entry);
+            }
+        }
+        RemovedSessionHandlers { _handlers: removed }
     }
 
     /// Returns the total number of handler registrations (all keys + globals).
-    #[cfg(test)]
-    fn handler_count(&self) -> usize {
+    pub fn handler_count(&self) -> usize {
         let specific: usize = self.handlers.values().map(|v| v.len()).sum();
         specific + self.global_handlers.len()
     }
 
     /// Returns the number of handlers registered for one `(session_key, method)`
-    /// key. Test-only; used by leak-regression guards.
-    #[cfg(test)]
+    /// key.
     pub fn handler_count_for(&self, session_key: &str, method: &str) -> usize {
         self.handlers
             .get(&(session_key.to_owned(), method.to_owned()))
@@ -207,7 +249,7 @@ mod tests {
         router.on(
             "",
             "Browser.attachedToTarget",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 c.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -227,7 +269,7 @@ mod tests {
         let c = count.clone();
         router.on_any(
             "session-1",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 c.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -246,7 +288,7 @@ mod tests {
         let mut router = EventRouter::new();
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        router.on_global(Box::new(move |_| {
+        router.on_global(Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
         }));
 
@@ -265,7 +307,7 @@ mod tests {
         router.on(
             "",
             "Browser.attachedToTarget",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 o1.lock().unwrap().push("exact");
             }),
         );
@@ -273,13 +315,13 @@ mod tests {
         let o2 = order.clone();
         router.on_any(
             "",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 o2.lock().unwrap().push("wildcard");
             }),
         );
 
         let o3 = order.clone();
-        router.on_global(Box::new(move |_| {
+        router.on_global(Arc::new(move |_| {
             o3.lock().unwrap().push("global");
         }));
 
@@ -298,13 +340,13 @@ mod tests {
         router.on(
             "s1",
             "Page.navigationStarted",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 c1.fetch_add(1, Ordering::SeqCst);
             }),
         );
         router.on_any(
             "s1",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 c2.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -312,7 +354,7 @@ mod tests {
         // Should have 2 handler entries for s1
         assert_eq!(router.handler_count(), 2);
 
-        router.remove_session("s1");
+        let (): () = router.remove_session("s1");
         assert_eq!(router.handler_count(), 0);
 
         // Dispatch should not fire anything
@@ -331,14 +373,14 @@ mod tests {
         router.on(
             "s1",
             "Page.load",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 c1.fetch_add(1, Ordering::SeqCst);
             }),
         );
         router.on(
             "s2",
             "Page.load",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 c2.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -357,7 +399,7 @@ mod tests {
         let mut router = EventRouter::new();
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        router.on_global(Box::new(move |_| {
+        router.on_global(Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
         }));
 
@@ -377,14 +419,14 @@ mod tests {
         router.on(
             "",
             "Browser.attachedToTarget",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 c1.fetch_add(1, Ordering::SeqCst);
             }),
         );
         router.on(
             "",
             "Browser.attachedToTarget",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 c2.fetch_add(10, Ordering::SeqCst);
             }),
         );
@@ -401,7 +443,7 @@ mod tests {
         router.on(
             "",
             "Browser.attachedToTarget",
-            Box::new(move |event| {
+            Arc::new(move |event| {
                 *r.lock().unwrap() = Some(event.params.clone());
             }),
         );
@@ -437,9 +479,9 @@ mod tests {
     #[test]
     fn on_returns_unique_ids() {
         let mut router = EventRouter::new();
-        let id1 = router.on("s1", "Page.eventFired", Box::new(|_| {}));
-        let id2 = router.on("s1", "Page.eventFired", Box::new(|_| {}));
-        let id3 = router.on("s2", "Page.eventFired", Box::new(|_| {}));
+        let id1 = router.on("s1", "Page.eventFired", Arc::new(|_| {}));
+        let id2 = router.on("s1", "Page.eventFired", Arc::new(|_| {}));
+        let id3 = router.on("s2", "Page.eventFired", Arc::new(|_| {}));
         assert_ne!(id1, id2);
         assert_ne!(id2, id3);
         assert_ne!(id1, id3);
@@ -456,14 +498,14 @@ mod tests {
         let id_a = router.on(
             "s1",
             "Page.eventFired",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 ca.fetch_add(1, Ordering::SeqCst);
             }),
         );
         let _id_b = router.on(
             "s1",
             "Page.eventFired",
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 cb.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -481,7 +523,7 @@ mod tests {
     #[test]
     fn off_prunes_empty_key_entry() {
         let mut router = EventRouter::new();
-        let id = router.on("s1", "Page.eventFired", Box::new(|_| {}));
+        let id = router.on("s1", "Page.eventFired", Arc::new(|_| {}));
         assert_eq!(router.handler_count_for("s1", "Page.eventFired"), 1);
 
         router.off("s1", "Page.eventFired", id);
@@ -493,7 +535,7 @@ mod tests {
     #[test]
     fn off_unknown_id_is_noop() {
         let mut router = EventRouter::new();
-        let _id = router.on("s1", "Page.eventFired", Box::new(|_| {}));
+        let _id = router.on("s1", "Page.eventFired", Arc::new(|_| {}));
         // Removing an id that was never issued does nothing.
         router.off("s1", "Page.eventFired", 99999);
         assert_eq!(router.handler_count_for("s1", "Page.eventFired"), 1);
@@ -509,11 +551,32 @@ mod tests {
         // wait_for_lifecycle pattern does not accumulate dead closures.
         let mut router = EventRouter::new();
         for _ in 0..5 {
-            let id = router.on("page-A", "Page.eventFired", Box::new(|_| {}));
+            let id = router.on("page-A", "Page.eventFired", Arc::new(|_| {}));
             assert_eq!(router.handler_count_for("page-A", "Page.eventFired"), 1);
             router.off("page-A", "Page.eventFired", id);
             assert_eq!(router.handler_count_for("page-A", "Page.eventFired"), 0);
         }
         assert_eq!(router.handler_count(), 0);
+    }
+
+    #[test]
+    fn on_global_and_off_global() {
+        let mut router = EventRouter::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+
+        let id = router.on_global(Arc::new(move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(router.handler_count(), 1);
+
+        router.dispatch(&make_event("Page.load", Some("s1")));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        router.off_global(id);
+        assert_eq!(router.handler_count(), 0);
+
+        router.dispatch(&make_event("Page.load", Some("s1")));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

@@ -13,6 +13,9 @@ use super::errors::CodecError;
 /// expectations (64 KiB = 1 << 16).
 const DEFAULT_WRITE_CHUNK_SIZE: usize = 65_536;
 
+/// Default maximum frame size: 256 MiB (256 * 1024 * 1024 bytes).
+pub const DEFAULT_MAX_FRAME_SIZE: usize = 256 * 1024 * 1024;
+
 /// Null-byte delimited JSON codec.
 ///
 /// Accumulates partial reads in an internal buffer and yields fully-framed
@@ -26,6 +29,8 @@ pub struct NulJsonCodec {
     scan_pos: usize,
     /// Maximum bytes per chunk when encoding for `write()`.
     write_chunk_size: usize,
+    /// Maximum allowed frame size in bytes.
+    max_frame_size: usize,
 }
 
 impl Default for NulJsonCodec {
@@ -35,12 +40,13 @@ impl Default for NulJsonCodec {
 }
 
 impl NulJsonCodec {
-    /// Create a new codec with default settings (64 KiB write chunk size).
+    /// Create a new codec with default settings (64 KiB write chunk size, 256 MiB max frame size).
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
             scan_pos: 0,
             write_chunk_size: DEFAULT_WRITE_CHUNK_SIZE,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
         }
     }
 
@@ -55,6 +61,22 @@ impl NulJsonCodec {
             buf: Vec::new(),
             scan_pos: 0,
             write_chunk_size: size,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+        }
+    }
+
+    /// Create a codec with a custom maximum frame size in bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bytes` is zero.
+    pub fn with_max_frame(bytes: usize) -> Self {
+        assert!(bytes > 0, "max_frame must be positive");
+        Self {
+            buf: Vec::new(),
+            scan_pos: 0,
+            write_chunk_size: DEFAULT_WRITE_CHUNK_SIZE,
+            max_frame_size: bytes,
         }
     }
 
@@ -92,7 +114,14 @@ impl NulJsonCodec {
             if nul_pos > start {
                 // Non-empty segment: attempt decode.
                 let segment = &self.buf[start..nul_pos];
-                results.push(Self::decode_segment(segment));
+                if segment.len() > self.max_frame_size {
+                    results.push(Err(CodecError::FrameTooLarge {
+                        limit: self.max_frame_size,
+                        len: segment.len(),
+                    }));
+                } else {
+                    results.push(Self::decode_segment(segment));
+                }
             }
             // else: empty segment (\0\0) — silently skip.
 
@@ -104,8 +133,19 @@ impl NulJsonCodec {
         if start > 0 {
             self.buf.drain(..start);
         }
-        // All current buffer bytes have been scanned for \0.
-        self.scan_pos = self.buf.len();
+
+        if self.buf.len() > self.max_frame_size {
+            let len = self.buf.len();
+            self.buf.clear();
+            self.scan_pos = 0;
+            results.push(Err(CodecError::FrameTooLarge {
+                limit: self.max_frame_size,
+                len,
+            }));
+        } else {
+            // All current buffer bytes have been scanned for \0.
+            self.scan_pos = self.buf.len();
+        }
 
         results
     }
@@ -113,10 +153,11 @@ impl NulJsonCodec {
     /// Decode a single segment (bytes between two `\0` delimiters) into a
     /// JSON value.
     fn decode_segment(segment: &[u8]) -> Result<serde_json::Value, CodecError> {
-        // Validate UTF-8 first to give a specific error variant.
-        // We need an owned String to get FromUtf8Error (which CodecError wraps).
-        let text = String::from_utf8(segment.to_vec())?;
-        let value: serde_json::Value = serde_json::from_str(&text)?;
+        let text = match std::str::from_utf8(segment) {
+            Ok(t) => t,
+            Err(_) => return Err(String::from_utf8(segment.to_vec()).unwrap_err().into()),
+        };
+        let value: serde_json::Value = serde_json::from_str(text)?;
         Ok(value)
     }
 
@@ -484,5 +525,78 @@ mod tests {
         let results = unwrap_all(codec.feed(&wire(&err_resp)));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], err_resp);
+    }
+
+    // -- Max frame size tests (D10.10) ------------------------------------
+
+    #[test]
+    fn max_frame_cap_exceeded_without_delimiter() {
+        let mut codec = NulJsonCodec::with_max_frame(10);
+        let res = codec.feed(b"0123456789a"); // 11 bytes, no \0
+        assert_eq!(res.len(), 1);
+        match &res[0] {
+            Err(CodecError::FrameTooLarge { limit, len }) => {
+                assert_eq!(*limit, 10);
+                assert_eq!(*len, 11);
+            }
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+        assert!(!codec.has_partial(), "buffer must be discarded");
+    }
+
+    #[test]
+    fn max_frame_cap_exceeded_with_delimiter() {
+        let mut codec = NulJsonCodec::with_max_frame(10);
+        let res = codec.feed(b"0123456789a\0"); // 11 bytes segment
+        assert_eq!(res.len(), 1);
+        match &res[0] {
+            Err(CodecError::FrameTooLarge { limit, len }) => {
+                assert_eq!(*limit, 10);
+                assert_eq!(*len, 11);
+            }
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+        assert!(!codec.has_partial(), "buffer must be discarded");
+    }
+
+    #[test]
+    fn max_frame_exactly_at_cap() {
+        let mut codec = NulJsonCodec::with_max_frame(10);
+        // "{\"a\":1234}" is exactly 10 bytes
+        let data = b"{\"a\":1234}\0";
+        assert_eq!(&data[..10].len(), &10);
+        let res = codec.feed(data);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].as_ref().unwrap(), &json!({"a": 1234}));
+        assert!(!codec.has_partial());
+    }
+
+    #[test]
+    fn max_frame_recovery_after_oversized_frame() {
+        let mut codec = NulJsonCodec::with_max_frame(10);
+        // Exceed cap without delimiter
+        let res1 = codec.feed(b"0123456789a");
+        assert_eq!(res1.len(), 1);
+        assert!(matches!(
+            res1[0],
+            Err(CodecError::FrameTooLarge { limit: 10, len: 11 })
+        ));
+        assert!(!codec.has_partial());
+
+        // Subsequent valid frame decodes normally
+        let res2 = codec.feed(b"{\"b\":2}\0");
+        assert_eq!(res2.len(), 1);
+        assert_eq!(res2[0].as_ref().unwrap(), &json!({"b": 2}));
+        assert!(!codec.has_partial());
+
+        // Exceed cap with delimiter, then recover
+        let res3 = codec.feed(b"abcdefghijk\0{\"c\":3}\0");
+        assert_eq!(res3.len(), 2);
+        assert!(matches!(
+            res3[0],
+            Err(CodecError::FrameTooLarge { limit: 10, len: 11 })
+        ));
+        assert_eq!(res3[1].as_ref().unwrap(), &json!({"c": 3}));
+        assert!(!codec.has_partial());
     }
 }

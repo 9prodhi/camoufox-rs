@@ -10,8 +10,6 @@ pub enum TransportError {
     Codec(CodecError),
     /// I/O error.
     Io(std::io::Error),
-    /// The child process exited unexpectedly.
-    ProcessExited(Option<i32>),
 }
 
 impl fmt::Display for TransportError {
@@ -20,13 +18,6 @@ impl fmt::Display for TransportError {
             Self::Closed => write!(f, "transport closed"),
             Self::Codec(e) => write!(f, "codec error: {e}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
-            Self::ProcessExited(code) => {
-                write!(f, "process exited")?;
-                if let Some(c) = code {
-                    write!(f, " with code {c}")?;
-                }
-                Ok(())
-            }
         }
     }
 }

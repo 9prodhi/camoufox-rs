@@ -108,6 +108,7 @@ pub struct Connection {
     inner: Arc<Mutex<ConnectionInner>>,
     /// Handle to the reader thread.
     reader_handle: Option<thread::JoinHandle<()>>,
+    reader_thread_id: thread::ThreadId,
     /// Receiver for exit notification from the reader thread.
     reader_exit_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// Serialized write half of the transport (guards send and close).
@@ -152,6 +153,7 @@ impl Connection {
 
         Connection {
             inner,
+            reader_thread_id: reader_handle.thread().id(),
             reader_handle: Some(reader_handle),
             reader_exit_rx: Mutex::new(Some(exit_rx)),
             writer,
@@ -222,17 +224,20 @@ impl Connection {
     /// Called when `Browser.detachedFromTarget` arrives. Rejects all pending
     /// requests and removes event handlers.
     pub fn dispose_session(&self, session_id: &str) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(mut session) = guard.sessions.remove(session_id) {
-            session.pending.reject_all(ProtocolErrorKind::Closed);
-        }
-        guard
-            .pending_navs
-            .retain(|_, nav| nav.session_key != session_id);
-        guard.events.remove_session(session_id);
+        let handlers_to_drop = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(mut session) = guard.sessions.remove(session_id) {
+                session.pending.reject_all(ProtocolErrorKind::Closed);
+            }
+            guard
+                .pending_navs
+                .retain(|_, nav| nav.session_key != session_id);
+            guard.events.take_session_handlers(session_id)
+        };
+        drop(handlers_to_drop);
     }
 
     /// Subscribe to events on a specific session.
@@ -376,12 +381,21 @@ impl Connection {
             let _ = writer.close();
         }
         close_all_sessions(&self.inner);
+        self.finish_reader();
+    }
+
+    fn finish_reader(&mut self) {
         let exit_rx = self
             .reader_exit_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        join_reader_bounded(self.reader_handle.take(), exit_rx);
+        let handle = self.reader_handle.take();
+        // A handler's temporary upgrade can be the last owner. Waiting for
+        // our own exit notification would stall this reader until timeout.
+        if thread::current().id() != self.reader_thread_id {
+            join_reader_bounded(handle, exit_rx);
+        }
     }
 }
 
@@ -397,12 +411,7 @@ impl Drop for Connection {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = writer.close();
         }
-        let exit_rx = self
-            .reader_exit_rx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        join_reader_bounded(self.reader_handle.take(), exit_rx);
+        self.finish_reader();
     }
 }
 
@@ -428,6 +437,64 @@ pub struct Session {
 }
 
 impl Session {
+    /// Pre-send check: session state
+    pub fn is_closed(&self) -> bool {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.state.rejects_sends() {
+            return true;
+        }
+        match guard.sessions.get(&self.session_key) {
+            Some(session) => session.state == SessionState::Disposed,
+            None => true,
+        }
+    }
+
+    pub fn is_crashed(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .get(&self.session_key)
+            .is_some_and(|session| session.state == SessionState::Crashed)
+    }
+
+    /// Close a crashed page without waiting for a renderer response. Unlike
+    /// ordinary sends, Page.close is allowed on a crashed (but not disposed)
+    /// session. No pending request is registered; a late response is ignored.
+    pub(crate) fn close_page_best_effort(&self) {
+        let request = {
+            let guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.state.rejects_sends()
+                || !guard
+                    .sessions
+                    .get(&self.session_key)
+                    .is_some_and(|s| s.state == SessionState::Crashed)
+            {
+                return;
+            }
+            Request {
+                id: guard.id_gen.next(),
+                method: "Page.close".into(),
+                params: serde_json::json!({}),
+                session_id: self.session_id.clone(),
+            }
+        };
+        if let Ok(value) = serde_json::to_value(request) {
+            crate::obs::log_outgoing(&value);
+            let _ = self
+                .writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .send(&value);
+        }
+    }
+
     /// Send a protocol method and wait for the response.
     ///
     /// Applies a default deadline of [`DEFAULT_SEND_TIMEOUT`] so no protocol
@@ -898,6 +965,7 @@ fn handle_event(inner: &Arc<Mutex<ConnectionInner>>, event: EventMessage) {
         handle_download_created(inner, &event);
     }
 
+    let mut handlers_to_drop = Default::default();
     let handlers = {
         let mut guard = inner
             .lock()
@@ -910,7 +978,7 @@ fn handle_event(inner: &Arc<Mutex<ConnectionInner>>, event: EventMessage) {
                     session.pending.reject_all(ProtocolErrorKind::Closed);
                 }
                 guard.pending_navs.retain(|_, nav| nav.session_key != sid);
-                guard.events.remove_session(sid);
+                handlers_to_drop = guard.events.take_session_handlers(sid);
             }
         } else if event.method == "Page.crashed" {
             let session_key = event.session_id.as_deref().unwrap_or("");
@@ -922,6 +990,7 @@ fn handle_event(inner: &Arc<Mutex<ConnectionInner>>, event: EventMessage) {
 
         guard.events.matching_handlers(&event)
     };
+    drop(handlers_to_drop);
 
     // Dispatch handlers outside the mutex lock to prevent deadlocks and poison cascades.
     for handler in handlers {
@@ -2224,6 +2293,61 @@ mod tests {
     }
 
     #[test]
+    fn c1_reader_thread_no_deadlock_when_dropping_session_handler_reacquires_inner() {
+        let (transport, in_tx, _out_rx, _closed) = MockTransport::new();
+        let conn = Arc::new(Connection::new(Box::new(transport)));
+        let (done_tx, done_rx) = mpsc::channel();
+
+        struct ReacquireInnerOnDrop {
+            conn: Arc<Connection>,
+            done_tx: mpsc::Sender<()>,
+        }
+        impl Drop for ReacquireInnerOnDrop {
+            fn drop(&mut self) {
+                // Calling off_event locks ConnectionInner.
+                // If dropped while the reader thread holds ConnectionInner during
+                // remove_session, this deadlocks the reader thread.
+                self.conn.off_event("s1", "some.method", 9999);
+                let _ = self.done_tx.send(());
+            }
+        }
+
+        let dropper = ReacquireInnerOnDrop {
+            conn: Arc::clone(&conn),
+            done_tx,
+        };
+
+        // Register a handler on session "s1" that holds dropper
+        conn.on_event(
+            "s1",
+            "Page.frameAttached",
+            Arc::new(move |_| {
+                let _ = &dropper;
+            }),
+        );
+
+        // Send Browser.detachedFromTarget for s1
+        let detach_msg = RawMessage {
+            id: None,
+            method: Some("Browser.detachedFromTarget".into()),
+            params: Some(json!({
+                "sessionId": "s1",
+                "targetId": "t1",
+            })),
+            result: None,
+            error: None,
+            session_id: None,
+        };
+        in_tx.send(detach_msg).unwrap();
+
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "dropping session handlers must not deadlock reader thread"
+        );
+    }
+
+    #[test]
     fn reader_exit_rejects_pending_sends_and_disconnects_waiters() {
         let mut h = setup();
         let session = h.conn.root_session();
@@ -2361,6 +2485,9 @@ mod tests {
         let r2 = h2.join().unwrap();
         assert!(r2.is_err());
         assert_eq!(r2.unwrap_err().kind, ProtocolErrorKind::Crashed);
+        assert!(page2.is_crashed());
+        assert!(!page2.is_closed());
+        assert!(page1.is_closed());
 
         // Future sends on crashed session fail with Crashed
         assert_eq!(
@@ -2415,5 +2542,75 @@ mod tests {
             elapsed < std::time::Duration::from_secs(1),
             "Connection::drop took too long: {elapsed:?}"
         );
+    }
+    #[test]
+    fn s3_reader_can_drop_last_connection_without_waiting_for_itself() {
+        for wait_first in [false, true] {
+            let h = setup();
+            let holder = Arc::new(Mutex::new(None::<Arc<Connection>>));
+            let holder_in_handler = holder.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let conn = Arc::new(h.conn);
+            conn.on_event(
+                "",
+                "Test.dropLastConnection",
+                Arc::new(move |_| {
+                    let last = holder_in_handler.lock().unwrap().take().unwrap();
+                    let mut last = Arc::try_unwrap(last)
+                        .ok()
+                        .expect("handler must own the last connection");
+                    let start = std::time::Instant::now();
+                    if wait_first {
+                        last.wait_closed();
+                    }
+                    drop(last);
+                    done_tx.send(start.elapsed()).unwrap();
+                }),
+            );
+            *holder.lock().unwrap() = Some(conn.clone());
+            drop(conn);
+            h.in_tx
+                .send(event_message("Test.dropLastConnection", None))
+                .unwrap();
+            let elapsed = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reader-thread drop stalled");
+            assert!(
+                elapsed < READER_JOIN_TIMEOUT / 2,
+                "reader waited for itself (wait_closed={wait_first}): {elapsed:?}"
+            );
+            drop(h.in_tx);
+        }
+    }
+
+    #[test]
+    fn s6_crashed_page_close_is_sent_without_waiting_for_a_reply() {
+        let h = setup();
+        let page = h.conn.create_session("crashed".into());
+        page.mark_crashed();
+        assert!(page.is_crashed());
+        page.close_page_best_effort();
+        let request = recv_out(&h.out_rx);
+        assert_eq!(request["method"], "Page.close");
+        assert_eq!(request["sessionId"], "crashed");
+        assert_eq!(
+            h.conn.inner.lock().unwrap().sessions["crashed"]
+                .pending
+                .len(),
+            0
+        );
+        teardown(h);
+    }
+    #[test]
+    fn s5_crash_query_recovers_poisoned_connection_lock() {
+        let h = setup();
+        let page = h.conn.create_session("s-poison".into());
+        page.mark_crashed();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner = h.conn.inner.lock().unwrap();
+            panic!("poison connection lock");
+        }));
+        assert!(page.is_crashed());
+        teardown(h);
     }
 }

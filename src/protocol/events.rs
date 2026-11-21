@@ -17,6 +17,15 @@ pub type EventHandler = std::sync::Arc<dyn Fn(&EventMessage) + Send + Sync>;
 /// registration even if the same callback shape is registered repeatedly.
 pub type HandlerId = u64;
 
+type HandlerEntries = Vec<((String, String), Vec<(HandlerId, EventHandler)>)>;
+
+/// Removed callbacks must be dropped only after releasing the connection lock.
+#[must_use = "drop removed session handlers after releasing the connection lock"]
+#[derive(Default)]
+pub(crate) struct RemovedSessionHandlers {
+    _handlers: HandlerEntries,
+}
+
 /// Manages event subscriptions per session.
 ///
 /// Events are keyed by `(session_key, method)`. The `session_key` is `""` for
@@ -158,10 +167,26 @@ impl EventRouter {
     /// Remove all handlers associated with a session.
     ///
     /// Called when a session is disposed (page closed or detached). This
-    /// removes both exact-match and wildcard subscriptions for the session.
+    /// removes and drops both exact-match and wildcard subscriptions for the session.
     pub fn remove_session(&mut self, session_key: &str) {
-        self.handlers
-            .retain(|(key, _method), _handlers| key != session_key);
+        drop(self.take_session_handlers(session_key));
+    }
+
+    /// Extract without dropping callbacks; callers must release their lock first.
+    pub(crate) fn take_session_handlers(&mut self, session_key: &str) -> RemovedSessionHandlers {
+        let matching_keys: Vec<(String, String)> = self
+            .handlers
+            .keys()
+            .filter(|(key, _)| key == session_key)
+            .cloned()
+            .collect();
+        let mut removed = Vec::with_capacity(matching_keys.len());
+        for key in matching_keys {
+            if let Some(entry) = self.handlers.remove_entry(&key) {
+                removed.push(entry);
+            }
+        }
+        RemovedSessionHandlers { _handlers: removed }
     }
 
     /// Returns the total number of handler registrations (all keys + globals).
@@ -329,7 +354,7 @@ mod tests {
         // Should have 2 handler entries for s1
         assert_eq!(router.handler_count(), 2);
 
-        router.remove_session("s1");
+        let (): () = router.remove_session("s1");
         assert_eq!(router.handler_count(), 0);
 
         // Dispatch should not fire anything

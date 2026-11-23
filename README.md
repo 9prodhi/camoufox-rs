@@ -192,6 +192,9 @@ cargo run --features cli --bin camoufox -- click <instance_id> <page_id> 200 300
 cargo run --features cli --bin camoufox -- fill <instance_id> <page_id> 'input[name=q]' camoufox
 cargo run --features cli --bin camoufox -- press <instance_id> <page_id> Enter
 
+# Set a file input's files (also works with hidden inputs):
+cargo run --features cli --bin camoufox -- upload <instance_id> <page_id> 'input[type=file]' ./fixture.pdf
+
 # Also available: type <text>, hover <selector>, select <selector> <value>, scroll [selector]
 ```
 
@@ -210,7 +213,7 @@ cargo run --features cli --bin camoufox -- text <instance_id> <page_id> --frame 
 cargo run --features cli --bin camoufox -- click <instance_id> <page_id> '#btn' \
     --frame '#outer-frame' --frame '#inner-frame'
 
-# Supported across 11 commands: text, html, links, click, fill, type, press, hover, select, wait, evaluate.
+# Supported across 12 commands: text, html, links, click, fill, upload, type, press, hover, select, wait, evaluate.
 ```
 
 Clicks and hovers scroll ancestor frames and the target into view before measuring

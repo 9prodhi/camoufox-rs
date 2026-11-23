@@ -263,6 +263,18 @@ pub enum DaemonRequest {
         frames: Vec<String>,
     },
 
+    /// Set the files of a file input selected by CSS, optionally within frames.
+    Upload {
+        instance_id: String,
+        page_id: String,
+        selector: String,
+        paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
+        #[serde(default = "default_timeout")]
+        timeout_secs: u64,
+    },
+
     /// Insert text into the currently focused element.
     Type {
         instance_id: String,
@@ -363,6 +375,7 @@ impl DaemonRequest {
             | Self::Type { timeout_secs, .. }
             | Self::Press { timeout_secs, .. }
             | Self::Fill { timeout_secs, .. }
+            | Self::Upload { timeout_secs, .. }
             | Self::Hover { timeout_secs, .. }
             | Self::Select { timeout_secs, .. }
             | Self::Scroll { timeout_secs, .. }
@@ -427,6 +440,26 @@ impl DaemonResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn upload_request_round_trip_and_defaults() {
+        let payload = json!({"method":"Upload", "params": {
+            "instance_id":"i", "page_id":"p1", "selector":"host >>> input",
+            "paths":["/tmp/fixture.txt", "/tmp/second.txt"],
+            "frames":["#outer", "#inner"], "timeout_secs":17
+        }});
+        let request: DaemonRequest = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(request.timeout_secs(), 17);
+        assert_eq!(request.read_timeout().as_secs(), 47);
+        assert_eq!(serde_json::to_value(request).unwrap(), payload);
+        let request: DaemonRequest = serde_json::from_value(json!({"method":"Upload", "params": {
+            "instance_id":"i", "page_id":"p1", "selector":"input", "paths":["/tmp/fixture.txt"]
+        }}))
+        .unwrap();
+        assert!(
+            matches!(request, DaemonRequest::Upload { frames, timeout_secs:30, .. } if frames.is_empty())
+        );
+    }
 
     #[test]
     fn evaluate_main_world_round_trip_and_legacy_default() {

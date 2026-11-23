@@ -82,6 +82,18 @@ pub fn render(data: Option<&Value>) -> Rendered {
         return Rendered::out(format!("dialog {verb}: {kind} {message:?}"));
     }
 
+    if data.get("uploaded").and_then(Value::as_bool) == Some(true) {
+        let files = data.get("files").and_then(Value::as_array);
+        return Rendered::out(
+            files
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
     // Structured metadata (`data --og/--jsonld/--meta`).
     if data.get("og").is_some() || data.get("jsonld").is_some() || data.get("meta").is_some() {
         return Rendered::out(pretty(data));
@@ -303,6 +315,15 @@ mod tests {
     use super::*;
     use crate::cli::ipc::DaemonResponse;
     use serde_json::json;
+
+    #[test]
+    fn upload_renders_one_filename_per_line() {
+        let data = json!({"uploaded":true, "selector":"#file", "files":["fixture one.txt", "fixture.pdf"]});
+        assert_eq!(
+            render(Some(&data)),
+            Rendered::out("fixture one.txt\nfixture.pdf")
+        );
+    }
 
     /// `print_response` in JSON mode emits the full response including cookies
     /// with httpOnly preserved — verified by checking `to_string_pretty` output.

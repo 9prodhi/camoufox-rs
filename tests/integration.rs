@@ -4311,3 +4311,448 @@ fn scoped_focus_explicit_blur_then_outside_same_tick_main_world() {
 
     manager.stop(&instance).unwrap();
 }
+
+#[cfg(feature = "cli")]
+struct UploadFixture {
+    manager: camoufox::cli::instance::InstanceManager,
+    instance: String,
+    page: String,
+    files: Vec<String>,
+    _dir: tempfile::TempDir,
+    _server: fixtures::UploadServer,
+}
+
+#[cfg(feature = "cli")]
+impl UploadFixture {
+    fn new() -> Self {
+        let server = fixtures::UploadServer::start();
+        let mut manager = camoufox::cli::instance::InstanceManager::new();
+        let (instance, _, _) = manager.launch(Some(true), None).unwrap();
+        let page = manager.new_page(&instance).unwrap();
+        let mut fixture = Self {
+            manager,
+            instance,
+            page,
+            files: Vec::new(),
+            _dir: tempfile::tempdir().unwrap(),
+            _server: server,
+        };
+        fixture
+            .manager
+            .navigate(
+                &fixture.instance,
+                &fixture.page,
+                &fixture._server.url,
+                Duration::from_secs(30),
+                Some("load"),
+            )
+            .unwrap();
+        fixture.files = ["fixture one.txt", "fixture-two.pdf"]
+            .into_iter()
+            .map(|name| {
+                let path = fixture._dir.path().join(name);
+                std::fs::write(&path, b"fixture contents").unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        fixture
+    }
+
+    fn upload(
+        &self,
+        selector: &str,
+        paths: &[String],
+        frames: &[String],
+    ) -> Result<Vec<String>, String> {
+        self.manager.upload(
+            &self.instance,
+            &self.page,
+            selector,
+            paths,
+            frames,
+            Duration::from_secs(10),
+        )
+    }
+
+    fn assert_files(&self, element: &str, frames: &[String], names: &[&str], events: u64) {
+        let state = self.manager.evaluate_scoped(
+            &self.instance, &self.page,
+            &format!("(() => {{ const el = {element}; return {{length: el.files?.length || 0, names: Array.from(el.files || [], f => f.name), input: Number(el.dataset.input || 0), change: Number(el.dataset.change || 0), inputNames: JSON.parse(el.dataset.inputNames || '[]'), changeNames: JSON.parse(el.dataset.changeNames || '[]')}}; }})()"),
+            false, frames, Duration::from_secs(10),
+        ).unwrap();
+        assert_eq!(
+            state,
+            serde_json::json!({"length":names.len(), "names":names, "input":events, "change":events, "inputNames":names, "changeNames":names})
+        );
+    }
+}
+
+#[cfg(feature = "cli")]
+impl Drop for UploadFixture {
+    fn drop(&mut self) {
+        self.manager.shutdown_all();
+    }
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_single_file_and_replacement() {
+    let fixture = UploadFixture::new();
+    assert_eq!(
+        fixture.upload("#single", &fixture.files[..1], &[]).unwrap(),
+        ["fixture one.txt"]
+    );
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+    fixture.upload("#single", &fixture.files[1..], &[]).unwrap();
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture-two.pdf"],
+        2,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_multiple_files() {
+    let fixture = UploadFixture::new();
+    assert_eq!(
+        fixture.upload("#multiple", &fixture.files, &[]).unwrap(),
+        ["fixture one.txt", "fixture-two.pdf"]
+    );
+    fixture.assert_files(
+        "document.querySelector('#multiple')",
+        &[],
+        &["fixture one.txt", "fixture-two.pdf"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_rejects_multiple_without_attribute() {
+    let fixture = UploadFixture::new();
+    fixture.upload("#single", &fixture.files[..1], &[]).unwrap();
+    assert_eq!(
+        fixture.upload("#single", &fixture.files, &[]).unwrap_err(),
+        "invalid argument: input does not accept multiple files"
+    );
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_same_origin_iframe() {
+    let fixture = UploadFixture::new();
+    let frames = ["#outer".into()];
+    fixture
+        .upload("#single", &fixture.files[..1], &frames)
+        .unwrap();
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &frames,
+        &["fixture one.txt"],
+        1,
+    );
+    fixture.assert_files("document.querySelector('#single')", &[], &[], 0);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_nested_frames_and_shadow_root() {
+    let fixture = UploadFixture::new();
+    let frames = ["#outer".into(), "#inner".into()];
+    fixture
+        .upload("#host >>> input", &fixture.files[..1], &frames)
+        .unwrap();
+    fixture.assert_files(
+        "document.querySelector('#host').shadowRoot.querySelector('input')",
+        &frames,
+        &["fixture one.txt"],
+        1,
+    );
+    fixture.assert_files("document.querySelector('#single')", &[], &[], 0);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_open_shadow_root() {
+    let fixture = UploadFixture::new();
+    fixture
+        .upload("#host >>> input", &fixture.files[..1], &[])
+        .unwrap();
+    fixture.assert_files(
+        "document.querySelector('#host').shadowRoot.querySelector('input')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_hidden_input() {
+    let fixture = UploadFixture::new();
+    fixture.upload("#hidden", &fixture.files[..1], &[]).unwrap();
+    fixture.assert_files(
+        "document.querySelector('#hidden')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_rejects_non_file_input() {
+    let fixture = UploadFixture::new();
+    fixture.upload("#single", &fixture.files[..1], &[]).unwrap();
+    for (selector, description) in [("#text", "input[type=text]"), ("#other", "div[type=]")] {
+        assert_eq!(
+            fixture
+                .upload(selector, &fixture.files[..1], &[])
+                .unwrap_err(),
+            format!("invalid argument: element is not a file input ({description})")
+        );
+    }
+    fixture.assert_files("document.querySelector('#text')", &[], &[], 0);
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_missing_file_does_not_change_input() {
+    let fixture = UploadFixture::new();
+    fixture
+        .upload("#multiple", &fixture.files[..1], &[])
+        .unwrap();
+    let mut paths = fixture.files.clone();
+    paths.push(
+        fixture
+            ._dir
+            .path()
+            .join("missing.txt")
+            .display()
+            .to_string(),
+    );
+    assert!(fixture
+        .upload("#multiple", &paths, &[])
+        .unwrap_err()
+        .starts_with("invalid argument: upload file "));
+    fixture.assert_files(
+        "document.querySelector('#multiple')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_missing_selector_and_scoping_errors() {
+    let fixture = UploadFixture::new();
+    fixture.upload("#single", &fixture.files[..1], &[]).unwrap();
+    assert_eq!(
+        fixture
+            .upload("#absent", &fixture.files[..1], &[])
+            .unwrap_err(),
+        "selector not found: #absent"
+    );
+    let error = fixture
+        .upload("#single", &fixture.files[..1], &["#absent".into()])
+        .unwrap_err();
+    assert_eq!(error, "--frame #absent: no element matches");
+    let error = fixture
+        .upload("#single", &fixture.files[..1], &["#single".into()])
+        .unwrap_err();
+    assert_eq!(error, "--frame #single: element is not an iframe");
+    let error = fixture
+        .upload("#no-root >>> input", &fixture.files[..1], &[])
+        .unwrap_err();
+    assert!(error.contains("shadow root"), "{error}");
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_cli_resolves_client_paths_and_renders_response() {
+    use camoufox::cli::client::send_request;
+    use camoufox::cli::ipc::DaemonRequest;
+    use std::process::{Command, Stdio};
+
+    struct DaemonGuard {
+        child: Child,
+        socket: PathBuf,
+    }
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            let _ = send_request(&self.socket, &DaemonRequest::Shutdown);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let client_dir = dir.path().join("client");
+    let daemon_dir = dir.path().join("daemon");
+    std::fs::create_dir(&client_dir).unwrap();
+    std::fs::create_dir(&daemon_dir).unwrap();
+    for name in ["fixture one.txt", "fixture-two.pdf"] {
+        std::fs::write(client_dir.join(name), b"fixture contents").unwrap();
+    }
+    let socket = dir.path().join("daemon.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_camoufox"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("serve")
+        .current_dir(&daemon_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = DaemonGuard {
+        child,
+        socket: socket.clone(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if send_request(&socket, &DaemonRequest::Ping).is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "test daemon did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_camoufox"))
+            .arg("--socket")
+            .arg(&socket)
+            .args(args)
+            .current_dir(&client_dir)
+            .output()
+            .unwrap()
+    };
+    let json = |args: &[&str]| {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let server = fixtures::UploadServer::start();
+    let launched = json(&["--json", "launch"]);
+    let instance = launched["data"]["instance_id"].as_str().unwrap();
+    let page = json(&["--json", "new-page", instance]);
+    let page = page["data"]["page_id"].as_str().unwrap();
+    json(&[
+        "--json",
+        "navigate",
+        instance,
+        page,
+        &server.url,
+        "--wait-until",
+        "load",
+    ]);
+    let uploaded = json(&[
+        "--json",
+        "upload",
+        instance,
+        page,
+        "#multiple",
+        "fixture one.txt",
+        "fixture-two.pdf",
+        "--frame",
+        "#outer",
+        "--frame",
+        "#inner",
+    ]);
+    assert_eq!(
+        uploaded["data"],
+        serde_json::json!({"uploaded":true, "selector":"#multiple", "files":["fixture one.txt", "fixture-two.pdf"]})
+    );
+    let expression = "(() => { const el = document.querySelector('#multiple'); return {length:el.files.length, names:Array.from(el.files, f=>f.name), input:Number(el.dataset.input), change:Number(el.dataset.change)}; })()";
+    let state = json(&[
+        "--json", "evaluate", instance, page, expression, "--frame", "#outer", "--frame", "#inner",
+    ]);
+    assert_eq!(
+        state["data"]["result"],
+        serde_json::json!({"length":2, "names":["fixture one.txt", "fixture-two.pdf"], "input":1, "change":1})
+    );
+    let output = run(&[
+        "upload",
+        instance,
+        page,
+        "#multiple",
+        "fixture one.txt",
+        "fixture-two.pdf",
+        "--frame",
+        "#outer",
+        "--frame",
+        "#inner",
+    ]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "fixture one.txt\nfixture-two.pdf\n"
+    );
+    assert!(output.stderr.is_empty());
+    let output = run(&["upload", instance, page, "#multiple", "missing.txt"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .starts_with("error: invalid argument: upload file "));
+    let output = run(&[
+        "--json",
+        "upload",
+        instance,
+        page,
+        "#multiple",
+        "missing.txt",
+    ]);
+    assert!(!output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["ok"], false);
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("invalid argument: upload file "));
+}

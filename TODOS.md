@@ -37,3 +37,21 @@ This document tracks known architectural limitations and verified future work it
 - **Context**: `Page.goBack` and `Page.goForward` protocol methods are wired to `camoufox back` and `camoufox forward`. However, in pages initialized via `Browser.newPage`, Camoufox/Firefox does not populate standard session history (`history.length === 0`).
 - **Current Behavior**: The commands report that no session history entry exists.
 - **Follow-up**: Investigate Juggler session history initialization flags or track an in-client navigation stack as a fallback.
+
+---
+
+## 5. Cross-Daemon Profile Locking
+
+- **Status**: Documented limitation.
+- **Context**: Firefox does not support concurrent use of a profile directory and it can corrupt the profile.
+- **Current Behavior**: Persistent profile reservations are in memory in each daemon's `InstanceManager`. Two daemons on different sockets can both launch on the same canonical profile directory.
+- **Follow-up**: Add a filesystem lock, such as `flock` on a lock file in the profile directory, held for the browser's lifetime.
+
+---
+
+## 6. Record/Replay for Popups and Service-Worker Requests
+
+- **Status**: Documented limitation.
+- **Context**: Record and replay use a page's network session.
+- **Current Behavior**: Record and replay apply to one page, including its subframes. Popups opened from that page are not recorded or replayed; requests handled by a service worker are not intercepted.
+- **Follow-up**: Extend record and replay to popup pages and investigate capturing and intercepting service-worker requests.

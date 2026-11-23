@@ -37,7 +37,7 @@ pub struct Cli {
     pub json: bool,
 
     /// Path to the daemon Unix socket.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "CAMOUFOX_SOCKET")]
     pub socket: Option<String>,
 
     #[command(subcommand)]
@@ -48,6 +48,18 @@ pub struct Cli {
 pub enum Command {
     /// Start the daemon process.
     Serve,
+
+    /// Record a page's HTTP exchanges into a cassette.
+    Record {
+        #[command(subcommand)]
+        action: RecordAction,
+    },
+
+    /// Serve a page's HTTP requests from a cassette, aborting misses.
+    Replay {
+        #[command(subcommand)]
+        action: ReplayAction,
+    },
 
     /// Launch a new browser instance.
     Launch {
@@ -68,6 +80,9 @@ pub enum Command {
         /// JavaScript dialog handling policy.
         #[arg(long, value_enum, default_value = "manual")]
         dialogs: DialogMode,
+        /// Absolute path; created with mode 0700 or group/other permissions removed, canonicalized, must be empty or an existing profile, never deleted on stop.
+        #[arg(long)]
+        profile_dir: Option<PathBuf>,
     },
 
     /// Accept or dismiss an open JavaScript dialog.
@@ -387,6 +402,25 @@ pub enum Command {
         frames: Vec<String>,
     },
 
+    /// Set files on a file input, including hidden inputs.
+    Upload {
+        /// Instance ID.
+        instance_id: String,
+        /// Page ID.
+        page_id: String,
+        /// CSS selector of the file input. Supports ` >>> ` shadow piercing.
+        selector: String,
+        /// Files to upload, resolved against the client's working directory.
+        #[arg(required = true, num_args = 1.., value_name = "PATH")]
+        paths: Vec<String>,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
+        /// Overall command timeout in seconds.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+    },
+
     /// Type text into whatever element currently has focus.
     Type {
         /// Instance ID.
@@ -494,5 +528,200 @@ pub enum Command {
         /// Optional timeout in seconds to wait for download events.
         #[arg(long)]
         wait: Option<u64>,
+    },
+
+    /// External subcommand: `camoufox <name> [args...]` runs `camoufox-<name>` from PATH.
+    ///
+    /// Built-in subcommand names always win. When `<name>` is not a built-in,
+    /// the binary `camoufox-<name>` is looked up on `PATH` and executed with the
+    /// remaining arguments, inheriting stdio, the current environment, and
+    /// `CAMOUFOX_SOCKET` set to the absolute daemon socket path, and
+    /// `CAMOUFOX_JSON=1` when the global `--json` flag is given.
+    /// Exit code mirrors the child (signal → 128+n on Unix).
+    ///
+    /// Names containing path separators are treated as not found.
+    #[command(external_subcommand)]
+    External(Vec<String>),
+}
+
+/// Look up an external subcommand executable on `PATH`.
+///
+/// Returns `Some(path)` if `camoufox-<name>` is found on `PATH` and is an
+/// executable file. Returns `None` if `name` is empty, contains path
+/// separators, or is not found on `PATH`. Relative and empty `PATH` entries
+/// are skipped.
+pub fn find_external_subcommand(name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(std::path::is_separator) {
+        return None;
+    }
+
+    let bin_name = format!("camoufox-{name}");
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        if !dir.is_absolute() {
+            continue;
+        }
+        let candidate = dir.join(&bin_name);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = candidate.metadata() {
+                if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) {
+                    return Some(candidate);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_external_subcommand_rejects_empty_and_separators() {
+        // Isolate PATH in a child test process so parallel tests keep their
+        // environment. Both separator names lead to real executables if the
+        // lookup guard is removed.
+        const FIXTURE: &str = "CAMOUFOX_SEPARATOR_FIXTURE";
+        if let Some(dir) = std::env::var_os(FIXTURE) {
+            let dir = PathBuf::from(dir);
+            for name in ["foo/bar", "../cmd"] {
+                let candidate = dir.join(format!("camoufox-{name}"));
+                assert!(candidate.is_file(), "{}", candidate.display());
+                assert!(find_external_subcommand(name).is_none(), "{name}");
+            }
+            assert!(find_external_subcommand("").is_none());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["camoufox-foo/bar", "camoufox-../cmd"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            crate::test_script::write_script(
+                &path,
+                "#!/bin/sh\necho SEPARATOR_EXECUTED\nexit 42\n",
+                0o755,
+            );
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("PATH", dir.path())
+            .env(FIXTURE, dir.path())
+            .args([
+                "--exact",
+                "cli::commands::tests::find_external_subcommand_rejects_empty_and_separators",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "{stdout}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(test)]
+mod cassette_command_tests {
+    use super::*;
+
+    #[test]
+    fn record_replay_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "camoufox",
+            "record",
+            "start",
+            "i",
+            "p1",
+            "--dir",
+            "/tmp/cassette",
+            "--url",
+            "example",
+            "--url",
+            "data",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Record { action: RecordAction::Start { urls, .. } } if urls == ["example", "data"])
+        );
+        let cli = Cli::try_parse_from([
+            "camoufox",
+            "replay",
+            "start",
+            "i",
+            "p1",
+            "--dir",
+            "/tmp/cassette",
+            "--match-body",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Replay {
+                action: ReplayAction::Start {
+                    match_body: true,
+                    ..
+                }
+            }
+        ));
+        assert!(Cli::try_parse_from(["camoufox", "record", "stop", "i", "p1"]).is_ok());
+        assert!(Cli::try_parse_from(["camoufox", "replay", "stop", "i", "p1"]).is_ok());
+        assert!(Cli::try_parse_from(["camoufox", "record", "start", "i", "p1"]).is_err());
+    }
+}
+
+/// Start or stop recording a page's HTTP exchanges.
+#[derive(Subcommand)]
+pub enum RecordAction {
+    /// Begin passive recording into an empty absolute directory.
+    Start {
+        instance_id: String,
+        page_id: String,
+        /// Absolute cassette directory; must be empty or absent.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Include URLs matching any of these regexes (all URLs by default).
+        #[arg(long = "url", action = clap::ArgAction::Append)]
+        urls: Vec<String>,
+    },
+    /// Finalize the cassette and return exchange and body counts.
+    Stop {
+        instance_id: String,
+        page_id: String,
+    },
+}
+
+/// Start or stop offline replay of a page's HTTP requests.
+#[derive(Subcommand)]
+pub enum ReplayAction {
+    /// Validate a cassette and enable interception for this page.
+    Start {
+        instance_id: String,
+        page_id: String,
+        /// Absolute cassette directory containing index.json and bodies/.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Include the raw request body hash in matching.
+        #[arg(long)]
+        match_body: bool,
+    },
+    /// Disable interception and return served count and missed requests.
+    Stop {
+        instance_id: String,
+        page_id: String,
     },
 }

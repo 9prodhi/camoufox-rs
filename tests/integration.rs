@@ -8,6 +8,10 @@
 //! cargo test --all-features --test integration -- --ignored --test-threads=1
 //! ```
 
+#[cfg(all(unix, feature = "cli"))]
+#[path = "support/script.rs"]
+mod script;
+
 use std::path::PathBuf;
 use std::process::Child;
 use std::time::Duration;
@@ -21,6 +25,87 @@ use camoufox::protocol::client::Connection;
 use camoufox::transport::pipe::PipeTransport;
 
 mod fixtures;
+
+/// Exercise both output modes through the real CLI and a private daemon socket.
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn cli_error_kind_missing_selector_preserves_plain_stderr() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct PrivateDaemon {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+    }
+    impl Drop for PrivateDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let result = thread.join();
+                if !std::thread::panicking() {
+                    result.unwrap().unwrap();
+                }
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let server = fixtures::ClickServer::start();
+    let manager = Arc::new(InstanceManager::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let _daemon = PrivateDaemon {
+        stop: Arc::clone(&stop),
+        thread: Some(std::thread::spawn({
+            let manager = Arc::clone(&manager);
+            let socket = socket.clone();
+            move || camoufox::cli::daemon::serve(&socket, manager, stop)
+        })),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "private daemon did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (instance, _, _) = manager.launch_with(&LaunchOptions::default()).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url,
+            Duration::from_secs(30),
+            Some("load"),
+        )
+        .unwrap();
+
+    let run = |json_mode: bool| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_camoufox"));
+        command.arg("--socket").arg(&socket);
+        if json_mode {
+            command.arg("--json");
+        }
+        command.args(["click", &instance, &page, "#missing", "--timeout", "5"]);
+        command.output().unwrap()
+    };
+    let json = run(true);
+    assert_eq!(json.status.code(), Some(1));
+    assert!(json.stderr.is_empty(), "{:?}", json.stderr);
+    let response: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["kind"], "selector_not_found");
+    assert_eq!(response["error"], "selector not found: #missing");
+    assert!(response.get("data").is_none());
+
+    let plain = run(false);
+    assert_eq!(plain.status.code(), Some(1));
+    assert!(plain.stdout.is_empty());
+    assert_eq!(plain.stderr, b"error: selector not found: #missing\n");
+}
 
 /// Resolved the same way as the daemon: see [`camoufox::config::default_executable`].
 fn camoufox_bin() -> String {
@@ -1157,13 +1242,12 @@ fn downloads_dir_saves_file_at_uuid_path() {
     let downloads_dir = dir.path().to_path_buf();
 
     let manager = InstanceManager::new();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.downloads_dir = Some(downloads_dir.clone());
     let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            downloads_dir: Some(downloads_dir.clone()),
-            ..Default::default()
-        })
+        .launch_with(&launch_options)
         .expect("launch_with failed");
 
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
@@ -1230,13 +1314,12 @@ fn navigate_download_with_dir_still_returns_navigation_became_download_and_logs(
     let downloads_dir = dir.path().to_path_buf();
 
     let manager = InstanceManager::new();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.downloads_dir = Some(downloads_dir);
     let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            downloads_dir: Some(downloads_dir),
-            ..Default::default()
-        })
+        .launch_with(&launch_options)
         .expect("launch_with failed");
 
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
@@ -1341,14 +1424,12 @@ fn main_world_strict_csp_reports_bypass_hint() {
 
     let csp = CspServer::start();
     let manager = InstanceManager::new();
-    let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            bypass_csp: false,
-            ..Default::default()
-        })
-        .expect("launch failed");
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.bypass_csp = false;
+    let (instance_id, _version, _pid) =
+        manager.launch_with(&launch_options).expect("launch failed");
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
     let timeout = Duration::from_secs(30);
 
@@ -1390,14 +1471,12 @@ fn main_world_strict_csp_works_with_bypass_csp() {
 
     let csp = CspServer::start();
     let manager = InstanceManager::new();
-    let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            bypass_csp: true,
-            ..Default::default()
-        })
-        .expect("launch failed");
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.bypass_csp = true;
+    let (instance_id, _version, _pid) =
+        manager.launch_with(&launch_options).expect("launch failed");
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
     let timeout = Duration::from_secs(30);
 
@@ -1433,14 +1512,12 @@ fn main_world_unsafe_inline_works_without_flag() {
 
     let csp = CspServer::start();
     let manager = InstanceManager::new();
-    let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            bypass_csp: false,
-            ..Default::default()
-        })
-        .expect("launch failed");
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.bypass_csp = false;
+    let (instance_id, _version, _pid) =
+        manager.launch_with(&launch_options).expect("launch failed");
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
     let timeout = Duration::from_secs(30);
 
@@ -1476,14 +1553,12 @@ fn main_world_nonce_csp_feasibility() {
 
     let csp = CspServer::start();
     let manager = InstanceManager::new();
-    let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            bypass_csp: false,
-            ..Default::default()
-        })
-        .expect("launch failed");
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.bypass_csp = false;
+    let (instance_id, _version, _pid) =
+        manager.launch_with(&launch_options).expect("launch failed");
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
     let timeout = Duration::from_secs(30);
 
@@ -1521,14 +1596,12 @@ fn main_world_page_global_named_val_is_readable() {
 
     let csp = CspServer::start();
     let manager = InstanceManager::new();
-    let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            bypass_csp: false,
-            ..Default::default()
-        })
-        .expect("launch failed");
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.bypass_csp = false;
+    let (instance_id, _version, _pid) =
+        manager.launch_with(&launch_options).expect("launch failed");
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
     let timeout = Duration::from_secs(30);
 
@@ -1643,14 +1716,11 @@ fn accept_policy_auto_handles() {
     use camoufox::cli::instance::{InstanceManager, LaunchOptions};
     let server = fixtures::DialogServer::start();
     let manager = InstanceManager::new();
-    let (instance, _, _) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            dialogs: DialogPolicy::Accept,
-            ..Default::default()
-        })
-        .unwrap();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.dialogs = DialogPolicy::Accept;
+    let (instance, _, _) = manager.launch_with(&launch_options).unwrap();
     let page = manager.new_page(&instance).unwrap();
     let timeout = Duration::from_secs(10);
     manager
@@ -4310,4 +4380,916 @@ fn scoped_focus_explicit_blur_then_outside_same_tick_main_world() {
     );
 
     manager.stop(&instance).unwrap();
+}
+
+#[cfg(feature = "cli")]
+struct UploadFixture {
+    manager: camoufox::cli::instance::InstanceManager,
+    instance: String,
+    page: String,
+    files: Vec<String>,
+    _dir: tempfile::TempDir,
+    _server: fixtures::UploadServer,
+}
+
+#[cfg(feature = "cli")]
+impl UploadFixture {
+    fn new() -> Self {
+        let server = fixtures::UploadServer::start();
+        let mut manager = camoufox::cli::instance::InstanceManager::new();
+        let (instance, _, _) = manager.launch(Some(true), None).unwrap();
+        let page = manager.new_page(&instance).unwrap();
+        let mut fixture = Self {
+            manager,
+            instance,
+            page,
+            files: Vec::new(),
+            _dir: tempfile::tempdir().unwrap(),
+            _server: server,
+        };
+        fixture
+            .manager
+            .navigate(
+                &fixture.instance,
+                &fixture.page,
+                &fixture._server.url,
+                Duration::from_secs(30),
+                Some("load"),
+            )
+            .unwrap();
+        fixture.files = [
+            (
+                "fixture one.txt",
+                b"fixture one distinct payload: 12345" as &[u8],
+            ),
+            (
+                "fixture-two.pdf",
+                b"fixture-two pdf binary payload: 678901234567890" as &[u8],
+            ),
+        ]
+        .into_iter()
+        .map(|(name, data)| {
+            let path = fixture._dir.path().join(name);
+            std::fs::write(&path, data).unwrap();
+            path.to_string_lossy().into_owned()
+        })
+        .collect();
+        fixture
+    }
+
+    fn upload(
+        &self,
+        selector: &str,
+        paths: &[String],
+        frames: &[String],
+    ) -> Result<Vec<String>, String> {
+        self.manager
+            .upload(
+                &self.instance,
+                &self.page,
+                selector,
+                paths,
+                frames,
+                Duration::from_secs(10),
+            )
+            .map(|(files, _)| files)
+    }
+
+    fn assert_files(&self, element: &str, frames: &[String], names: &[&str], events: u64) {
+        let expected_sizes: Vec<u64> = names
+            .iter()
+            .map(|name| match *name {
+                "fixture one.txt" => 35,
+                "fixture-two.pdf" => 47,
+                other => panic!("unexpected fixture file: {other}"),
+            })
+            .collect();
+        let state = self.manager.evaluate_scoped(
+            &self.instance, &self.page,
+            &format!("(() => {{ const el = {element}; return {{length: el.files?.length || 0, names: Array.from(el.files || [], f => f.name), sizes: Array.from(el.files || [], f => f.size), input: Number(el.dataset.input || 0), change: Number(el.dataset.change || 0), inputNames: JSON.parse(el.dataset.inputNames || '[]'), changeNames: JSON.parse(el.dataset.changeNames || '[]')}}; }})()"),
+            false, frames, Duration::from_secs(10),
+        ).unwrap();
+        assert_eq!(
+            state,
+            serde_json::json!({
+                "length": names.len(),
+                "names": names,
+                "sizes": expected_sizes,
+                "input": events,
+                "change": events,
+                "inputNames": names,
+                "changeNames": names,
+            })
+        );
+    }
+}
+
+#[cfg(feature = "cli")]
+impl Drop for UploadFixture {
+    fn drop(&mut self) {
+        self.manager.shutdown_all();
+    }
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_single_file_and_replacement() {
+    let fixture = UploadFixture::new();
+    assert_eq!(
+        fixture.upload("#single", &fixture.files[..1], &[]).unwrap(),
+        ["fixture one.txt"]
+    );
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+    fixture.upload("#single", &fixture.files[1..], &[]).unwrap();
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture-two.pdf"],
+        2,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_multiple_files() {
+    let fixture = UploadFixture::new();
+    assert_eq!(
+        fixture.upload("#multiple", &fixture.files, &[]).unwrap(),
+        ["fixture one.txt", "fixture-two.pdf"]
+    );
+    fixture.assert_files(
+        "document.querySelector('#multiple')",
+        &[],
+        &["fixture one.txt", "fixture-two.pdf"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_rejects_multiple_without_attribute() {
+    let fixture = UploadFixture::new();
+    fixture.upload("#single", &fixture.files[..1], &[]).unwrap();
+    assert_eq!(
+        fixture.upload("#single", &fixture.files, &[]).unwrap_err(),
+        "invalid argument: input does not accept multiple files"
+    );
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_same_origin_iframe() {
+    let fixture = UploadFixture::new();
+    let frames = ["#outer".into()];
+    fixture
+        .upload("#single", &fixture.files[..1], &frames)
+        .unwrap();
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &frames,
+        &["fixture one.txt"],
+        1,
+    );
+    fixture.assert_files("document.querySelector('#single')", &[], &[], 0);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_nested_frames_and_shadow_root() {
+    let fixture = UploadFixture::new();
+    let frames = ["#outer".into(), "#inner".into()];
+    fixture
+        .upload("#host >>> input", &fixture.files[..1], &frames)
+        .unwrap();
+    fixture.assert_files(
+        "document.querySelector('#host').shadowRoot.querySelector('input')",
+        &frames,
+        &["fixture one.txt"],
+        1,
+    );
+    fixture.assert_files("document.querySelector('#single')", &[], &[], 0);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_open_shadow_root() {
+    let fixture = UploadFixture::new();
+    fixture
+        .upload("#host >>> input", &fixture.files[..1], &[])
+        .unwrap();
+    fixture.assert_files(
+        "document.querySelector('#host').shadowRoot.querySelector('input')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_hidden_input() {
+    let fixture = UploadFixture::new();
+    fixture.upload("#hidden", &fixture.files[..1], &[]).unwrap();
+    fixture.assert_files(
+        "document.querySelector('#hidden')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_rejects_non_file_input() {
+    let fixture = UploadFixture::new();
+    fixture.upload("#single", &fixture.files[..1], &[]).unwrap();
+    for (selector, description) in [("#text", "input[type=text]"), ("#other", "div[type=]")] {
+        assert_eq!(
+            fixture
+                .upload(selector, &fixture.files[..1], &[])
+                .unwrap_err(),
+            format!("invalid argument: element is not a file input ({description})")
+        );
+    }
+    fixture.assert_files("document.querySelector('#text')", &[], &[], 0);
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_missing_file_does_not_change_input() {
+    let fixture = UploadFixture::new();
+    fixture
+        .upload("#multiple", &fixture.files[..1], &[])
+        .unwrap();
+    let mut paths = fixture.files.clone();
+    paths.push(
+        fixture
+            ._dir
+            .path()
+            .join("missing.txt")
+            .display()
+            .to_string(),
+    );
+    assert!(fixture
+        .upload("#multiple", &paths, &[])
+        .unwrap_err()
+        .starts_with("invalid argument: upload file "));
+    fixture.assert_files(
+        "document.querySelector('#multiple')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_missing_selector_and_scoping_errors() {
+    let fixture = UploadFixture::new();
+    fixture.upload("#single", &fixture.files[..1], &[]).unwrap();
+    assert_eq!(
+        fixture
+            .upload("#absent", &fixture.files[..1], &[])
+            .unwrap_err(),
+        "selector not found: #absent"
+    );
+    let error = fixture
+        .upload("#single", &fixture.files[..1], &["#absent".into()])
+        .unwrap_err();
+    assert_eq!(error, "--frame #absent: no element matches");
+    let error = fixture
+        .upload("#single", &fixture.files[..1], &["#single".into()])
+        .unwrap_err();
+    assert_eq!(error, "--frame #single: element is not an iframe");
+    let error = fixture
+        .upload("#no-root >>> input", &fixture.files[..1], &[])
+        .unwrap_err();
+    assert!(error.contains("shadow root"), "{error}");
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_unknown_page_and_instance_after_path_validation() {
+    use camoufox::cli::ipc::DaemonResponse;
+    let fixture = UploadFixture::new();
+    let kind = |error: String| DaemonResponse::err(error).kind.unwrap();
+    let missing = fixture
+        ._dir
+        .path()
+        .join("missing.txt")
+        .display()
+        .to_string();
+    let upload = |instance: &str, page: &str, paths: &[String]| {
+        fixture.manager.upload(
+            instance,
+            page,
+            "#single",
+            paths,
+            &[],
+            Duration::from_secs(10),
+        )
+    };
+    let error = upload(&fixture.instance, "p99", &fixture.files[..1]).unwrap_err();
+    assert_eq!(error, "page p99 not found");
+    assert_eq!(kind(error), "page_not_found");
+    let error = upload("ffffffff", &fixture.page, &fixture.files[..1]).unwrap_err();
+    assert_eq!(error, "instance ffffffff not found");
+    assert_eq!(kind(error), "instance_not_found");
+    // Path validation runs before any instance or page lookup.
+    let error = upload("ffffffff", "p99", &[missing]).unwrap_err();
+    assert!(
+        error.starts_with("invalid argument: upload file "),
+        "{error}"
+    );
+    assert_eq!(kind(error), "invalid_argument");
+    // The page stays usable after the rejected requests.
+    fixture.upload("#single", &fixture.files[..1], &[]).unwrap();
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_rejects_directory_picker_inputs() {
+    let fixture = UploadFixture::new();
+    let err = fixture
+        .upload("#directory", &fixture.files[..1], &[])
+        .unwrap_err();
+    assert_eq!(
+        err,
+        "invalid argument: directory-picker inputs (webkitdirectory) are not supported"
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_onchange_alert_returns_success_with_dialog_info() {
+    let fixture = UploadFixture::new();
+    let (files, outcome) = fixture
+        .manager
+        .upload(
+            &fixture.instance,
+            &fixture.page,
+            "#alert-on-change",
+            &fixture.files[..1],
+            &[],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    assert_eq!(files, ["fixture one.txt"]);
+    let dialog = outcome.dialog.expect("dialog info must be returned");
+    assert_eq!(dialog.kind, "alert");
+    assert_eq!(dialog.message, "file selected");
+    // Accept the dialog so subsequent page evaluations can proceed.
+    fixture
+        .manager
+        .dialog(&fixture.instance, &fixture.page, true, None)
+        .unwrap();
+    // Verify the file was indeed set on the input.
+    fixture.assert_files(
+        "document.querySelector('#alert-on-change')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_cli_resolves_client_paths_and_renders_response() {
+    use camoufox::cli::client::send_request;
+    use camoufox::cli::ipc::DaemonRequest;
+    use std::process::{Command, Stdio};
+
+    struct DaemonGuard {
+        child: Child,
+        socket: PathBuf,
+    }
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            let _ = send_request(&self.socket, &DaemonRequest::Shutdown);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let client_dir = dir.path().join("client");
+    let daemon_dir = dir.path().join("daemon");
+    std::fs::create_dir(&client_dir).unwrap();
+    std::fs::create_dir(&daemon_dir).unwrap();
+    let cli_files = [
+        ("fixture one.txt", b"client fixture one text data" as &[u8]),
+        (
+            "fixture-two.pdf",
+            b"client fixture-two pdf distinct payload" as &[u8],
+        ),
+    ];
+    for (name, content) in cli_files {
+        std::fs::write(client_dir.join(name), content).unwrap();
+    }
+    let socket = dir.path().join("daemon.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_camoufox"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("serve")
+        .current_dir(&daemon_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = DaemonGuard {
+        child,
+        socket: socket.clone(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if send_request(&socket, &DaemonRequest::Ping).is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "test daemon did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_camoufox"))
+            .arg("--socket")
+            .arg(&socket)
+            .args(args)
+            .current_dir(&client_dir)
+            .output()
+            .unwrap()
+    };
+    let json = |args: &[&str]| {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let server = fixtures::UploadServer::start();
+    let launched = json(&["--json", "launch"]);
+    let instance = launched["data"]["instance_id"].as_str().unwrap();
+    let page = json(&["--json", "new-page", instance]);
+    let page = page["data"]["page_id"].as_str().unwrap();
+    json(&[
+        "--json",
+        "navigate",
+        instance,
+        page,
+        &server.url,
+        "--wait-until",
+        "load",
+    ]);
+    let uploaded = json(&[
+        "--json",
+        "upload",
+        instance,
+        page,
+        "#multiple",
+        "fixture one.txt",
+        "fixture-two.pdf",
+        "--frame",
+        "#outer",
+        "--frame",
+        "#inner",
+    ]);
+    assert_eq!(
+        uploaded["data"],
+        serde_json::json!({"uploaded":true, "selector":"#multiple", "files":["fixture one.txt", "fixture-two.pdf"]})
+    );
+    let expression = "(() => { const el = document.querySelector('#multiple'); return {length:el.files.length, names:Array.from(el.files, f=>f.name), sizes:Array.from(el.files, f=>f.size), input:Number(el.dataset.input), change:Number(el.dataset.change)}; })()";
+    let state = json(&[
+        "--json", "evaluate", instance, page, expression, "--frame", "#outer", "--frame", "#inner",
+    ]);
+    assert_eq!(
+        state["data"]["result"],
+        serde_json::json!({"length":2, "names":["fixture one.txt", "fixture-two.pdf"], "sizes":[28, 39], "input":1, "change":1})
+    );
+    let output = run(&[
+        "upload",
+        instance,
+        page,
+        "#multiple",
+        "fixture one.txt",
+        "fixture-two.pdf",
+        "--frame",
+        "#outer",
+        "--frame",
+        "#inner",
+    ]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "fixture one.txt\nfixture-two.pdf\n"
+    );
+    assert!(output.stderr.is_empty());
+    let output = run(&["upload", instance, page, "#multiple", "missing.txt"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .starts_with("error: invalid argument: upload file "));
+    let output = run(&[
+        "--json",
+        "upload",
+        instance,
+        page,
+        "#multiple",
+        "missing.txt",
+    ]);
+    assert!(!output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["ok"], false);
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("invalid argument: upload file "));
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_persists_after_stop() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let profile_temp = tempfile::tempdir().expect("create profile tempdir");
+    let profile_path = profile_temp.path().canonicalize().expect("canonicalize");
+
+    let manager = InstanceManager::new();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.profile_dir = Some(profile_path.to_string_lossy().into_owned());
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&launch_options)
+        .expect("launch_with persistent profile failed");
+
+    // Check list output shows profile_dir
+    let list = manager.list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(
+        list[0]["profile_dir"].as_str(),
+        Some(profile_path.to_str().unwrap())
+    );
+
+    // Stop instance
+    manager.stop(&instance_id).expect("stop failed");
+
+    // Directory still exists and contains files written by browser (e.g. prefs.js)
+    assert!(profile_path.exists());
+    assert!(
+        profile_path.join("prefs.js").exists(),
+        "prefs.js must persist after instance stop"
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_refuses_second_instance_on_same_dir() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let profile_temp = tempfile::tempdir().expect("create profile tempdir");
+    let profile_path = profile_temp.path().canonicalize().expect("canonicalize");
+
+    let manager = InstanceManager::new();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.profile_dir = Some(profile_path.to_string_lossy().into_owned());
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&launch_options)
+        .expect("first launch failed");
+
+    // Second launch with same canonical path should be refused
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.profile_dir = Some(profile_path.to_string_lossy().into_owned());
+    let err = manager.launch_with(&launch_options).unwrap_err();
+
+    assert_eq!(
+        err,
+        format!("invalid argument: profile directory already in use by instance {instance_id}")
+    );
+
+    manager.stop(&instance_id).expect("stop failed");
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_refuses_relative_path() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let manager = InstanceManager::new();
+    let mut options = LaunchOptions::default();
+    options.headless = Some(true);
+    options.executable = Some(camoufox_bin());
+    options.profile_dir = Some("relative/profile/path".to_string());
+    let err = manager.launch_with(&options).unwrap_err();
+
+    assert_eq!(
+        err,
+        "invalid argument: --profile-dir must be an absolute path"
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_list_shows_only_for_persistent() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let profile_temp = tempfile::tempdir().expect("create profile tempdir");
+    let profile_path = profile_temp.path().canonicalize().expect("canonicalize");
+
+    let manager = InstanceManager::new();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.profile_dir = Some(profile_path.to_string_lossy().into_owned());
+    let (inst1, _, _) = manager
+        .launch_with(&launch_options)
+        .expect("inst1 launch failed");
+
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.profile_dir = None;
+    let (inst2, _, _) = manager
+        .launch_with(&launch_options)
+        .expect("inst2 launch failed");
+
+    let list = manager.list();
+    assert_eq!(list.len(), 2);
+
+    let item1 = list.iter().find(|i| i["instance_id"] == inst1).unwrap();
+    let item2 = list.iter().find(|i| i["instance_id"] == inst2).unwrap();
+
+    assert_eq!(
+        item1["profile_dir"].as_str(),
+        Some(profile_path.to_str().unwrap())
+    );
+    assert!(item2.get("profile_dir").is_none());
+
+    manager.stop(&inst1).expect("stop inst1");
+    manager.stop(&inst2).expect("stop inst2");
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_aliases_collide_and_release_on_stop() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let profile = temp.path().join("profile");
+    let link = temp.path().join("profile-link");
+    let launch = |manager: &InstanceManager, dir: &std::path::Path| {
+        let mut launch_options = LaunchOptions::default();
+        launch_options.headless = Some(true);
+        launch_options.executable = Some(camoufox_bin());
+        launch_options.profile_dir = Some(dir.to_string_lossy().into_owned());
+        manager.launch_with(&launch_options)
+    };
+
+    let manager = InstanceManager::new();
+    // The directory does not exist yet: launch creates it.
+    let (first, _, _) = launch(&manager, &profile).expect("first launch");
+    std::os::unix::fs::symlink(&profile, &link).unwrap();
+
+    // Any alias of a profile in use is refused before a browser starts.
+    let error = launch(&manager, &link).unwrap_err();
+    assert_eq!(
+        error,
+        format!("invalid argument: profile directory already in use by instance {first}")
+    );
+    assert_eq!(manager.list().len(), 1);
+    manager.stop(&first).expect("stop first");
+
+    // After stop, the same directory (via another alias) is reusable.
+    let dotted = PathBuf::from(format!("{}/./", link.display()));
+    let (second, _, _) = launch(&manager, &dotted).expect("relaunch");
+    assert_ne!(first, second);
+    let listed = manager.list();
+    assert_eq!(
+        listed[0]["profile_dir"].as_str(),
+        Some(profile.canonicalize().unwrap().to_str().unwrap())
+    );
+    let page = manager.new_page(&second).unwrap();
+    assert_eq!(
+        manager
+            .evaluate(&second, &page, "1 + 1", Duration::from_secs(10))
+            .unwrap(),
+        2
+    );
+    manager.stop(&second).expect("stop second");
+    assert!(profile.is_dir(), "persistent profile must survive stop");
+}
+
+/// Persistent launches use disk storage; temporary launches get fresh storage.
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_persists_cookie_and_local_storage_across_relaunch() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    struct StorageServer {
+        server: std::sync::Arc<tiny_http::Server>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for StorageServer {
+        fn drop(&mut self) {
+            self.server.unblock();
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+    let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+    let url = format!("http://{}/", server.server_addr());
+    let _server = StorageServer {
+        server: server.clone(),
+        worker: Some(std::thread::spawn(move || {
+            while let Ok(request) = server.recv() {
+                let _ = request.respond(tiny_http::Response::from_string(
+                    "<!doctype html><html><head><title>Storage</title><link rel='icon' href='data:,'></head><body id='storage'>Storage</body></html>"
+                ).with_header(tiny_http::Header::from_bytes("Content-Type", "text/html").unwrap()));
+            }
+        })),
+    };
+    let timeout = Duration::from_secs(15);
+    for (persistent, shutdown) in [(false, false), (true, false), (false, true), (true, true)] {
+        let profile = tempfile::tempdir().unwrap();
+        let manager = InstanceManager::new();
+        let mut options = LaunchOptions::default();
+        options.headless = Some(true);
+        options.executable = Some(camoufox_bin());
+        options.profile_dir = persistent.then(|| profile.path().display().to_string());
+        let (first, _, _) = manager.launch_with(&options).unwrap();
+        let page = manager.new_page(&first).unwrap();
+        manager
+            .navigate(&first, &page, &url, timeout, Some("load"))
+            .unwrap();
+        assert_eq!(manager.evaluate_main_world(&first, &page,
+            "(() => { document.cookie = 'saved=value; Max-Age=3600; Path=/'; localStorage.setItem('saved', 'value'); return [document.cookie, localStorage.getItem('saved')]; })()",
+            timeout).unwrap(), serde_json::json!(["saved=value", "value"]));
+        if shutdown {
+            manager.shutdown_all();
+        } else {
+            manager.stop(&first).unwrap();
+        }
+
+        let (second, _, _) = manager.launch_with(&options).unwrap();
+        let page = manager.new_page(&second).unwrap();
+        manager
+            .navigate(&second, &page, &url, timeout, Some("load"))
+            .unwrap();
+        let state = manager
+            .evaluate_main_world(
+                &second,
+                &page,
+                "[document.cookie, localStorage.getItem('saved')]",
+                timeout,
+            )
+            .unwrap();
+        manager.stop(&second).unwrap();
+        assert_eq!(
+            state,
+            if persistent {
+                serde_json::json!(["saved=value", "value"])
+            } else {
+                serde_json::json!(["", null])
+            },
+            "persistent={persistent}, shutdown={shutdown}"
+        );
+    }
+}
+
+/// Hold the first child before browser startup so the launches overlap deterministically.
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_reserves_before_browser_ready_and_releases_failed_spawn() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("profile");
+    let marker = dir.path().join("started");
+    let gate = dir.path().join("gate");
+    let wrapper = dir.path().join("browser");
+    // Quote fixture paths even if a test runner uses a directory containing spaces.
+    let quote =
+        |path: &std::path::Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    script::write_script(
+        &wrapper,
+        &format!(
+        "#!/bin/sh\nprintf ready > {}\nwhile [ ! -f {} ]; do sleep 0.01; done\nexec {} \"$@\"\n",
+        quote(&marker), quote(&gate), quote(std::path::Path::new(&camoufox_bin()))
+    ),
+        0o700,
+    );
+    let manager = Arc::new(InstanceManager::new());
+    let mut options = LaunchOptions::default();
+    options.headless = Some(true);
+    options.executable = Some(wrapper.display().to_string());
+    options.profile_dir = Some(profile.display().to_string());
+    let first = std::thread::spawn({
+        let manager = Arc::clone(&manager);
+        let options = options.clone();
+        move || manager.launch_with(&options)
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let started = marker.exists();
+    let second = if started {
+        let mut launch_options = options.clone();
+        launch_options.executable = Some(camoufox_bin());
+        manager.launch_with(&launch_options)
+    } else {
+        Err("first child did not start".into())
+    };
+    // Clean up even on the buggy implementation where the second launch succeeds.
+    if let Ok((id, _, _)) = &second {
+        manager.stop(id).unwrap();
+    }
+    std::fs::write(&gate, b"continue").unwrap();
+    let (id, _, _) = first.join().unwrap().unwrap();
+    manager.stop(&id).unwrap();
+    assert!(started, "first child must reach the startup gate");
+    assert_eq!(
+        second.unwrap_err(),
+        "invalid argument: profile directory already in use by a launch in progress"
+    );
+
+    for executable in [
+        dir.path().join("missing-browser"),
+        PathBuf::from("/bin/false"),
+    ] {
+        let mut launch_options = options.clone();
+        launch_options.executable = Some(executable.display().to_string());
+        let error = manager.launch_with(&launch_options).unwrap_err();
+        assert!(
+            error.starts_with("failed to spawn browser:")
+                || error.starts_with("browser did not become ready:"),
+            "{error}"
+        );
+        let mut launch_options = options.clone();
+        launch_options.executable = Some(camoufox_bin());
+        let (id, _, _) = manager
+            .launch_with(&launch_options)
+            .expect("failed startup must release the profile reservation");
+        manager.stop(&id).unwrap();
+    }
 }

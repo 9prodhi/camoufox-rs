@@ -240,11 +240,13 @@ impl Harness {
             pid: child.id(),
             child,
             version: None,
-            _profile_dir: tempfile::tempdir().unwrap(),
+            profile_dir: super::ProfileDir::Temp(tempfile::tempdir().unwrap()),
+            profile_reservation: None,
             pages: HashMap::from([(
                 "p".into(),
                 ManagedMainFrame {
-                    main_frame,
+                    main_frame: Arc::new(main_frame),
+                    network: Default::default(),
                     headers: Vec::new(),
                 },
             )]),

@@ -2,6 +2,17 @@
 
 This guide covers managing file downloads and handling JavaScript dialogs (`alert`, `confirm`, `prompt`, `beforeunload`) using either the `camoufox` CLI daemon or the Rust API.
 
+For uploads, use `camoufox upload <instance> <page> 'input[type=file]' ./fixture.pdf`.
+It supports hidden inputs, repeated `--frame` scopes, and open shadow roots with
+` >>> `. Relative paths resolve against the client's working directory; regular
+files are validated before page access and replace the current selection.
+Multiple files require `multiple`; directory-picker (`webkitdirectory`) inputs
+are rejected with kind `invalid_argument`. Plain output lists basenames; JSON
+returns `uploaded`, `selector`, and `files`. Rust callers can use
+`MainFrame::set_file_input_files` (60-second timeout) or
+`set_file_input_files_with_timeout` with frame/object IDs and an explicit timeout.
+Both dispatch `input` and `change` events.
+
 ---
 
 ## Part 1: Managing File Downloads
@@ -19,6 +30,13 @@ camoufox serve &
 # Launch an instance with download directory configured
 camoufox launch --downloads-dir /tmp/my-downloads
 ```
+
+This policy also applies to persistent `launch --profile-dir` instances. Their
+default context tracks pages, popups, and downloads; persistence does not enable
+downloads automatically. In Rust, `Browser::default_context(ContextOptions)`
+configures the same download policy; connect with
+`BrowserOptions::attach_to_default_context: true` for page events and close the
+browser to flush storage.
 
 When a download starts:
 1. The browser saves the file inside `/tmp/my-downloads/<uuid>`, where `<uuid>` is a browser-generated unique identifier.
@@ -59,7 +77,7 @@ camoufox downloads 00000001 --wait 15 --json
 When you instruct a page to navigate directly to an attachment URL (or a link with `Content-Disposition: attachment`), the browser diverts the navigation into a download rather than rendering a new DOM.
 
 In Camoufox:
-- The `navigate` command exits with an error indicating that the navigation became a download.
+- The `navigate` command exits 1 with kind `navigation`, indicating that the navigation became a download.
 - The existing DOM and URL of the page are preserved intact (the page is not blanked or broken).
 - The file is saved to your configured `--downloads-dir`.
 
@@ -117,7 +135,13 @@ camoufox launch --dialogs manual
 
 Under `--dialogs manual`, most commands issued while a dialog is open return immediately with an actionable error message indicating a dialog is open.
 
-*(Exceptions: `tabs` and `close-tab` do not check for dialogs; `tabs --json` exposes the open dialog in its tab object via `"dialog": { ... }`. Additionally, `screenshot --clip` bypasses dialog checks.)*
+*(Exceptions: `tabs`, `close-tab`, `record stop`, and `replay stop` do not check
+for dialogs; `tabs --json` exposes the open dialog in its tab object via
+`"dialog": { ... }`. Additionally, `screenshot --clip` bypasses dialog checks.)*
+
+JSON errors include `kind: "dialog_open"` and exit 1. A successful upload whose
+`input` or `change` handler opens a dialog may instead return `dialog` in its
+success data; resolve it before issuing another command that checks dialogs.
 
 To inspect and resolve the dialog:
 

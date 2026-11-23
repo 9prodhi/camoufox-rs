@@ -29,6 +29,35 @@ use crate::protocol::client::Connection;
 use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 use crate::transport::pipe::PipeTransport;
 
+fn validate_upload_paths(paths: &[String]) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Err("invalid argument: at least one upload path is required".into());
+    }
+    paths
+        .iter()
+        .map(|path| {
+            let file = Path::new(path);
+            if !file.is_absolute() {
+                return Err(format!(
+                    "invalid argument: upload path must be absolute: {path}"
+                ));
+            }
+            let metadata = std::fs::metadata(file)
+                .map_err(|e| format!("invalid argument: upload file {path}: {e}"))?;
+            if !metadata.is_file() {
+                return Err(format!(
+                    "invalid argument: upload path is not a regular file: {path}"
+                ));
+            }
+            Ok(file
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned())
+        })
+        .collect()
+}
+
 fn screenshot_path(
     instance_id: &str,
     page_id: &str,
@@ -329,7 +358,8 @@ fn punctuation_descriptor(c: char) -> Option<(&'static str, u32)> {
 /// A `MainFrame` plus its CLI-facing page label tracking. The label lives
 /// in the parent `HashMap` key; this struct just owns the frame.
 pub struct ManagedMainFrame {
-    pub main_frame: MainFrame,
+    pub main_frame: Arc<MainFrame>,
+    pub(crate) network: Arc<Mutex<super::network::NetworkState>>,
     /// Extra HTTP headers set on this page so far. `Network.setExtraHTTPHeaders`
     /// replaces the whole set on every call, so the CLI keeps the accumulated
     /// list here and re-sends all of them.
@@ -345,7 +375,19 @@ pub struct ManagedMainFrame {
 /// New launch flags add a field here (and on `DaemonRequest::Launch`), so
 /// `launch_with`'s signature never changes. Flags that configure the browser
 /// context are mapped in `LaunchOptions::context_options`.
+/// Start with `Default` and assign fields to allow for future launch options:
+/// ```
+/// use camoufox::cli::instance::LaunchOptions;
+/// let mut options = LaunchOptions::default();
+/// options.headless = Some(true);
+/// ```
+/// External callers cannot construct this extensible type with a struct literal:
+/// ```compile_fail,E0639
+/// use camoufox::cli::instance::LaunchOptions;
+/// let options = LaunchOptions { ..Default::default() };
+/// ```
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct LaunchOptions {
     /// `None` means headless.
     pub headless: Option<bool>,
@@ -357,6 +399,8 @@ pub struct LaunchOptions {
     pub bypass_csp: bool,
     /// Policy for JavaScript dialogs.
     pub dialogs: DialogPolicy,
+    /// Absolute path; created with mode 0700 or group/other permissions removed, canonicalized, must be empty or an existing profile, never deleted on stop.
+    pub profile_dir: Option<String>,
 }
 
 impl LaunchOptions {
@@ -396,6 +440,108 @@ fn interaction_error(error: ProtocolError, operation: &str) -> Result<Interactio
     }
 }
 
+/// Owns the lifecycle of a browser profile directory.
+pub(crate) enum ProfileDir {
+    /// Persistent directory: not removed on drop.
+    Persistent(PathBuf),
+    /// Temporary directory: removed on drop.
+    Temp(tempfile::TempDir),
+}
+
+impl ProfileDir {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Persistent(p) => p.as_path(),
+            Self::Temp(t) => t.path(),
+        }
+    }
+
+    fn is_persistent(&self) -> bool {
+        matches!(self, Self::Persistent(_))
+    }
+}
+
+/// Prepare an absolute persistent profile path, creating it with mode 0700 or
+/// removing group/other permissions. It must be empty or contain `prefs.js` or
+/// `times.json`. Returns the canonical path; never deleted on stop.
+pub fn prepare_profile_dir(path_str: &str) -> Result<PathBuf, String> {
+    prepare_profile_dir_impl(path_str, |path, permissions| {
+        std::fs::set_permissions(path, permissions)
+    })
+}
+
+// Private test seam for exercising chmod failure without depending on the UID.
+#[cfg(test)]
+use prepare_profile_dir_impl as prepare_profile_dir_with_permissions;
+
+fn prepare_profile_dir_impl(
+    path_str: &str,
+    set_permissions: impl FnOnce(&Path, std::fs::Permissions) -> std::io::Result<()>,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let path = PathBuf::from(path_str);
+    if !path.is_absolute() {
+        return Err("invalid argument: --profile-dir must be an absolute path".to_string());
+    }
+    if !path.exists() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&path)
+            .map_err(|e| format!("failed to create profile directory {}: {e}", path.display()))?;
+    }
+    let inspect_error = |e| {
+        format!(
+            "failed to inspect profile directory {}: {e}",
+            path.display()
+        )
+    };
+    let meta = std::fs::metadata(&path).map_err(inspect_error)?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "invalid argument: profile directory {} is not a directory",
+            path.display()
+        ));
+    }
+    if !path.join("prefs.js").is_file() && !path.join("times.json").is_file() {
+        let mut entries = std::fs::read_dir(&path).map_err(inspect_error)?;
+        if entries.next().transpose().map_err(inspect_error)?.is_some() {
+            return Err(format!(
+                "invalid argument: profile directory is not empty and is not a browser profile: {}",
+                path.display()
+            ));
+        }
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        set_permissions(&path, std::fs::Permissions::from_mode(mode & !0o077)).map_err(|e| {
+            format!(
+                "failed to set permissions on profile directory {}: {e}",
+                path.display()
+            )
+        })?;
+    }
+    path.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize profile directory {}: {e}",
+            path.display()
+        )
+    })
+}
+
+/// Browser launch details used to construct the daemon success response.
+pub(crate) struct LaunchedInstance {
+    /// Allocated instance identifier.
+    pub instance_id: String,
+    /// Browser version when available.
+    pub version: Option<String>,
+    /// Browser process identifier.
+    pub pid: u32,
+    /// Canonical persistent profile path; absent for temporary profiles.
+    pub profile_dir: Option<PathBuf>,
+}
+
 /// A running Camoufox browser instance managed by the daemon.
 pub struct Instance {
     instance_id: String,
@@ -403,7 +549,10 @@ pub struct Instance {
     pub child: Child,
     pub version: Option<String>,
     pub pid: u32,
-    _profile_dir: tempfile::TempDir,
+    /// Profile directory handle. `Persistent` keeps the directory after stop;
+    /// `Temp` deletes it when the handle is dropped.
+    profile_dir: ProfileDir,
+    profile_reservation: Option<ProfileReservation>,
     pages: HashMap<String, ManagedMainFrame>,
     closed_pages: HashSet<String>,
     closed_pages_order: VecDeque<String>,
@@ -499,6 +648,19 @@ impl Instance {
 
     /// Adopt any ready popups opened by this instance's pages.
     pub fn adopt_popups(&mut self, context: &crate::api::BrowserContext) {
+        let networks = Mutex::new(super::network::NetworkSessions::default());
+        for (page_id, page) in self.adopt_popups_deferred(context) {
+            let errors =
+                super::network::NetworkSessions::close_page(&networks, &page_id, &page.network);
+            super::network::log_cassette_errors(&errors);
+        }
+    }
+
+    fn adopt_popups_deferred(
+        &mut self,
+        context: &crate::api::BrowserContext,
+    ) -> Vec<(String, ManagedMainFrame)> {
+        let mut removed = Vec::new();
         let mut closed_ids = Vec::new();
         for (page_id, mp) in &self.pages {
             if mp.main_frame.is_closed() || self.registry.is_detached(mp.main_frame.target_id()) {
@@ -506,7 +668,9 @@ impl Instance {
             }
         }
         for id in closed_ids {
-            self.pages.remove(&id);
+            if let Some(page) = self.pages.remove(&id) {
+                removed.push((id.clone(), page));
+            }
             self.record_closed_page(id);
         }
 
@@ -518,11 +682,13 @@ impl Instance {
             self.pages.insert(
                 page_id,
                 ManagedMainFrame {
-                    main_frame,
+                    main_frame: Arc::new(main_frame),
+                    network: Default::default(),
                     headers: Vec::new(),
                 },
             );
         }
+        removed
     }
 
     fn page_mut(&mut self, id: &str) -> Result<&mut ManagedMainFrame, String> {
@@ -558,7 +724,8 @@ impl Instance {
         self.pages.insert(
             page_id.clone(),
             ManagedMainFrame {
-                main_frame,
+                main_frame: Arc::new(main_frame),
+                network: Default::default(),
                 headers: Vec::new(),
             },
         );
@@ -1348,6 +1515,82 @@ impl Instance {
         Ok(tag)
     }
 
+    /// Set files on a file input, including hidden inputs and scoped selectors.
+    fn upload(
+        &self,
+        page_id: &str,
+        selector: &str,
+        paths: &[String],
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<InteractionOutcome, String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let target_frame_id = self.resolve_frames(page_id, frames, remaining())?;
+        let q = js_query(selector);
+        // Return either a validation error or the actual node so validation and
+        // handle creation refer to the same element, without measuring layout.
+        let expr = format!(
+            "(() => {{ const el = {q}; if (!el) return null; \
+             const tag = el.tagName.toLowerCase(); const type = el.type || el.getAttribute('type') || ''; \
+             if (tag !== 'input' || type !== 'file') \
+               return 'invalid argument: element is not a file input (' + tag + '[type=' + type + '])'; \
+             if (el.webkitdirectory || el.hasAttribute('webkitdirectory')) \
+               return 'invalid argument: directory-picker inputs (webkitdirectory) are not supported'; \
+             if ({count} > 1 && !el.multiple) \
+               return 'invalid argument: input does not accept multiple files'; \
+             return el; }})()",
+            count = paths.len(),
+        );
+        let main_frame = &self.page(page_id)?.main_frame;
+        let raw = main_frame
+            .evaluate_in_frame_raw(&target_frame_id, &expr, false, remaining())
+            .map_err(|e| scoped_error(frames, e))?;
+        if let Some(exc) = raw.get("exceptionDetails") {
+            return Err(scoped_error(
+                frames,
+                crate::api::selectors::selector_exception(exc),
+            ));
+        }
+        if let Some(error) = raw.pointer("/result/value").and_then(|v| v.as_str()) {
+            return Err(error.to_owned());
+        }
+        let object_id = raw
+            .pointer("/result/objectId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("selector not found: {selector}"))?;
+        let context_id = main_frame
+            .frame_ctx(&target_frame_id)
+            .and_then(|t| t.current());
+        let files: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let result = main_frame.set_file_input_files_with_timeout(
+            &target_frame_id,
+            object_id,
+            &files,
+            remaining(),
+        );
+        // Release the handle on failure too; preserve the upload result if the
+        // page navigates or closes while processing its change listener.
+        if let Some(context_id) = context_id {
+            let _ = main_frame.dispose_object_with_timeout(&context_id, object_id, remaining());
+        }
+        let outcome = match result {
+            Ok(()) => InteractionOutcome {
+                dialog: main_frame.pending_dialog(),
+            },
+            Err(e) if e.kind == ProtocolErrorKind::DialogOpened => {
+                let mut outcome = interaction_error(e, "upload")?;
+                if outcome.dialog.is_none() {
+                    outcome.dialog = main_frame.pending_dialog();
+                }
+                outcome
+            }
+            Err(e) => return Err(scoped_error(frames, e)),
+        };
+        Ok(outcome)
+    }
+
     /// Press a named key (keydown followed by keyup).
     pub fn press(
         &self,
@@ -1715,19 +1958,47 @@ impl Instance {
 
     /// Shut down this instance. Browser.close is followed by pipe EOF, which makes Camoufox exit.
     pub fn stop(self) -> Result<(), String> {
+        let networks = Mutex::new(super::network::NetworkSessions::default());
+        for (id, page) in &self.pages {
+            let deadline = networks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .register(id, &page.network)?;
+            page.network
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_finalize_deadline(deadline);
+        }
+        let errors =
+            super::network::NetworkSessions::close_all(&networks, self.browser.connection());
+        super::network::log_cassette_errors(&errors);
+        self.stop_after_network_cleanup()
+    }
+
+    fn stop_after_network_cleanup(self) -> Result<(), String> {
         let Instance {
             browser,
             mut child,
             close_timeout,
-            _profile_dir,
+            profile_dir,
+            profile_reservation,
             ..
         } = self;
         let _ = browser.close();
         let result = crate::process::lifecycle::graceful_shutdown(&mut child, close_timeout)
             .map_err(|e| format!("failed to stop browser: {e}"));
         // Keep the profile alive through kill + wait, including error paths.
-        drop(_profile_dir);
+        drop(profile_dir);
+        drop(profile_reservation);
         result
+    }
+
+    /// Returns the canonical profile directory path if persistent, else `None`.
+    pub fn persistent_profile_dir(&self) -> Option<&std::path::Path> {
+        match &self.profile_dir {
+            ProfileDir::Persistent(path) => Some(path),
+            ProfileDir::Temp(_) => None,
+        }
     }
 }
 
@@ -1744,15 +2015,67 @@ struct InstanceEntry {
     /// Closes the protocol connection: rejects in-flight requests and makes
     /// Camoufox exit (pipe EOF). Used by stop/shutdown.
     closer: Arc<Connection>,
+    networks: Arc<Mutex<super::network::NetworkSessions>>,
     /// Download events for this instance's context. `downloads --wait`
     /// blocks on it without taking the instance mutex.
     downloads: Arc<crate::cli::downloads::DownloadLog>,
+}
+
+// A lease spans startup, registration and shutdown. Dropping it releases the
+// canonical path even when spawn, readiness or protocol bootstrap fails.
+struct ProfileReservation {
+    profiles: Arc<Mutex<HashMap<PathBuf, Option<String>>>>,
+    path: PathBuf,
+}
+
+impl ProfileReservation {
+    fn reserve(
+        profiles: &Arc<Mutex<HashMap<PathBuf, Option<String>>>>,
+        path: &Path,
+    ) -> Result<Self, String> {
+        let mut owners = profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(owner) = owners.get(path) {
+            return Err(match owner {
+                Some(id) => {
+                    format!("invalid argument: profile directory already in use by instance {id}")
+                }
+                None => {
+                    "invalid argument: profile directory already in use by a launch in progress"
+                        .into()
+                }
+            });
+        }
+        owners.insert(path.to_owned(), None);
+        Ok(Self {
+            profiles: Arc::clone(profiles),
+            path: path.to_owned(),
+        })
+    }
+
+    fn bind(&self, id: &str) {
+        self.profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.path.clone(), Some(id.to_owned()));
+    }
+}
+
+impl Drop for ProfileReservation {
+    fn drop(&mut self) {
+        self.profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.path);
+    }
 }
 
 /// Manages all browser instances for the daemon.
 #[derive(Default)]
 pub struct InstanceManager {
     instances: Mutex<HashMap<String, InstanceEntry>>,
+    profiles: Arc<Mutex<HashMap<PathBuf, Option<String>>>>,
     closing: AtomicBool,
     counter: AtomicU64,
 }
@@ -1768,6 +2091,7 @@ impl InstanceManager {
     pub fn new() -> Self {
         InstanceManager {
             instances: Mutex::new(HashMap::new()),
+            profiles: Arc::default(),
             counter: AtomicU64::new(0),
             closing: AtomicBool::new(false),
         }
@@ -1792,6 +2116,15 @@ impl InstanceManager {
         &self,
         options: &LaunchOptions,
     ) -> Result<(String, Option<String>, u32), String> {
+        self.launch_with_result(options)
+            .map(|result| (result.instance_id, result.version, result.pid))
+    }
+
+    /// Launch with the canonical persistent profile path included in the result.
+    pub(crate) fn launch_with_result(
+        &self,
+        options: &LaunchOptions,
+    ) -> Result<LaunchedInstance, String> {
         if self.is_closing() {
             return Err("daemon shutting down".into());
         }
@@ -1826,8 +2159,18 @@ impl InstanceManager {
         }
 
         let instance_id = format!("{:08x}", self.counter.fetch_add(1, Ordering::Relaxed) + 1);
-        let profile_dir =
-            tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+        let (profile_dir, profile_reservation) = match &options.profile_dir {
+            Some(dir_str) => {
+                let canonical = prepare_profile_dir(dir_str)?;
+                let reservation = ProfileReservation::reserve(&self.profiles, &canonical)?;
+                (ProfileDir::Persistent(canonical), Some(reservation))
+            }
+            None => {
+                let temp =
+                    tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+                (ProfileDir::Temp(temp), None)
+            }
+        };
         let headless = options.headless;
 
         let executable = options
@@ -1842,6 +2185,7 @@ impl InstanceManager {
             env: user_agent_env(&executable, &inherited_env_keys),
             executable,
             profile_dir: Some(profile_dir.path().to_owned()),
+            persistent: profile_dir.is_persistent(),
             headless: headless.unwrap_or(true),
             close_timeout: Duration::from_secs(10),
             ..Default::default()
@@ -1859,15 +2203,26 @@ impl InstanceManager {
         let transport = PipeTransport::new(launched.command_pipe, launched.response_pipe);
         let conn = Connection::new(Box::new(transport));
         let session = conn.root_session();
-        let browser = Browser::connect(conn, session, BrowserOptions::default())
-            .map_err(|e| format!("bootstrap failed: {}", e.message))?;
+        let browser = Browser::connect(
+            conn,
+            session,
+            BrowserOptions {
+                attach_to_default_context: profile_dir.is_persistent(),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("bootstrap failed: {}", e.message))?;
 
         let version = browser.version().map(|s| s.to_owned());
 
-        // Create a default context.
-        let context = browser
-            .new_context(options.context_options())
-            .map_err(|e| format!("failed to create context: {}", e.message))?;
+        // Persistent profiles store browsing data in Firefox's default context.
+        // Temporary profiles keep using an isolated, remove-on-detach context.
+        let context = if profile_dir.is_persistent() {
+            browser.default_context(options.context_options())
+        } else {
+            browser.new_context(options.context_options())
+        }
+        .map_err(|e| format!("failed to create context: {}", e.message))?;
 
         let closer = Arc::clone(browser.connection());
         let download_log = crate::cli::downloads::DownloadLog::new(
@@ -1882,7 +2237,8 @@ impl InstanceManager {
             child: child.into_child(),
             version: version.clone(),
             pid,
-            _profile_dir: profile_dir,
+            profile_dir,
+            profile_reservation,
             pages: HashMap::new(),
             closed_pages: HashSet::new(),
             closed_pages_order: VecDeque::new(),
@@ -1900,6 +2256,10 @@ impl InstanceManager {
             let _ = instance.stop();
             return Err("daemon shutting down".into());
         }
+        if let Some(reservation) = &instance.profile_reservation {
+            reservation.bind(&instance_id);
+        }
+        let profile_dir = instance.persistent_profile_dir().map(Path::to_path_buf);
         instances.insert(
             instance_id.clone(),
             InstanceEntry {
@@ -1909,11 +2269,17 @@ impl InstanceManager {
                     _download_guards: download_guards,
                 })),
                 closer,
+                networks: Default::default(),
                 downloads: download_log,
             },
         );
 
-        Ok((instance_id, version, pid))
+        Ok(LaunchedInstance {
+            instance_id,
+            version,
+            pid,
+            profile_dir,
+        })
     }
 
     /// List all instances.
@@ -1931,12 +2297,16 @@ impl InstanceManager {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(inst) = &entry.instance {
-                result.push(json!({
+                let mut item = json!({
                     "instance_id": id,
                     "pid": inst.pid,
                     "version": inst.version,
                     "pages": inst.page_ids(),
-                }));
+                });
+                if let Some(profile_dir) = inst.persistent_profile_dir() {
+                    item["profile_dir"] = json!(profile_dir.to_string_lossy());
+                }
+                result.push(item);
             }
         }
         result.sort_by(|a, b| {
@@ -1949,9 +2319,15 @@ impl InstanceManager {
 
     /// Stop an instance.
     pub fn stop(&self, instance_id: &str) -> Result<(), String> {
+        self.stop_with_result(instance_id).map(|_| ())
+    }
+
+    /// Stop while retaining cassette failures for the daemon success response.
+    pub(crate) fn stop_with_result(&self, instance_id: &str) -> Result<serde_json::Value, String> {
         let InstanceEntry {
             managed: entry,
             closer,
+            networks,
             ..
         } = self
             .instances
@@ -1959,8 +2335,9 @@ impl InstanceManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(instance_id)
             .ok_or_else(|| Self::missing(instance_id))?;
-        // Interrupt any command running on this instance first, so the
-        // instance mutex below frees promptly.
+        // Network workers still need the connection to read completed bodies.
+        let errors = super::network::NetworkSessions::close_all(&networks, &closer);
+        // Then interrupt other commands so the instance mutex frees promptly.
         let _ = closer.close();
         let inst = entry
             .lock()
@@ -1968,7 +2345,12 @@ impl InstanceManager {
             .instance
             .take()
             .ok_or_else(|| Self::missing(instance_id))?;
-        inst.stop()
+        inst.stop_after_network_cleanup()?;
+        Ok(if errors.is_empty() {
+            serde_json::Value::Null
+        } else {
+            json!({"cassette_errors":errors})
+        })
     }
 
     /// Create a new page in an instance.
@@ -2068,12 +2450,12 @@ impl InstanceManager {
         id: &str,
         f: impl FnOnce(&mut Instance, &crate::api::BrowserContext) -> Result<T, String>,
     ) -> Result<T, String> {
-        let entry = self
+        let (entry, networks) = self
             .instances
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(id)
-            .map(|e| Arc::clone(&e.managed))
+            .map(|e| (Arc::clone(&e.managed), Arc::clone(&e.networks)))
             .ok_or_else(|| Self::missing(id))?;
         let mut entry = entry
             .lock()
@@ -2082,8 +2464,151 @@ impl InstanceManager {
             instance, context, ..
         } = &mut *entry;
         let inst = instance.as_mut().ok_or_else(|| Self::missing(id))?;
-        inst.adopt_popups(context);
-        f(inst, context)
+        let removed = inst.adopt_popups_deferred(context);
+        let result = f(inst, context);
+        drop(entry);
+        for (page_id, page) in removed {
+            let errors =
+                super::network::NetworkSessions::close_page(&networks, &page_id, &page.network);
+            super::network::log_cassette_errors(&errors);
+        }
+        result
+    }
+
+    // Look up the page under the instance lock; all validation, disk work,
+    // and draining then run under only this page's network-operation mutex.
+    fn with_network<T>(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        allow_dialog: bool,
+        f: impl FnOnce(
+            &mut super::network::NetworkState,
+            Arc<MainFrame>,
+            Arc<Connection>,
+            Result<(), String>,
+        ) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let registry = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(instance_id)
+            .map(|e| Arc::clone(&e.networks))
+            .ok_or_else(|| Self::missing(instance_id))?;
+        let (state, page, connection, validation) =
+            self.with_instance(instance_id, |inst, _| {
+                let page = inst.page_any(page_id)?;
+                // Carry page validation to the start operation so its previous
+                // stop result is cleared even when an open dialog rejects it.
+                let validation = if allow_dialog {
+                    Ok(())
+                } else {
+                    inst.page(page_id).map(|_| ())
+                };
+                Ok((
+                    Arc::clone(&page.network),
+                    Arc::clone(&page.main_frame),
+                    Arc::clone(inst.browser.connection()),
+                    validation,
+                ))
+            })?;
+        let deadline = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register(page_id, &state)?;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.set_finalize_deadline(deadline);
+        f(&mut state, page, connection, validation)
+    }
+
+    /// Begin passive HTTP recording for a page into an empty absolute directory.
+    pub fn record_start(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        dir: &Path,
+        urls: &[String],
+    ) -> Result<serde_json::Value, String> {
+        self.with_network(
+            instance_id,
+            page_id,
+            false,
+            |state, page, connection, validation| {
+                state.record(page, connection, dir, urls, validation)
+            },
+        )
+    }
+
+    /// Finalize a recording, or return its last stop result with `repeated` set.
+    pub fn record_stop(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        self.with_network(instance_id, page_id, true, |state, page, _, validation| {
+            validation?;
+            state.stop(true, &page)
+        })
+        .or_else(|error| {
+            self.closed_network_stop(instance_id, page_id, true)
+                .unwrap_or(Err(error))
+        })
+    }
+
+    /// Validate a cassette and enable offline replay for a page.
+    pub fn replay_start(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        dir: &Path,
+        match_body: bool,
+    ) -> Result<serde_json::Value, String> {
+        self.with_network(
+            instance_id,
+            page_id,
+            false,
+            |state, page, connection, validation| {
+                state.replay(page, connection, dir, match_body, validation)
+            },
+        )
+    }
+
+    /// Disable interception and return replay counts, or repeat the last result.
+    pub fn replay_stop(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        self.with_network(instance_id, page_id, true, |state, page, _, validation| {
+            validation?;
+            state.stop(false, &page)
+        })
+        .or_else(|error| {
+            self.closed_network_stop(instance_id, page_id, false)
+                .unwrap_or(Err(error))
+        })
+    }
+
+    fn closed_network_stop(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        recording: bool,
+    ) -> Option<Result<serde_json::Value, String>> {
+        let networks = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(instance_id)
+            .map(|entry| Arc::clone(&entry.networks))?;
+        let result = networks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed_stop(page_id, recording);
+        result
     }
 
     /// Access the download log for an instance without locking the instance.
@@ -2384,6 +2909,26 @@ impl InstanceManager {
         })
     }
 
+    /// Set a file input's files and return their basenames in argument order.
+    ///
+    /// Paths must be absolute regular files. All paths are validated before
+    /// accessing the page. Multiple files require the input's `multiple` attribute.
+    pub fn upload(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        selector: &str,
+        paths: &[String],
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<(Vec<String>, InteractionOutcome), String> {
+        let files = validate_upload_paths(paths)?;
+        let outcome = self.with_instance(instance_id, |inst, _| {
+            inst.upload(page_id, selector, paths, frames, timeout)
+        })?;
+        Ok((files, outcome))
+    }
+
     /// Insert text into the focused element.
     pub fn insert_text(
         &self,
@@ -2494,7 +3039,35 @@ impl InstanceManager {
 
     /// Close a page.
     pub fn close_tab(&self, instance_id: &str, page_id: &str) -> Result<(), String> {
+        self.close_tab_with_result(instance_id, page_id).map(|_| ())
+    }
+
+    /// Close a tab and include any cassette failure in its success data.
+    pub(crate) fn close_tab_with_result(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let networks = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(instance_id)
+            .map(|entry| Arc::clone(&entry.networks))
+            .ok_or_else(|| Self::missing(instance_id))?;
+        let state = self.with_instance(instance_id, |inst, _| {
+            Ok(inst.pages.get(page_id).map(|p| Arc::clone(&p.network)))
+        })?;
+        let errors = state.map_or_else(Vec::new, |state| {
+            super::network::NetworkSessions::close_page(&networks, page_id, &state)
+        });
         self.with_instance(instance_id, |inst, _| inst.close_tab(page_id))
+            .inspect_err(|_| super::network::log_cassette_errors(&errors))?;
+        let mut data = json!({"closed_page":page_id});
+        if !errors.is_empty() {
+            data["cassette_errors"] = json!(errors);
+        }
+        Ok(data)
     }
 
     /// Export all cookies for an instance's browser context (including HttpOnly).
@@ -2536,15 +3109,27 @@ impl InstanceManager {
     }
 
     pub(crate) fn close_all_connections(&self) {
-        let closers: Vec<_> = self
+        let entries: Vec<_> = self
             .instances
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
-            .map(|e| Arc::clone(&e.closer))
+            .map(|e| (Arc::clone(&e.networks), Arc::clone(&e.closer)))
             .collect();
-        for closer in closers {
-            let _ = closer.close();
+        let workers: Vec<_> = entries
+            .into_iter()
+            .map(|(networks, closer)| {
+                std::thread::spawn(move || {
+                    let errors = super::network::NetworkSessions::close_all(&networks, &closer);
+                    super::network::log_cassette_errors(&errors);
+                    let _ = closer.close();
+                })
+            })
+            .collect();
+        for worker in workers {
+            if worker.join().is_err() {
+                log::warn!("connection shutdown worker panicked");
+            }
         }
     }
 
@@ -2563,15 +3148,20 @@ impl InstanceManager {
                 |InstanceEntry {
                      managed: entry,
                      closer,
+                     networks,
                      ..
                  }| {
                     std::thread::spawn(move || {
+                        let errors = super::network::NetworkSessions::close_all(&networks, &closer);
+                        super::network::log_cassette_errors(&errors);
                         let _ = closer.close();
-                        let mut entry = entry
+                        let instance = entry
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if let Some(instance) = entry.instance.take() {
-                            let _ = instance.stop();
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .instance
+                            .take();
+                        if let Some(instance) = instance {
+                            let _ = instance.stop_after_network_cleanup();
                         }
                     })
                 },
@@ -2593,8 +3183,53 @@ impl InstanceManager {
 mod phase_tests;
 
 #[cfg(test)]
+mod network_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_paths_accept_regular_files_and_symlinks_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("fixture one.txt");
+        let second = dir.path().join("fixture-two.pdf");
+        std::fs::write(&first, b"one").unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+        let paths = vec![first.display().to_string(), second.display().to_string()];
+        assert_eq!(
+            validate_upload_paths(&paths).unwrap(),
+            ["fixture one.txt", "fixture-two.pdf"]
+        );
+    }
+
+    #[test]
+    fn upload_paths_reject_empty_relative_missing_directory_and_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let cases = [
+            vec![],
+            vec!["relative.txt".into()],
+            vec![dir.path().join("missing.txt").display().to_string()],
+            vec![dir.path().display().to_string()],
+            vec![socket.display().to_string()],
+        ];
+        for paths in cases {
+            // Validation must happen before even looking up the instance/page.
+            let error = InstanceManager::new()
+                .upload(
+                    "absent",
+                    "absent",
+                    "input",
+                    &paths,
+                    &[],
+                    Duration::from_secs(1),
+                )
+                .unwrap_err();
+            assert!(error.starts_with("invalid argument: "), "{error}");
+        }
+    }
 
     #[test]
     fn resolve_chain_shares_budget_across_delayed_hops() {
@@ -3023,11 +3658,13 @@ mod tests {
             child,
             version: None,
             pid: 0,
-            _profile_dir: tempfile::tempdir().unwrap(),
+            profile_dir: ProfileDir::Temp(tempfile::tempdir().unwrap()),
+            profile_reservation: None,
             pages: HashMap::from([(
                 "p1".into(),
                 ManagedMainFrame {
-                    main_frame,
+                    main_frame: Arc::new(main_frame),
+                    network: Default::default(),
                     headers: Vec::new(),
                 },
             )]),
@@ -3056,5 +3693,311 @@ mod tests {
         drop(context);
         drop(tx);
         drop(conn);
+    }
+
+    #[test]
+    fn prepare_profile_dir_rejects_unrelated_contents_without_changing_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("documents");
+        std::fs::create_dir(&target).unwrap();
+        let file = target.join("fixture.pdf");
+        std::fs::write(&file, b"contents").unwrap();
+        let error = prepare_profile_dir(target.to_str().unwrap()).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "invalid argument: profile directory is not empty and is not a browser profile: {}",
+                target.display()
+            )
+        );
+        assert_eq!(std::fs::read(file).unwrap(), b"contents");
+        let manager = InstanceManager::new();
+        let error = manager
+            .launch_with(&LaunchOptions {
+                executable: Some("/nonexistent/camoufox-test-binary".into()),
+                profile_dir: Some(target.display().to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(
+            error.starts_with("invalid argument: profile directory is not empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn prepare_profile_dir_accepts_firefox_profile_markers() {
+        for marker in ["prefs.js", "times.json"] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(temp.path().join(marker), b"profile data").unwrap();
+            std::fs::write(temp.path().join("other-data"), b"contents").unwrap();
+            assert_eq!(
+                prepare_profile_dir(temp.path().to_str().unwrap()).unwrap(),
+                temp.path().canonicalize().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_profile_dir_preserves_special_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        for mode in [0o3777, 0o3750, 0o3700, 0o2750] {
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            prepare_profile_dir(temp.path().to_str().unwrap()).unwrap();
+            assert_eq!(
+                std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o7777,
+                mode & !0o077
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_profile_dir_rejects_relative_path() {
+        let err = prepare_profile_dir("relative/path").unwrap_err();
+        assert_eq!(
+            err,
+            "invalid argument: --profile-dir must be an absolute path"
+        );
+    }
+
+    #[test]
+    fn prepare_profile_dir_creates_missing_dir_with_mode_0700() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("missing_profile_subdir");
+        assert!(!target.exists());
+
+        let canonical = prepare_profile_dir(target.to_str().unwrap()).unwrap();
+        assert!(canonical.exists());
+        assert!(canonical.is_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&canonical).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "created directory permissions must be 0700");
+        }
+    }
+
+    #[test]
+    fn prepare_profile_dir_tightens_looser_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("loose_profile");
+        std::fs::create_dir_all(&target).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let meta = std::fs::metadata(&target).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o777);
+
+            let canonical = prepare_profile_dir(target.to_str().unwrap()).unwrap();
+            let meta = std::fs::metadata(&canonical).unwrap();
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o700,
+                "looser permissions must be tightened to 0700"
+            );
+        }
+
+        #[cfg(not(unix))]
+        {
+            let canonical = prepare_profile_dir(target.to_str().unwrap()).unwrap();
+            assert!(canonical.is_dir());
+        }
+    }
+
+    #[test]
+    fn prepare_profile_dir_canonicalizes_aliases_to_one_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("profile");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = temp.path().join("profile-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let dotted = format!("{}/./sub/../", real.display());
+        std::fs::create_dir(real.join("sub")).unwrap();
+        std::fs::write(real.join("prefs.js"), b"// profile preferences").unwrap();
+
+        let canonical = prepare_profile_dir(real.to_str().unwrap()).unwrap();
+        assert_eq!(canonical, real.canonicalize().unwrap());
+        // Collision detection compares canonical paths, so every alias must
+        // resolve to the same value.
+        assert_eq!(
+            prepare_profile_dir(link.to_str().unwrap()).unwrap(),
+            canonical
+        );
+        assert_eq!(prepare_profile_dir(&dotted).unwrap(), canonical);
+        let mode = std::fs::metadata(&canonical).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a private directory is left unchanged");
+    }
+
+    #[test]
+    fn prepare_profile_dir_creates_missing_parents_and_tightens_group_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("a").join("b").join("profile");
+        let canonical = prepare_profile_dir(nested.to_str().unwrap()).unwrap();
+        assert!(canonical.is_dir());
+        let group = temp.path().join("group");
+        std::fs::create_dir(&group).unwrap();
+        std::fs::set_permissions(&group, std::fs::Permissions::from_mode(0o750)).unwrap();
+        prepare_profile_dir(group.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(&group).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn launch_profile_dir_errors_precede_browser_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("fixture.pdf");
+        std::fs::write(&file, b"contents").unwrap();
+        let manager = InstanceManager::new();
+        // A nonexistent executable proves the profile error is returned
+        // before any browser process is spawned.
+        let launch = |profile_dir: &str| {
+            manager
+                .launch_with(&LaunchOptions {
+                    executable: Some("/nonexistent/camoufox-test-binary".into()),
+                    profile_dir: Some(profile_dir.into()),
+                    ..Default::default()
+                })
+                .unwrap_err()
+        };
+        assert_eq!(
+            launch("relative/profile"),
+            "invalid argument: --profile-dir must be an absolute path"
+        );
+        let error = launch(file.to_str().unwrap());
+        assert!(error.ends_with("is not a directory"), "{error}");
+        assert_eq!(
+            crate::cli::ipc::DaemonResponse::err(error).kind.as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"contents");
+        // A valid directory gets past validation and fails at spawn instead.
+        let error = launch(temp.path().join("profile").to_str().unwrap());
+        assert!(error.starts_with("failed to spawn browser"), "{error}");
+        assert!(temp.path().join("profile").is_dir());
+        assert!(manager.list().is_empty());
+        // Shutdown takes precedence over profile validation.
+        manager.begin_shutdown();
+        assert_eq!(launch("relative/profile"), "daemon shutting down");
+    }
+
+    #[test]
+    fn cassette_commands_report_missing_instance_and_validate_nothing_else() {
+        let manager = InstanceManager::new();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("cassette");
+        let results = [
+            manager.record_start("absent", "p1", &dir, &[]),
+            manager.record_stop("absent", "p1"),
+            manager.replay_start("absent", "p1", &dir, false),
+            manager.replay_stop("absent", "p1"),
+        ];
+        for result in results {
+            let error = result.unwrap_err();
+            assert_eq!(error, "instance absent not found");
+            assert_eq!(
+                crate::cli::ipc::DaemonResponse::err(error).kind.as_deref(),
+                Some("instance_not_found")
+            );
+        }
+        assert!(
+            !dir.exists(),
+            "a missing instance must not create a cassette directory"
+        );
+    }
+
+    #[test]
+    fn prepare_profile_dir_create_failure_is_io_and_precedes_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("regular-file");
+        std::fs::write(&parent, b"contents").unwrap();
+        let target = parent.join("profile");
+        let direct = prepare_profile_dir(target.to_str().unwrap()).unwrap_err();
+        let manager = InstanceManager::new();
+        let launched = manager
+            .launch_with(&LaunchOptions {
+                executable: Some("/nonexistent/camoufox-test-binary".into()),
+                profile_dir: Some(target.display().to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        for error in [direct, launched] {
+            assert!(
+                error.starts_with(&format!(
+                    "failed to create profile directory {}: ",
+                    target.display()
+                )),
+                "{error}"
+            );
+            assert_eq!(
+                crate::cli::ipc::DaemonResponse::err(error).kind.as_deref(),
+                Some("io")
+            );
+        }
+        assert!(!target.exists());
+        assert!(manager.list().is_empty());
+        // A preparation failure must not reserve the profile. Retry through
+        // launch_with so an accidental reservation cannot hide behind validation.
+        let retry = manager
+            .launch_with(&LaunchOptions {
+                executable: Some("/nonexistent/camoufox-test-binary".into()),
+                profile_dir: Some(target.display().to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(
+            retry.starts_with("failed to create profile directory "),
+            "{retry}"
+        );
+        assert!(!retry.contains("already in use"), "{retry}");
+    }
+
+    #[test]
+    fn prepare_profile_dir_permission_failure_is_io() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = prepare_profile_dir_with_permissions(temp.path().to_str().unwrap(), |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected chmod failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "failed to set permissions on profile directory {}: injected chmod failure",
+                temp.path().display()
+            )
+        );
+        assert_eq!(
+            crate::cli::ipc::DaemonResponse::err(error).kind.as_deref(),
+            Some("io")
+        );
+        assert_eq!(
+            std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn prepare_profile_dir_rejects_existing_non_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("some_file");
+        std::fs::write(&file_path, "not a directory").unwrap();
+
+        let err = prepare_profile_dir(file_path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("is not a directory"),
+            "expected non-directory error, got: {err}"
+        );
     }
 }

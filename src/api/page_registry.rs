@@ -683,10 +683,10 @@ impl PageRegistry {
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned());
 
-        // C6: Require explicit match with our context id.
-        match t_ctx {
-            Some(ctx) if ctx == self.context_id => {}
-            _ => return,
+        // Private contexts require an explicit matching ID. The default
+        // context has no ID in Juggler events and uses an empty registry key.
+        if t_ctx.unwrap_or_default() != self.context_id {
+            return;
         }
 
         if t_type != "page" {
@@ -1464,6 +1464,38 @@ mod tests {
         assert_eq!(conn.event_handler_count_for("s1", "Page.frameAttached"), 0);
         assert_eq!(reg.page_count(), 0);
         assert!(reg.frame_ctx("s1", "f1").is_none());
+    }
+
+    #[test]
+    fn default_context_adopts_absent_id_and_rejects_private_contexts() {
+        let (transport, in_tx) = TestTransport::new();
+        let conn = Arc::new(Connection::new(Box::new(transport)));
+        let reg = PageRegistry::install(&conn, "", DialogPolicy::Manual);
+        let mut default_page =
+            attached_to_target_msg("default-session", "default-target", "", None);
+        default_page.params.as_mut().unwrap()["targetInfo"]
+            .as_object_mut()
+            .unwrap()
+            .remove("browserContextId");
+        in_tx.send(default_page).unwrap();
+        in_tx
+            .send(frame_attached_msg("default-session", "main", None))
+            .unwrap();
+        in_tx
+            .send(attached_to_target_msg(
+                "private-session",
+                "private-target",
+                "private",
+                None,
+            ))
+            .unwrap();
+        in_tx
+            .send(frame_attached_msg("private-session", "private-main", None))
+            .unwrap();
+        sync_reader(&conn, &in_tx);
+        let popups = reg.take_popups();
+        assert_eq!(popups.len(), 1);
+        assert_eq!(popups[0].target_id, "default-target");
     }
 
     #[test]

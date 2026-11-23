@@ -1,9 +1,10 @@
 //! Camoufox CLI binary entrypoint.
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use camoufox::cli::client::send_request;
-use camoufox::cli::commands::{Cli, Command};
+use camoufox::cli::commands::{Cli, Command, RecordAction, ReplayAction};
+use camoufox::cli::error_kind::{ErrorKind, PROFILE_DIR_UNSUPPORTED};
 use camoufox::cli::ipc::DaemonRequest;
 use camoufox::cli::output::print_response;
 use camoufox::cli::socket::socket_path;
@@ -21,21 +22,96 @@ fn main() {
             }
         }
 
+        Command::Record { action } => {
+            let request = match action {
+                RecordAction::Start {
+                    instance_id,
+                    page_id,
+                    dir,
+                    urls,
+                } => DaemonRequest::RecordStart {
+                    instance_id,
+                    page_id,
+                    dir,
+                    urls,
+                },
+                RecordAction::Stop {
+                    instance_id,
+                    page_id,
+                } => DaemonRequest::RecordStop {
+                    instance_id,
+                    page_id,
+                },
+            };
+            run_client(&sock, &request, cli.json);
+        }
+        Command::Replay { action } => {
+            let request = match action {
+                ReplayAction::Start {
+                    instance_id,
+                    page_id,
+                    dir,
+                    match_body,
+                } => DaemonRequest::ReplayStart {
+                    instance_id,
+                    page_id,
+                    dir,
+                    match_body,
+                },
+                ReplayAction::Stop {
+                    instance_id,
+                    page_id,
+                } => DaemonRequest::ReplayStop {
+                    instance_id,
+                    page_id,
+                },
+            };
+            run_client(&sock, &request, cli.json);
+        }
+
         Command::Launch {
             headed,
             executable,
             downloads_dir,
             bypass_csp,
             dialogs,
+            profile_dir,
         } => {
+            let persistent = profile_dir.is_some();
             let request = DaemonRequest::Launch {
                 headless: Some(!headed),
                 executable,
                 downloads_dir,
                 bypass_csp,
                 dialogs: dialogs.into(),
+                profile_dir: profile_dir.map(|p| p.to_string_lossy().into_owned()),
             };
-            run_client(&sock, &request, cli.json);
+            let result = send_request(&sock, &request).and_then(|response| {
+                if persistent && response.ok
+                    && response.data.as_ref().and_then(|data| data.get("profile_dir")).is_none()
+                {
+                    let Some(instance_id) = response.data.as_ref()
+                        .and_then(|data| data.get("instance_id"))
+                        .and_then(serde_json::Value::as_str)
+                    else {
+                        return Err(format!("{PROFILE_DIR_UNSUPPORTED}; missing instance_id in launch response; could not stop browser"));
+                    };
+                    let stop = DaemonRequest::Stop { instance_id: instance_id.to_owned() };
+                    let cleanup = send_request(&sock, &stop).and_then(|response| {
+                        if response.ok {
+                            Ok(())
+                        } else {
+                            Err(response.error.unwrap_or_else(|| "daemon rejected stop".into()))
+                        }
+                    });
+                    return Err(match cleanup {
+                        Ok(()) => PROFILE_DIR_UNSUPPORTED.to_owned(),
+                        Err(error) => format!("{PROFILE_DIR_UNSUPPORTED}; failed to stop instance {instance_id}: {error}"),
+                    });
+                }
+                Ok(response)
+            });
+            print_client_result(result, cli.json);
         }
 
         Command::Dialog {
@@ -163,8 +239,14 @@ fn main() {
             timeout,
         } => {
             let output = output.map(|p| {
-                absolute_output_path(&p)
-                    .unwrap_or_else(|e| fail(cli.json, &format!("resolve screenshot path: {e}")))
+                absolute_output_path(&p).unwrap_or_else(|e| {
+                    fail_with_kind(
+                        cli.json,
+                        &format!("io error: resolve screenshot path: {e}"),
+                        ErrorKind::Io,
+                        1,
+                    )
+                })
             });
             let clip = match clip.as_deref().map(parse_clip) {
                 Some(Ok(rect)) => Some(rect),
@@ -453,6 +535,41 @@ fn main() {
             );
         }
 
+        Command::Upload {
+            instance_id,
+            page_id,
+            selector,
+            paths,
+            frames,
+            timeout,
+        } => {
+            let paths = paths
+                .iter()
+                .map(|path| {
+                    absolute_output_path(path).unwrap_or_else(|e| {
+                        fail_with_kind(
+                            cli.json,
+                            &format!("io error: resolve upload path: {e}"),
+                            ErrorKind::Io,
+                            1,
+                        )
+                    })
+                })
+                .collect();
+            run_client(
+                &sock,
+                &DaemonRequest::Upload {
+                    instance_id,
+                    page_id,
+                    selector,
+                    paths,
+                    frames,
+                    timeout_secs: timeout,
+                },
+                cli.json,
+            );
+        }
+
         Command::Type {
             instance_id,
             page_id,
@@ -594,7 +711,85 @@ fn main() {
                 cli.json,
             );
         }
+
+        Command::External(args) => {
+            dispatch_external(&sock, &args, cli.json);
+        }
     }
+}
+
+/// Dispatches an external subcommand or exits with clap's unrecognized subcommand error.
+fn dispatch_external(sock: &std::path::Path, args: &[String], json_mode: bool) -> ! {
+    if let Some(binary) = args
+        .first()
+        .and_then(|name| camoufox::cli::commands::find_external_subcommand(name))
+    {
+        let path = std::path::absolute(sock).unwrap_or_else(|e| {
+            eprintln!("error: io error: failed to resolve daemon socket: {e}");
+            std::process::exit(1);
+        });
+        let mut command = std::process::Command::new(&binary);
+        command
+            .args(&args[1..])
+            .env("CAMOUFOX_SOCKET", path.as_os_str());
+        if json_mode {
+            command.env("CAMOUFOX_JSON", "1");
+        } else {
+            command.env_remove("CAMOUFOX_JSON");
+        }
+        let mut attempt = 1;
+        let child = loop {
+            match command.spawn() {
+                Ok(child) => break Ok(child),
+                Err(error) => match external_spawn_retry_delay(&error, attempt) {
+                    Some(delay) => {
+                        std::thread::sleep(delay);
+                        attempt += 1;
+                    }
+                    None => break Err(error),
+                },
+            }
+        };
+        let status = child
+            .and_then(|mut child| child.wait())
+            .unwrap_or_else(|e| {
+                eprintln!("error: failed to execute external subcommand: {e}");
+                std::process::exit(1);
+            });
+
+        #[cfg(unix)]
+        let exit_code = {
+            use std::os::unix::process::ExitStatusExt;
+            status
+                .code()
+                .or_else(|| status.signal().map(|s| 128 + s))
+                .unwrap_or(1)
+        };
+        #[cfg(not(unix))]
+        let exit_code = status.code().unwrap_or(1);
+
+        std::process::exit(exit_code);
+    }
+
+    // Reparse the original argv so clap supplies its native error and suggestions.
+    Cli::command()
+        // The derive-configured value parser would re-enable external subcommands.
+        .external_subcommand_value_parser(None)
+        .allow_external_subcommands(false)
+        .try_get_matches()
+        .expect_err("unresolved external subcommands must be rejected by clap")
+        .exit();
+}
+
+/// Delay before retrying a transient external-command spawn failure.
+fn external_spawn_retry_delay(error: &std::io::Error, attempt: u32) -> Option<std::time::Duration> {
+    #[cfg(unix)]
+    if (1..5).contains(&attempt) && error.raw_os_error() == Some(libc::ETXTBSY) {
+        return Some(std::time::Duration::from_millis(u64::from(attempt) * 10));
+    }
+    #[cfg(not(unix))]
+    let _ = (error, attempt);
+    None
 }
 
 /// Split `s` on the first `sep`, trimming whitespace around both halves.
@@ -609,7 +804,7 @@ fn split_once_trimmed(s: &str, sep: char) -> Option<(String, String)> {
     Some((name.to_string(), value.trim().to_string()))
 }
 
-/// Resolve screenshot destinations against the client's cwd, not the daemon's.
+/// Resolve file paths against the client's cwd, not the daemon's.
 fn absolute_output_path(path: &str) -> std::io::Result<String> {
     let path = std::path::Path::new(path);
     let absolute = if path.is_absolute() {
@@ -642,8 +837,13 @@ fn parse_clip(s: &str) -> Result<[f64; 4], String> {
 
 /// Report a client-side argument error and exit, honouring `--json`.
 fn fail(json_mode: bool, message: &str) -> ! {
+    fail_with_kind(json_mode, message, ErrorKind::InvalidArgument, 2)
+}
+
+fn fail_with_kind(json_mode: bool, message: &str, kind: ErrorKind, exit_code: i32) -> ! {
     if json_mode {
-        let resp = camoufox::cli::ipc::DaemonResponse::err(message);
+        let mut resp = camoufox::cli::ipc::DaemonResponse::err(message);
+        resp.kind = Some(kind.as_str().into());
         println!(
             "{}",
             serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into())
@@ -651,11 +851,18 @@ fn fail(json_mode: bool, message: &str) -> ! {
     } else {
         eprintln!("error: {message}");
     }
-    std::process::exit(2);
+    std::process::exit(exit_code);
 }
 
 fn run_client(sock: &std::path::Path, request: &DaemonRequest, json_mode: bool) {
-    match send_request(sock, request) {
+    print_client_result(send_request(sock, request), json_mode);
+}
+
+fn print_client_result(
+    result: Result<camoufox::cli::ipc::DaemonResponse, String>,
+    json_mode: bool,
+) {
+    match result {
         Ok(response) => {
             let ok = response.ok;
             print_response(&response, json_mode);
@@ -698,6 +905,69 @@ mod tests {
             absolute_output_path(absolute.to_str().unwrap()).unwrap(),
             absolute.to_string_lossy()
         );
+    }
+
+    #[test]
+    fn upload_requires_paths_and_accepts_nested_frames_and_timeout() {
+        assert!(Cli::try_parse_from(["camoufox", "upload", "i", "p1", "input"]).is_err());
+        let cli = Cli::try_parse_from([
+            "camoufox",
+            "upload",
+            "i",
+            "p1",
+            "host >>> input",
+            "fixture.txt",
+            "second.pdf",
+            "--frame",
+            "#outer",
+            "--frame",
+            "#inner",
+            "--timeout",
+            "17",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Upload {
+                paths,
+                frames,
+                timeout,
+                ..
+            } => {
+                assert_eq!(paths, ["fixture.txt", "second.pdf"]);
+                assert_eq!(frames, ["#outer", "#inner"]);
+                assert_eq!(timeout, 17);
+            }
+            _ => panic!("expected upload command"),
+        }
+        let cli =
+            Cli::try_parse_from(["camoufox", "upload", "i", "p1", "input", "fixture.txt"]).unwrap();
+        assert!(matches!(cli.command, Command::Upload { timeout: 30, .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_spawn_retries_text_file_busy_with_bounded_backoff() {
+        let error = std::io::Error::from_raw_os_error(libc::ETXTBSY);
+        for (attempt, milliseconds) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+            assert_eq!(
+                external_spawn_retry_delay(&error, attempt),
+                Some(std::time::Duration::from_millis(milliseconds))
+            );
+        }
+        for attempt in [0, 5, 6, u32::MAX] {
+            assert_eq!(external_spawn_retry_delay(&error, attempt), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_spawn_does_not_retry_other_errors() {
+        for code in [libc::EACCES, libc::ENOENT, libc::ENOEXEC, libc::EINTR] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_eq!(external_spawn_retry_delay(&error, 1), None);
+        }
+        let error = std::io::Error::other("Text file busy");
+        assert_eq!(external_spawn_retry_delay(&error, 1), None);
     }
 
     #[test]

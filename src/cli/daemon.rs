@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::cli::instance::{InstanceManager, LaunchOptions};
+use crate::cli::instance::{InstanceManager, LaunchOptions, LaunchedInstance};
 use crate::cli::ipc::{DaemonRequest, DaemonResponse};
 
 const MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -294,6 +294,15 @@ fn respond<T: Serialize>(result: Result<T, String>) -> DaemonResponse {
     }
 }
 
+fn launch_success_data(result: LaunchedInstance) -> serde_json::Value {
+    let mut data =
+        json!({"instance_id": result.instance_id, "version": result.version, "pid": result.pid});
+    if let Some(path) = result.profile_dir {
+        data["profile_dir"] = json!(path.to_string_lossy());
+    }
+    data
+}
+
 fn dispatch_guarded(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
     if mgr.is_closing() && !matches!(request, DaemonRequest::Shutdown) {
         return DaemonResponse::err("daemon shutting down");
@@ -318,29 +327,33 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
         DaemonRequest::Ping => DaemonResponse::ok(json!({"instance_count": mgr.instance_count()})),
         DaemonRequest::List => DaemonResponse::ok(json!({"instances": mgr.list()})),
         DaemonRequest::Shutdown => DaemonResponse::ok_empty(),
+        DaemonRequest::RecordStart { instance_id, page_id, dir, urls } => respond(mgr.record_start(&instance_id, &page_id, &dir, &urls)),
+        DaemonRequest::RecordStop { instance_id, page_id } => respond(mgr.record_stop(&instance_id, &page_id)),
+        DaemonRequest::ReplayStart { instance_id, page_id, dir, match_body } => respond(mgr.replay_start(&instance_id, &page_id, &dir, match_body)),
+        DaemonRequest::ReplayStop { instance_id, page_id } => respond(mgr.replay_stop(&instance_id, &page_id)),
         DaemonRequest::Launch {
             headless,
             executable,
             downloads_dir,
             bypass_csp,
             dialogs,
+            profile_dir,
         } => respond(
-            mgr.launch_with(&LaunchOptions {
+            mgr.launch_with_result(&LaunchOptions {
                 headless,
                 executable,
                 downloads_dir,
                 bypass_csp,
                 dialogs,
+                profile_dir,
             })
-            .map(|(instance_id, version, pid)| {
-                json!({"instance_id": instance_id, "version": version, "pid": pid})
-            }),
+            .map(launch_success_data),
         ),
         DaemonRequest::Dialog { instance_id, page_id, action, text } => {
             let accept = match action.as_str() { "accept" => true, "dismiss" => false, _ => return DaemonResponse::err("dialog action must be accept or dismiss") };
             respond(mgr.dialog(&instance_id, &page_id, accept, text.as_deref()).map(|dialog| json!({"dialog_action": action, "dialog": dialog})))
         },
-        DaemonRequest::Stop { instance_id } => respond(mgr.stop(&instance_id)),
+        DaemonRequest::Stop { instance_id } => respond(mgr.stop_with_result(&instance_id)),
         DaemonRequest::NewPage { instance_id } => respond(mgr.new_page(&instance_id).map(|page_id| json!({"page_id": page_id}))),
         DaemonRequest::Navigate { instance_id, page_id, url, wait_until, .. } => respond(mgr.navigate(&instance_id, &page_id, &url, timeout, wait_until.as_deref()).map(|o| json!({"navigation_id": o.nav_id, "status_code": o.status_code}))),
         DaemonRequest::Evaluate { instance_id, page_id, expression, main_world, frames, .. } => {
@@ -380,6 +393,7 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
             }))
         },
         DaemonRequest::Screenshot { instance_id, page_id, format, quality, path, selector, clip, .. } => respond(mgr.screenshot(&instance_id, &page_id, format.as_deref(), quality, path.as_deref(), selector.as_deref(), clip, timeout).map(|(bytes, path, rect)| json!({"bytes": bytes.len(), "path": path, "clip": {"x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height}}))),
+        DaemonRequest::Upload { instance_id, page_id, selector, paths, frames, .. } => respond(mgr.upload(&instance_id, &page_id, &selector, &paths, &frames, timeout).map(|(files, outcome)| with_dialog(json!({"uploaded": true, "selector": selector, "files": files}), outcome))),
         DaemonRequest::Cookies { instance_id } => respond(mgr.cookies(&instance_id).map(|cookies| json!({"cookies": cookies}))),
         DaemonRequest::Text { instance_id, page_id, selector, frames, .. } => respond(mgr.text(&instance_id, &page_id, selector.as_deref(), &frames, timeout).map(|text| json!({"text": text}))),
         DaemonRequest::Html { instance_id, page_id, selector, frames, .. } => respond(mgr.html(&instance_id, &page_id, selector.as_deref(), &frames, timeout).map(|html| json!({"html": html}))),
@@ -399,7 +413,7 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
         DaemonRequest::Select { instance_id, page_id, selector, value, frames, .. } => respond(mgr.select_option(&instance_id, &page_id, &selector, &value, &frames, timeout).map(|r| json!({"selected": true, "selector": selector, "option_value": r.get("value"), "option_text": r.get("text")}))),
         DaemonRequest::Scroll { instance_id, page_id, selector, .. } => respond(mgr.scroll(&instance_id, &page_id, selector.as_deref(), timeout)),
         DaemonRequest::Tabs { instance_id, .. } => respond(mgr.tabs(&instance_id, timeout).map(|tabs| json!({"tabs": tabs}))),
-        DaemonRequest::CloseTab { instance_id, page_id } => respond(mgr.close_tab(&instance_id, &page_id).map(|()| json!({"closed_page": page_id}))),
+        DaemonRequest::CloseTab { instance_id, page_id } => respond(mgr.close_tab_with_result(&instance_id, &page_id)),
         DaemonRequest::Downloads {
             instance_id,
             wait_secs,
@@ -460,11 +474,52 @@ mod tests {
     }
 
     #[test]
+    fn launch_success_formats_non_utf8_profile_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+        let data = launch_success_data(LaunchedInstance {
+            instance_id: "00000001".into(),
+            version: None,
+            pid: 123,
+            profile_dir: Some(PathBuf::from(std::ffi::OsString::from_vec(
+                b"/profile-\xff".to_vec(),
+            ))),
+        });
+        assert_eq!(
+            data,
+            json!({
+                "instance_id": "00000001", "version": null, "pid": 123,
+                "profile_dir": "/profile-\u{fffd}",
+            })
+        );
+    }
+
+    #[test]
     fn ping_round_trip() {
         let daemon = TestDaemon::start();
         let response = daemon.request(DaemonRequest::Ping);
         assert!(response.ok);
         assert_eq!(response.data.unwrap()["instance_count"], 0);
+    }
+
+    #[test]
+    fn invalid_request_has_daemon_kind() {
+        let daemon = TestDaemon::start();
+        let mut stream = UnixStream::connect(&daemon.path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"{\n").unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["kind"], "daemon");
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid request: "));
+        assert!(response.get("data").is_none());
+        assert!(daemon.request(DaemonRequest::Ping).ok);
     }
 
     #[test]
@@ -491,6 +546,7 @@ mod tests {
         manager.begin_shutdown();
         let response = dispatch_guarded(DaemonRequest::List, &manager);
         assert!(!response.ok);
+        assert_eq!(serde_json::to_value(&response).unwrap()["kind"], "daemon");
         assert!(format!("{response:?}").contains("daemon shutting down"));
     }
 
@@ -550,8 +606,72 @@ mod tests {
         BufReader::new(stream).read_line(&mut line).unwrap();
         let response: DaemonResponse = serde_json::from_str(&line).unwrap();
         assert!(!response.ok);
+        assert_eq!(serde_json::to_value(&response).unwrap()["kind"], "daemon");
         assert!(response.error.unwrap().contains("too large"));
         assert!(daemon.request(DaemonRequest::Ping).ok);
+    }
+
+    #[test]
+    fn launch_forwards_profile_dir_through_dispatch() {
+        let daemon = TestDaemon::start();
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("fixture.pdf");
+        std::fs::write(&file, b"contents").unwrap();
+        let profile = temp.path().join("nested").join("profile");
+        let launch = |profile_dir: &str| {
+            daemon.request(DaemonRequest::Launch {
+                headless: Some(true),
+                // A nonexistent executable keeps the test browser-free while
+                // proving profile handling ran first.
+                executable: Some("/nonexistent/camoufox-test-binary".into()),
+                downloads_dir: None,
+                bypass_csp: false,
+                dialogs: Default::default(),
+                profile_dir: Some(profile_dir.into()),
+            })
+        };
+        let kind = |response: &DaemonResponse| {
+            serde_json::to_value(response).unwrap()["kind"]
+                .as_str()
+                .map(str::to_owned)
+        };
+        let relative = launch("relative/profile");
+        assert!(!relative.ok);
+        assert_eq!(
+            relative.error.as_deref(),
+            Some("invalid argument: --profile-dir must be an absolute path")
+        );
+        assert_eq!(kind(&relative).as_deref(), Some("invalid_argument"));
+        let not_dir = launch(file.to_str().unwrap());
+        assert!(not_dir
+            .error
+            .as_deref()
+            .unwrap()
+            .ends_with("is not a directory"));
+        assert_eq!(kind(&not_dir).as_deref(), Some("invalid_argument"));
+        // A valid profile dir is prepared (0700) before the spawn fails.
+        let spawn = launch(profile.to_str().unwrap());
+        assert!(
+            spawn
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("failed to spawn browser"),
+            "{spawn:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&profile).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let list = daemon.request(DaemonRequest::List);
+        assert_eq!(list.data.unwrap()["instances"], json!([]));
+        // The failed spawn released the reservation: retrying is not "in use".
+        let retry = launch(profile.to_str().unwrap());
+        assert!(retry
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("failed to spawn browser"));
     }
 
     #[test]

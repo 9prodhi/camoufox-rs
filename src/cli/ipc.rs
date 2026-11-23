@@ -16,9 +16,37 @@ fn default_timeout() -> u64 {
 /// A request from a CLI client to the daemon.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
+#[non_exhaustive]
 pub enum DaemonRequest {
     /// Ping the daemon. Returns instance count.
     Ping,
+
+    /// Begin recording a page's HTTP exchanges into an empty absolute directory.
+    RecordStart {
+        instance_id: String,
+        page_id: String,
+        dir: std::path::PathBuf,
+        #[serde(default)]
+        urls: Vec<String>,
+    },
+    /// Finalize a page's cassette and return directory and counts.
+    RecordStop {
+        instance_id: String,
+        page_id: String,
+    },
+    /// Validate a cassette and enable offline request interception.
+    ReplayStart {
+        instance_id: String,
+        page_id: String,
+        dir: std::path::PathBuf,
+        #[serde(default)]
+        match_body: bool,
+    },
+    /// Disable interception and report replay counts and misses.
+    ReplayStop {
+        instance_id: String,
+        page_id: String,
+    },
 
     /// Launch a new browser instance.
     Launch {
@@ -32,6 +60,9 @@ pub enum DaemonRequest {
         bypass_csp: bool,
         #[serde(default)]
         dialogs: crate::api::DialogPolicy,
+        /// Absolute path; created with mode 0700 or group/other permissions removed, canonicalized, must be empty or an existing profile, never deleted on stop.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_dir: Option<String>,
     },
 
     /// Accept or dismiss a page's open JavaScript dialog.
@@ -263,6 +294,18 @@ pub enum DaemonRequest {
         frames: Vec<String>,
     },
 
+    /// Set the files of a file input selected by CSS, optionally within frames.
+    Upload {
+        instance_id: String,
+        page_id: String,
+        selector: String,
+        paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: Vec<String>,
+        #[serde(default = "default_timeout")]
+        timeout_secs: u64,
+    },
+
     /// Insert text into the currently focused element.
     Type {
         instance_id: String,
@@ -342,12 +385,16 @@ pub enum DaemonRequest {
     },
 }
 
+const CASSETTE_STOP_TIMEOUT_SECS: u64 = 300;
+
 impl DaemonRequest {
     /// Operation budget, before the client's transport margin.
     pub fn timeout_secs(&self) -> u64 {
         match self {
             Self::Launch { .. } => 180,
-            Self::Shutdown => 20,
+            Self::RecordStop { .. } | Self::ReplayStop { .. } => CASSETTE_STOP_TIMEOUT_SECS,
+            Self::Shutdown => 20 + super::network::FINALIZE_TIMEOUT_SECS,
+            Self::Stop { .. } | Self::CloseTab { .. } => 60 + super::network::FINALIZE_TIMEOUT_SECS,
             Self::Downloads { wait_secs, .. } => wait_secs.unwrap_or(0).saturating_add(10),
             Self::Navigate { timeout_secs, .. }
             | Self::Evaluate { timeout_secs, .. }
@@ -363,6 +410,7 @@ impl DaemonRequest {
             | Self::Type { timeout_secs, .. }
             | Self::Press { timeout_secs, .. }
             | Self::Fill { timeout_secs, .. }
+            | Self::Upload { timeout_secs, .. }
             | Self::Hover { timeout_secs, .. }
             | Self::Select { timeout_secs, .. }
             | Self::Scroll { timeout_secs, .. }
@@ -380,12 +428,30 @@ impl DaemonRequest {
 // Response
 // ---------------------------------------------------------------------------
 
+pub use super::error_kind::ErrorKind;
+
 /// A response from the daemon to a CLI client.
+///
+/// Use the response constructors so future fields can be added:
+/// ```
+/// use camoufox::cli::ipc::DaemonResponse;
+/// let response = DaemonResponse::ok_empty();
+/// assert!(response.ok);
+/// ```
+/// External callers cannot construct this extensible type with a struct literal:
+/// ```compile_fail,E0639
+/// use camoufox::cli::ipc::DaemonResponse;
+/// let response = DaemonResponse { ok: true, error: None, kind: None, data: None };
+/// ```
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DaemonResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Stable error category; absent on successes and older daemon responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
@@ -396,6 +462,7 @@ impl DaemonResponse {
         DaemonResponse {
             ok: true,
             error: None,
+            kind: None,
             data: Some(data),
         }
     }
@@ -405,15 +472,19 @@ impl DaemonResponse {
         DaemonResponse {
             ok: true,
             error: None,
+            kind: None,
             data: None,
         }
     }
 
     /// Create an error response.
     pub fn err(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let kind = ErrorKind::classify(&message).as_str().to_owned();
         DaemonResponse {
             ok: false,
-            error: Some(message.into()),
+            error: Some(message),
+            kind: Some(kind),
             data: None,
         }
     }
@@ -427,6 +498,150 @@ impl DaemonResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    macro_rules! error_kind_case {
+        ($name:ident, $message:expr, $kind:literal) => {
+            #[test]
+            fn $name() {
+                let message = $message;
+                let value = serde_json::to_value(DaemonResponse::err(message)).unwrap();
+                assert_eq!(value["kind"], $kind);
+                assert_eq!(value["error"], message);
+                assert_eq!(value["ok"], false);
+                assert!(value.get("data").is_none());
+            }
+        };
+    }
+
+    error_kind_case!(page_closed_kind, "page p1 was closed", "page_closed");
+    error_kind_case!(page_crashed_kind, "page p2 crashed", "page_closed");
+    error_kind_case!(
+        profile_unsupported_kind,
+        "daemon does not support --profile-dir; restart it: camoufox shutdown && camoufox serve",
+        "daemon"
+    );
+
+    // src/cli/instance.rs: selector_box_in_frame, selector-not-found branch.
+    error_kind_case!(
+        selector_not_found_kind,
+        "selector not found: #missing",
+        "selector_not_found"
+    );
+    // src/cli/instance.rs: wait_deadline_normalizes_a_final_protocol_timeout.
+    error_kind_case!(
+        timeout_kind,
+        "timed out after 0s waiting for selector: #never",
+        "timeout"
+    );
+    // src/protocol/errors.rs: ProtocolError::dialog_opened.
+    error_kind_case!(
+        dialog_open_kind,
+        "open alert dialog: \"hello\"",
+        "dialog_open"
+    );
+    // src/cli/instance.rs: scoped_error.
+    error_kind_case!(frame_detached_kind, "frame was detached", "frame_detached");
+    // src/api/main_frame.rs: resolve_child_frame, missing objectId branch.
+    error_kind_case!(
+        frame_not_found_kind,
+        "--frame #missing: no element matches",
+        "frame_not_found"
+    );
+    // src/api/main_frame.rs: resolve_child_frame, missing contentFrameId branch.
+    error_kind_case!(
+        not_iframe_kind,
+        "--frame #text: element is not an iframe",
+        "not_iframe"
+    );
+    // src/api/selectors.rs: selector_exception and js_query's missing-root error.
+    error_kind_case!(shadow_root_kind, "shadow root: #closed >>> button: element at segment 1 has no open shadow root (absent or closed; cannot pierce)", "shadow_root");
+    // src/protocol/errors.rs: ProtocolError::navigation_became_download.
+    error_kind_case!(
+        navigation_kind,
+        "navigation diverted into download flow (url https://example.com/fixture.pdf)",
+        "navigation"
+    );
+    // src/cli/instance.rs: InstanceManager::missing.
+    error_kind_case!(
+        instance_not_found_kind,
+        "instance 00000001 not found",
+        "instance_not_found"
+    );
+    // src/cli/instance.rs: page_any.
+    error_kind_case!(page_not_found_kind, "page p1 not found", "page_not_found");
+    // src/cli/instance.rs: InstanceManager::launch_with.
+    error_kind_case!(
+        invalid_argument_kind,
+        "--downloads-dir must be an absolute path",
+        "invalid_argument"
+    );
+    // src/cli/instance.rs: write_screenshot, OpenOptions::open failure.
+    error_kind_case!(
+        io_kind,
+        "failed to open screenshot: Permission denied (os error 13)",
+        "io"
+    );
+    // src/cli/daemon.rs: dispatch_guarded.
+    error_kind_case!(daemon_kind, "daemon shutting down", "daemon");
+    // src/cli/instance.rs: data, unexpected metadata branch.
+    error_kind_case!(other_kind, "unexpected metadata shape", "other");
+
+    #[test]
+    fn unknown_error_preserves_message_bytes_and_field_order() {
+        let message = "unknown: é\n\t\0  ";
+        let response = DaemonResponse::err(message);
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"ok":false,"error":"unknown: é\n\t\u0000  ","kind":"other"}"#
+        );
+        let decoded: DaemonResponse = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(decoded.error.unwrap().as_bytes(), message.as_bytes());
+    }
+
+    #[test]
+    fn success_responses_omit_kind() {
+        assert_eq!(
+            serde_json::to_string(&DaemonResponse::ok_empty()).unwrap(),
+            r#"{"ok":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&DaemonResponse::ok(json!({"value": 1}))).unwrap(),
+            r#"{"ok":true,"data":{"value":1}}"#
+        );
+    }
+
+    #[test]
+    fn legacy_error_without_kind_still_deserializes() {
+        let response: DaemonResponse =
+            serde_json::from_str(r#"{"ok":false,"error":"legacy error"}"#).unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.error.as_deref(), Some("legacy error"));
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"ok":false,"error":"legacy error"}"#
+        );
+    }
+
+    #[test]
+    fn upload_request_round_trip_and_defaults() {
+        let payload = json!({"method":"Upload", "params": {
+            "instance_id":"i", "page_id":"p1", "selector":"host >>> input",
+            "paths":["/tmp/fixture.txt", "/tmp/second.txt"],
+            "frames":["#outer", "#inner"], "timeout_secs":17
+        }});
+        let request: DaemonRequest = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(request.timeout_secs(), 17);
+        assert_eq!(request.read_timeout().as_secs(), 47);
+        assert_eq!(serde_json::to_value(request).unwrap(), payload);
+        let request: DaemonRequest = serde_json::from_value(json!({"method":"Upload", "params": {
+            "instance_id":"i", "page_id":"p1", "selector":"input", "paths":["/tmp/fixture.txt"]
+        }}))
+        .unwrap();
+        assert!(
+            matches!(request, DaemonRequest::Upload { frames, timeout_secs:30, .. } if frames.is_empty())
+        );
+    }
 
     #[test]
     fn evaluate_main_world_round_trip_and_legacy_default() {
@@ -474,6 +689,18 @@ mod tests {
     }
 
     #[test]
+    fn cassette_stop_client_timeout_allows_draining() {
+        for method in ["RecordStop", "ReplayStop"] {
+            let request: DaemonRequest = serde_json::from_value(
+                json!({"method":method, "params":{"instance_id":"i", "page_id":"p"}}),
+            )
+            .unwrap();
+            assert_eq!(request.timeout_secs(), 300);
+            assert_eq!(request.read_timeout().as_secs(), 330);
+        }
+    }
+
+    #[test]
     fn client_timeout_budget_per_request_type() {
         let timed = [
             "Navigate",
@@ -510,7 +737,6 @@ mod tests {
         let default_methods = [
             "Ping",
             "List",
-            "Stop",
             "NewPage",
             "Click",
             "Cookies",
@@ -518,7 +744,6 @@ mod tests {
             "Forward",
             "Reload",
             "SetHeader",
-            "CloseTab",
         ];
         for method in default_methods {
             let request: DaemonRequest = serde_json::from_value(if matches!(method, "Ping" | "List" | "Shutdown") {
@@ -528,13 +753,25 @@ mod tests {
             }).unwrap();
             assert_eq!(request.read_timeout().as_secs(), 90, "{method}");
         }
-        assert_eq!(DaemonRequest::Shutdown.read_timeout().as_secs(), 50);
+        assert_eq!(DaemonRequest::Shutdown.read_timeout().as_secs(), 65);
+        for request in [
+            DaemonRequest::Stop {
+                instance_id: "i".into(),
+            },
+            DaemonRequest::CloseTab {
+                instance_id: "i".into(),
+                page_id: "p".into(),
+            },
+        ] {
+            assert_eq!(request.read_timeout().as_secs(), 105);
+        }
         let launch = DaemonRequest::Launch {
             headless: None,
             executable: None,
             downloads_dir: None,
             bypass_csp: false,
             dialogs: Default::default(),
+            profile_dir: None,
         };
         assert_eq!(launch.read_timeout().as_secs(), 210);
     }
@@ -552,6 +789,46 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(request, DaemonRequest::Launch { .. }));
+    }
+
+    #[test]
+    fn launch_profile_dir_wire_shape_and_round_trip() {
+        let launch = |profile_dir: Option<&str>| DaemonRequest::Launch {
+            headless: Some(true),
+            executable: None,
+            downloads_dir: None,
+            bypass_csp: false,
+            dialogs: Default::default(),
+            profile_dir: profile_dir.map(str::to_owned),
+        };
+        let with = serde_json::to_value(launch(Some("/data/profile"))).unwrap();
+        assert_eq!(with["method"], "Launch");
+        assert_eq!(with["params"]["profile_dir"], "/data/profile");
+        // Absent profile dirs are omitted so older daemons see the same payload.
+        let without = serde_json::to_value(launch(None)).unwrap();
+        assert!(without["params"].get("profile_dir").is_none(), "{without}");
+        for value in [with, without] {
+            let expected = value["params"]["profile_dir"].as_str().map(str::to_owned);
+            match serde_json::from_value(value).unwrap() {
+                DaemonRequest::Launch { profile_dir, .. } => assert_eq!(profile_dir, expected),
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+        // Explicit null means "no profile dir"; a non-string is rejected.
+        let request: DaemonRequest =
+            serde_json::from_value(json!({"method": "Launch", "params": {"profile_dir": null}}))
+                .unwrap();
+        assert!(matches!(
+            request,
+            DaemonRequest::Launch {
+                profile_dir: None,
+                ..
+            }
+        ));
+        assert!(serde_json::from_value::<DaemonRequest>(
+            json!({"method": "Launch", "params": {"profile_dir": 7}})
+        )
+        .is_err());
     }
 
     /// `DaemonRequest::Cookies` serialises to the expected JSON shape and
@@ -887,5 +1164,28 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cassette_ipc_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cassette_requests_roundtrip_and_defaults() {
+        for value in [
+            json!({"method":"RecordStart", "params":{"instance_id":"i", "page_id":"p", "dir":"/tmp/cassette", "urls":["data"]}}),
+            json!({"method":"ReplayStart", "params":{"instance_id":"i", "page_id":"p", "dir":"/tmp/cassette", "match_body":true}}),
+            json!({"method":"RecordStop", "params":{"instance_id":"i", "page_id":"p"}}),
+            json!({"method":"ReplayStop", "params":{"instance_id":"i", "page_id":"p"}}),
+        ] {
+            let request: DaemonRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+        assert!(
+            matches!(serde_json::from_value::<DaemonRequest>(json!({"method":"RecordStart", "params":{"instance_id":"i", "page_id":"p", "dir":"/tmp/cassette"}})).unwrap(), DaemonRequest::RecordStart { urls, .. } if urls.is_empty())
+        );
+        assert!(matches!(serde_json::from_value::<DaemonRequest>(json!({"method":"ReplayStart", "params":{"instance_id":"i", "page_id":"p", "dir":"/tmp/cassette"}})).unwrap(), DaemonRequest::ReplayStart { match_body:false, .. }));
     }
 }

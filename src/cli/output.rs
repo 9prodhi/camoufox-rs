@@ -59,9 +59,92 @@ pub fn print_response(response: &DaemonResponse, json_mode: bool) {
 /// command uses, and the more specific keys are tested first. Kept pure so the
 /// exact rendering can be asserted in tests.
 pub fn render(data: Option<&Value>) -> Rendered {
+    let mut rendered = render_data(data);
+    if let Some(errors) = data.and_then(|d| d["cassette_errors"].as_array()) {
+        for error in errors {
+            // Keep one warning per entry even when an I/O path contains newlines.
+            let page = error["page_id"]
+                .as_str()
+                .unwrap_or("")
+                .replace(['\n', '\r'], " ");
+            let message = error["error"]
+                .as_str()
+                .unwrap_or("")
+                .replace(['\n', '\r'], " ");
+            rendered.stderr.push(format!(
+                "warning: cassette for {page} not published: {message}"
+            ));
+        }
+    }
+    rendered
+}
+
+fn render_data(data: Option<&Value>) -> Rendered {
     let Some(data) = data else {
         return Rendered::out("ok");
     };
+
+    if data.get("recording").and_then(Value::as_bool) == Some(true) {
+        return Rendered::out(format!("recording: {}", data["dir"].as_str().unwrap_or("")));
+    }
+    if data.get("replaying").and_then(Value::as_bool) == Some(true) {
+        return Rendered::out(format!("replaying: {}", data["dir"].as_str().unwrap_or("")));
+    }
+    if let (Some(exchanges), Some(bodies)) = (data.get("exchanges"), data.get("bodies")) {
+        let mut rendered = Rendered::out(format!(
+            "recorded {exchanges} exchanges, {bodies} bodies: {}",
+            data["dir"].as_str().unwrap_or("")
+        ));
+        if let Some(skipped) = data["skipped"].as_array() {
+            for skip in skipped {
+                rendered.stderr.push(format!(
+                    "skipped: {} {} ({})",
+                    skip["method"].as_str().unwrap_or(""),
+                    skip["url"].as_str().unwrap_or(""),
+                    skip["reason"].as_str().unwrap_or("")
+                ));
+            }
+        }
+        if data["repeated"] == true {
+            rendered
+                .stderr
+                .push("note: recording was already stopped".into());
+        }
+        return rendered;
+    }
+    if let (Some(served), Some(missed)) = (
+        data.get("served"),
+        data.get("missed").and_then(Value::as_array),
+    ) {
+        let total = data["missed_total"].as_u64().unwrap_or(missed.len() as u64);
+        let mut rendered = Rendered::out(format!("replayed {served} requests, {total} misses"));
+        let mut listed: u64 = 0;
+        for miss in missed {
+            let count = miss["count"].as_u64().unwrap_or(1);
+            listed = listed.saturating_add(count);
+            let suffix = if count > 1 {
+                format!(" (x{count})")
+            } else {
+                String::new()
+            };
+            rendered.stderr.push(format!(
+                "missed: {} {}{suffix}",
+                miss["method"].as_str().unwrap_or(""),
+                miss["url"].as_str().unwrap_or("")
+            ));
+        }
+        if total > listed {
+            rendered
+                .stderr
+                .push(format!("... and {} more not listed", total - listed));
+        }
+        if data["repeated"] == true {
+            rendered
+                .stderr
+                .push("note: replay was already stopped".into());
+        }
+        return rendered;
+    }
 
     // -----------------------------------------------------------------------
     // Reading / interaction commands.
@@ -80,6 +163,18 @@ pub fn render(data: Option<&Value>) -> Rendered {
             "dismissed"
         };
         return Rendered::out(format!("dialog {verb}: {kind} {message:?}"));
+    }
+
+    if data.get("uploaded").and_then(Value::as_bool) == Some(true) {
+        let files = data.get("files").and_then(Value::as_array);
+        return Rendered::out(
+            files
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
     }
 
     // Structured metadata (`data --og/--jsonld/--meta`).
@@ -207,7 +302,11 @@ pub fn render(data: Option<&Value>) -> Rendered {
                             .join(",")
                     })
                     .unwrap_or_default();
-                format!("{id}  pid={pid}  version={version}  pages=[{pages}]")
+                let mut line = format!("{id}  pid={pid}  version={version}  pages=[{pages}]");
+                if let Some(profile_dir) = inst.get("profile_dir").and_then(|v| v.as_str()) {
+                    line.push_str(&format!("  profile_dir={profile_dir}"));
+                }
+                line
             })
             .collect();
         return Rendered::out(lines.join("\n"));
@@ -286,6 +385,10 @@ pub fn render(data: Option<&Value>) -> Rendered {
         }
     }
 
+    if data.get("cassette_errors").is_some() && data.as_object().is_some_and(|d| d.len() == 1) {
+        return Rendered::out("ok");
+    }
+
     // Fallback: print the data as JSON.
     Rendered::out(pretty(data))
 }
@@ -303,6 +406,15 @@ mod tests {
     use super::*;
     use crate::cli::ipc::DaemonResponse;
     use serde_json::json;
+
+    #[test]
+    fn upload_renders_one_filename_per_line() {
+        let data = json!({"uploaded":true, "selector":"#file", "files":["fixture one.txt", "fixture.pdf"]});
+        assert_eq!(
+            render(Some(&data)),
+            Rendered::out("fixture one.txt\nfixture.pdf")
+        );
+    }
 
     /// `print_response` in JSON mode emits the full response including cookies
     /// with httpOnly preserved — verified by checking `to_string_pretty` output.
@@ -523,5 +635,137 @@ mod tests {
     fn downloads_renders_no_downloads_when_empty() {
         let rendered = render(Some(&json!({ "downloads": [] })));
         assert_eq!(rendered.stdout, "no downloads");
+    }
+
+    #[test]
+    fn list_renders_profile_dir_only_when_present() {
+        let data = json!({
+            "instances": [
+                {
+                    "instance_id": "00000001",
+                    "pid": 100,
+                    "version": "Firefox/150",
+                    "pages": ["p1"],
+                    "profile_dir": "/abs/profile"
+                },
+                {
+                    "instance_id": "00000002",
+                    "pid": 200,
+                    "version": "Firefox/150",
+                    "pages": []
+                }
+            ]
+        });
+        let rendered = render(Some(&data));
+        let lines: Vec<&str> = rendered.stdout.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "00000001  pid=100  version=Firefox/150  pages=[p1]  profile_dir=/abs/profile"
+        );
+        assert_eq!(lines[1], "00000002  pid=200  version=Firefox/150  pages=[]");
+    }
+}
+
+#[cfg(test)]
+mod cassette_output_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cleanup_errors_render_one_warning_line_per_entry() {
+        let data = json!({"closed_page":"p1", "cassette_errors":[
+            {"page_id":"p1", "mode":"record", "error":"io error: first\nline\rbreak"},
+            {"page_id":"p2", "mode":"replay", "error":"io error: second"}
+        ]});
+        let rendered = render(Some(&data));
+        assert_eq!(
+            rendered.stderr,
+            [
+                "warning: cassette for p1 not published: io error: first line break",
+                "warning: cassette for p2 not published: io error: second"
+            ]
+        );
+    }
+
+    #[test]
+    fn cassette_responses_render_counts_and_miss_details() {
+        assert_eq!(
+            render(Some(&json!({"recording":true, "dir":"/tmp/cassette"}))).stdout,
+            "recording: /tmp/cassette"
+        );
+        assert_eq!(
+            render(Some(&json!({"replaying":true, "dir":"/tmp/cassette"}))).stdout,
+            "replaying: /tmp/cassette"
+        );
+        assert_eq!(
+            render(Some(
+                &json!({"dir":"/tmp/cassette", "exchanges":2, "bodies":1})
+            ))
+            .stdout,
+            "recorded 2 exchanges, 1 bodies: /tmp/cassette"
+        );
+        let rendered = render(Some(
+            &json!({"served":3, "missed":[{"method":"GET", "url":"https://example.com/miss"}]}),
+        ));
+        assert_eq!(rendered.stdout, "replayed 3 requests, 1 misses");
+        assert_eq!(rendered.stderr, ["missed: GET https://example.com/miss"]);
+    }
+
+    #[test]
+    fn cassette_stop_renders_skips_repeats_and_total_misses() {
+        let record = render(Some(
+            &json!({"dir":"/tmp/cassette", "exchanges":1, "bodies":1,
+            "skipped":[{"method":"GET", "url":"https://example.com/large", "reason":"response body was evicted during recording"}], "repeated":true}),
+        ));
+        assert_eq!(
+            record.stdout,
+            "recorded 1 exchanges, 1 bodies: /tmp/cassette"
+        );
+        assert_eq!(record.stderr, ["skipped: GET https://example.com/large (response body was evicted during recording)", "note: recording was already stopped"]);
+        let replay = render(Some(&json!({"served":2, "missed_total":8,
+            "missed":[{"method":"GET", "url":"https://example.com/a", "count":3}, {"method":"POST", "url":"https://example.com/b", "count":1}], "repeated":true})));
+        assert_eq!(replay.stdout, "replayed 2 requests, 8 misses");
+        assert_eq!(
+            replay.stderr,
+            [
+                "missed: GET https://example.com/a (x3)",
+                "missed: POST https://example.com/b",
+                "... and 4 more not listed",
+                "note: replay was already stopped"
+            ]
+        );
+    }
+
+    #[test]
+    fn cassette_and_upload_render_empty_and_partial_shapes() {
+        let rendered = render(Some(&json!({"served":0, "missed":[]})));
+        assert_eq!(rendered, Rendered::out("replayed 0 requests, 0 misses"));
+        let rendered = render(Some(
+            &json!({"served":1, "missed":[{"url":"https://example.com/"}]}),
+        ));
+        assert_eq!(rendered.stderr, ["missed:  https://example.com/"]);
+        assert_eq!(
+            render(Some(
+                &json!({"exchanges":0, "bodies":0, "dir":"/tmp/cassette"})
+            ))
+            .stdout,
+            "recorded 0 exchanges, 0 bodies: /tmp/cassette"
+        );
+        // `recording:false` is not a cassette response.
+        assert_ne!(
+            render(Some(&json!({"recording":false, "dir":"/tmp/cassette"}))).stdout,
+            "recording: /tmp/cassette"
+        );
+        assert_eq!(
+            render(Some(
+                &json!({"uploaded":true, "selector":"#file", "files":[]})
+            )),
+            Rendered::out("")
+        );
+        assert_eq!(
+            render(Some(&json!({"uploaded":true, "selector":"#file"}))),
+            Rendered::out("")
+        );
     }
 }

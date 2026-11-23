@@ -64,7 +64,12 @@ impl DownloadLog {
 
     /// Handle a `Browser.downloadCreated` protocol event.
     pub fn on_created(&self, params: &serde_json::Value) {
-        if params.get("browserContextId").and_then(|v| v.as_str()) != Some(&self.context_id) {
+        if params
+            .get("browserContextId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            != self.context_id
+        {
             return;
         }
 
@@ -259,6 +264,16 @@ impl DownloadLog {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn default_context_downloads_accept_absent_id_and_reject_private_contexts() {
+        let log = DownloadLog::new(String::new(), None);
+        log.on_created(&json!({ "uuid": "default", "url": "https://example.com/fixture.pdf" }));
+        log.on_created(&json!({ "uuid": "private", "browserContextId": "private" }));
+        let (_, entries) = log.snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uuid, "default");
+    }
 
     #[test]
     fn created_then_finished_completes_with_path() {

@@ -1,8 +1,11 @@
+pub(crate) mod cassette;
 pub mod client;
 pub mod commands;
 pub mod daemon;
 pub mod downloads;
+pub mod error_kind;
 pub mod instance;
 pub mod ipc;
+pub(crate) mod network;
 pub mod output;
 pub mod socket;

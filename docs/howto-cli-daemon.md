@@ -48,15 +48,35 @@ With `--json`:
 ```
 
 ### Socket resolution
-By default, the daemon binds to:
-- `$XDG_RUNTIME_DIR/camoufox/daemon.sock`
-- Or `/tmp/camoufox-<uid>/daemon.sock` if `XDG_RUNTIME_DIR` is unset.
+
+The daemon and client resolve the socket path in this order:
+
+1. `--socket <path>`, when supplied.
+2. `CAMOUFOX_SOCKET`, when set.
+3. `$XDG_RUNTIME_DIR/camoufox/daemon.sock`, when `XDG_RUNTIME_DIR` is set.
+4. `/tmp/camoufox-<uid>/daemon.sock` otherwise.
 
 Override the socket location with `--socket <path>` on any command:
 ```bash
 ./target/release/camoufox --socket /tmp/my-daemon.sock serve
 ./target/release/camoufox --socket /tmp/my-daemon.sock list
 ```
+
+Alternatively, export `CAMOUFOX_SOCKET=/tmp/my-daemon.sock` for both terminals.
+An explicit `--socket` takes precedence over that environment variable.
+
+### Output and errors
+
+With `--json`, successful responses contain `ok: true` and optional `data`;
+failures contain `ok: false`, `error`, and a machine-readable `kind` such as
+`selector_not_found`, `timeout`, `dialog_open`, `invalid_argument`, `io`, or
+`daemon`. Success omits `kind`. The client backfills missing kinds from older
+daemon messages and preserves unknown kinds; treat unknown values as `other`.
+
+Exit codes are 0 for success, 1 for execution or daemon failures, and 2 for
+client-side argument validation (`invalid_argument`) or clap parsing errors.
+Clap diagnostics remain text even with `--json`. Local path-resolution failures
+exit 1 with kind `io`; daemon-side validation failures also exit 1.
 
 ---
 
@@ -80,6 +100,26 @@ To configure downloads and dialogs at launch:
 ```bash
 ./target/release/camoufox launch --downloads-dir /tmp/my-downloads --dialogs accept
 ```
+
+### Keep browsing data across launches
+
+```bash
+./target/release/camoufox launch --profile-dir /absolute/path/to/profile
+```
+
+This uses the browser's default context so cookies, localStorage, IndexedDB, and
+other profile data survive relaunch. The directory must be empty or contain
+`prefs.js` or `times.json`; missing directories are created with mode 0700 and
+existing profiles have group/other access removed. The canonical path appears in
+launch JSON and `list`, and cannot be used concurrently by another instance in
+the same daemon process. Do not point two daemons at the same profile directory:
+Firefox does not support concurrent use and it can corrupt the profile.
+Stop or shutdown flushes storage and keeps the directory.
+
+If an older daemon cannot confirm profile support, the client stops the returned
+instance and exits 1 with kind `daemon` and restart instructions. If cleanup fails,
+the error identifies the instance to stop manually. Restart with `camoufox shutdown`,
+then `camoufox serve`, before retrying.
 
 ### List instances
 Listing instances shows all running processes and their open pages (a freshly launched instance has no pages):
@@ -254,6 +294,21 @@ Type text into whatever element currently has focus via `Page.insertText` (sent 
 ./target/release/camoufox type 00000001 p1 "search query"
 ```
 
+### Upload files
+
+```bash
+./target/release/camoufox upload 00000001 p1 'input[type=file]' ./fixture.pdf
+./target/release/camoufox upload 00000001 p1 'file-picker >>> input' ./one.txt ./two.txt \
+    --frame '#outer' --frame '#inner' --timeout 30
+```
+
+Upload replaces the selection and dispatches `input` and `change`, including on
+hidden inputs. Relative paths resolve against the client's working directory;
+all paths must be regular files and are validated before page access. Multiple
+files require `multiple`; directory-picker (`webkitdirectory`) inputs are rejected
+with kind `invalid_argument`. Plain output lists basenames; JSON returns
+`uploaded`, `selector`, and `files`, plus `dialog` if a handler opens one.
+
 ### Hover, Select, Scroll
 Hover over an element without clicking:
 ```bash
@@ -350,7 +405,11 @@ Stop a single instance:
 ```bash
 ./target/release/camoufox stop 00000001
 ```
-`stop` interrupts any in-flight commands and finishes in ~1s.
+`stop` interrupts in-flight commands and finalizes active cassettes with a shared
+15-second budget across the instance's pages. It may disconnect the browser at
+the deadline. Persistent profile storage is flushed and its directory is kept.
+Finalization failures appear in success data as `cassette_errors` entries with
+`page_id`, `mode`, and `error`; plain output warns on stderr and still exits 0.
 
 Shut down the daemon and all running instances:
 
@@ -358,6 +417,60 @@ Shut down the daemon and all running instances:
 ./target/release/camoufox shutdown
 ```
 `shutdown` stops browsers in parallel, removes the socket file, and exits. The `<socket>.lock` file is intentionally kept to prevent race conditions during daemon restart.
+It uses the same cassette finalization budget per instance and logs finalization failures.
+
+---
+
+## 10. Record and replay HTTP traffic
+
+Start recording before navigation and stop to publish the cassette:
+
+```bash
+./target/release/camoufox record start 00000001 p1 --dir /absolute/cassette
+./target/release/camoufox navigate 00000001 p1 https://example.com --wait-until load
+./target/release/camoufox record stop 00000001 p1
+./target/release/camoufox replay start 00000001 p1 --dir /absolute/cassette
+./target/release/camoufox navigate 00000001 p1 https://example.com --wait-until load
+./target/release/camoufox replay stop 00000001 p1
+```
+
+Recording requires an absent or empty absolute directory; existing directories
+must be owner-only. Repeat `--url <regex>` to include matching URLs. Stop atomically
+publishes `index.json` and reports `exchanges`, `bodies`, and `skipped`. Unreadable
+or evicted bodies are skipped; disk write errors prevent publication.
+
+Replay matches method and exact URL, optionally request-body hashes with
+`--match-body`. Repeated matches consume responses in order, then reuse the last.
+Misses are aborted and reported in `missed` with counts and `missed_total` at stop.
+Replay rejects redirect cassettes; keep cassette files unchanged until it stops.
+One recording or replay may run per page, including subframes. Popups need their
+own sessions; service-worker responses are outside replay interception.
+
+Explicit stop commands work with open dialogs, allow 300 seconds to drain, and
+return the last result with `repeated: true` if repeated. Closing a tab also
+finalizes its cassette, with a 15-second budget after acquiring its network-operation
+lock. Other tabs keep their connections. Finalization failures use the same
+`cassette_errors` success data as instance stop.
+
+Cassettes scrub credential headers, but store URLs and decoded bodies verbatim,
+which may contain secrets. Replayed HTML and scripts use the origin's real storage;
+use trusted cassettes. See the [CLI reference](reference-cli.md#record) for format,
+buffer limits, and lifecycle details.
+
+## 11. External subcommands
+
+`camoufox <name> <args>...` runs `camoufox-<name>` from absolute `PATH` entries
+when `<name>` is not built-in. Arguments, environment, standard streams, and exit
+status pass through. Put global options before the name:
+
+```bash
+camoufox --socket /tmp/my-daemon.sock --json custom-tool --flag value
+```
+
+The executable receives `CAMOUFOX_SOCKET` as an absolute path and
+`CAMOUFOX_JSON=1` with global `--json`; otherwise `CAMOUFOX_JSON` is cleared.
+Output is controlled by the executable. A missing command uses clap's standard
+error and exit code 2. Built-in commands always take precedence.
 
 ---
 

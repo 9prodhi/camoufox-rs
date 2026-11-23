@@ -76,6 +76,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Keep storage in the on-disk profile
+
+For persistent browsing, use a directory that you keep between launches in
+`LaunchConfig::profile_dir` and set `LaunchConfig::persistent` to `true`.
+Connect with default-context events enabled and configure that context instead
+of creating a private one:
+
+```rust,no_run
+# fn doc_test(conn: camoufox::protocol::client::Connection, root_session: camoufox::protocol::client::Session) -> Result<(), Box<dyn std::error::Error>> {
+use camoufox::api::{Browser, BrowserOptions, ContextOptions};
+
+let browser = Browser::connect(conn, root_session, BrowserOptions {
+    attach_to_default_context: true,
+    ..Default::default()
+})?;
+let context = browser.default_context(ContextOptions::default())?;
+let page = context.new_main_frame()?;
+assert_eq!(context.context_id(), "");
+browser.close()?;
+# Ok(())
+# }
+```
+
+Cookies, localStorage, IndexedDB, and other profile data survive relaunch in
+this context. `context.close()` only consumes the handle; use `Browser::close()`
+to close its pages and flush storage, then wait for the child process to exit.
+The CLI provides this setup through `launch --profile-dir`; its directory
+validation and reservation are CLI features, not automatic library behavior.
+
 ---
 
 ## 3. Interacting with Elements
@@ -114,6 +143,21 @@ page.dispatch_key_event(key_event)?;
 # Ok(())
 # }
 ```
+
+### File inputs
+
+`MainFrame::set_file_input_files(frame_id, object_id, files)` sends
+`Page.setFileInputFiles` with a 60-second timeout.
+`set_file_input_files_with_timeout(frame_id, object_id, files, timeout)` accepts
+an explicit `Duration`. Pass the target frame ID, the file input's remote object
+ID (from a `Runtime.evaluate` result with `returnByValue: false`), and file paths
+as `&[&str]`. Both methods dispatch `input` and `change` after setting the files.
+Release the remote handle with `dispose_object` when finished.
+
+These are low-level handle APIs. The CLI's `upload` adds CSS selection, hidden
+input support, nested `--frame` and open-shadow scoping, client-relative paths,
+and regular-file validation. It rejects directory-picker inputs and requires
+`multiple` for more than one file.
 
 ---
 

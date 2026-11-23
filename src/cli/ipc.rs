@@ -380,12 +380,17 @@ impl DaemonRequest {
 // Response
 // ---------------------------------------------------------------------------
 
+pub use super::error_kind::ErrorKind;
+
 /// A response from the daemon to a CLI client.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DaemonResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Stable error category; absent on successes and older daemon responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
@@ -396,6 +401,7 @@ impl DaemonResponse {
         DaemonResponse {
             ok: true,
             error: None,
+            kind: None,
             data: Some(data),
         }
     }
@@ -405,15 +411,19 @@ impl DaemonResponse {
         DaemonResponse {
             ok: true,
             error: None,
+            kind: None,
             data: None,
         }
     }
 
     /// Create an error response.
     pub fn err(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let kind = ErrorKind::classify(&message).as_str().to_owned();
         DaemonResponse {
             ok: false,
-            error: Some(message.into()),
+            error: Some(message),
+            kind: Some(kind),
             data: None,
         }
     }
@@ -427,6 +437,122 @@ impl DaemonResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    macro_rules! error_kind_case {
+        ($name:ident, $message:expr, $kind:literal) => {
+            #[test]
+            fn $name() {
+                let message = $message;
+                let value = serde_json::to_value(DaemonResponse::err(message)).unwrap();
+                assert_eq!(value["kind"], $kind);
+                assert_eq!(value["error"], message);
+                assert_eq!(value["ok"], false);
+                assert!(value.get("data").is_none());
+            }
+        };
+    }
+
+    // src/cli/instance.rs: selector_box_in_frame, selector-not-found branch.
+    error_kind_case!(
+        selector_not_found_kind,
+        "selector not found: #missing",
+        "selector_not_found"
+    );
+    // src/cli/instance.rs: wait_deadline_normalizes_a_final_protocol_timeout.
+    error_kind_case!(
+        timeout_kind,
+        "timed out after 0s waiting for selector: #never",
+        "timeout"
+    );
+    // src/protocol/errors.rs: ProtocolError::dialog_opened.
+    error_kind_case!(
+        dialog_open_kind,
+        "open alert dialog: \"hello\"",
+        "dialog_open"
+    );
+    // src/cli/instance.rs: scoped_error.
+    error_kind_case!(frame_detached_kind, "frame was detached", "frame_detached");
+    // src/api/main_frame.rs: resolve_child_frame, missing objectId branch.
+    error_kind_case!(
+        frame_not_found_kind,
+        "--frame #missing: no element matches",
+        "frame_not_found"
+    );
+    // src/api/main_frame.rs: resolve_child_frame, missing contentFrameId branch.
+    error_kind_case!(
+        not_iframe_kind,
+        "--frame #text: element is not an iframe",
+        "not_iframe"
+    );
+    // src/api/selectors.rs: selector_exception and js_query's missing-root error.
+    error_kind_case!(shadow_root_kind, "shadow root: #closed >>> button: element at segment 1 has no open shadow root (absent or closed; cannot pierce)", "shadow_root");
+    // src/protocol/errors.rs: ProtocolError::navigation_became_download.
+    error_kind_case!(
+        navigation_kind,
+        "navigation diverted into download flow (url https://example.com/fixture.pdf)",
+        "navigation"
+    );
+    // src/cli/instance.rs: InstanceManager::missing.
+    error_kind_case!(
+        instance_not_found_kind,
+        "instance 00000001 not found",
+        "instance_not_found"
+    );
+    // src/cli/instance.rs: page_any.
+    error_kind_case!(page_not_found_kind, "page p1 not found", "page_not_found");
+    // src/cli/instance.rs: InstanceManager::launch_with.
+    error_kind_case!(
+        invalid_argument_kind,
+        "--downloads-dir must be an absolute path",
+        "invalid_argument"
+    );
+    // src/cli/instance.rs: write_screenshot, OpenOptions::open failure.
+    error_kind_case!(
+        io_kind,
+        "failed to open screenshot: Permission denied (os error 13)",
+        "io"
+    );
+    // src/cli/daemon.rs: dispatch_guarded.
+    error_kind_case!(daemon_kind, "daemon shutting down", "daemon");
+    // src/cli/instance.rs: data, unexpected metadata branch.
+    error_kind_case!(other_kind, "unexpected metadata shape", "other");
+
+    #[test]
+    fn unknown_error_preserves_message_bytes_and_field_order() {
+        let message = "unknown: é\n\t\0  ";
+        let response = DaemonResponse::err(message);
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"ok":false,"error":"unknown: é\n\t\u0000  ","kind":"other"}"#
+        );
+        let decoded: DaemonResponse = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(decoded.error.unwrap().as_bytes(), message.as_bytes());
+    }
+
+    #[test]
+    fn success_responses_omit_kind() {
+        assert_eq!(
+            serde_json::to_string(&DaemonResponse::ok_empty()).unwrap(),
+            r#"{"ok":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&DaemonResponse::ok(json!({"value": 1}))).unwrap(),
+            r#"{"ok":true,"data":{"value":1}}"#
+        );
+    }
+
+    #[test]
+    fn legacy_error_without_kind_still_deserializes() {
+        let response: DaemonResponse =
+            serde_json::from_str(r#"{"ok":false,"error":"legacy error"}"#).unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.error.as_deref(), Some("legacy error"));
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"ok":false,"error":"legacy error"}"#
+        );
+    }
 
     #[test]
     fn evaluate_main_world_round_trip_and_legacy_default() {

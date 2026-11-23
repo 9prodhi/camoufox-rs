@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Machine-readable category of a daemon error, independent of its message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// No element matches the requested selector.
     SelectorNotFound,
@@ -26,6 +27,8 @@ pub enum ErrorKind {
     InstanceNotFound,
     /// The requested page does not exist.
     PageNotFound,
+    /// The requested page was closed or crashed.
+    PageClosed,
     /// An argument is invalid.
     InvalidArgument,
     /// A filesystem or I/O operation failed.
@@ -50,6 +53,7 @@ impl ErrorKind {
             Self::Navigation => "navigation",
             Self::InstanceNotFound => "instance_not_found",
             Self::PageNotFound => "page_not_found",
+            Self::PageClosed => "page_closed",
             Self::InvalidArgument => "invalid_argument",
             Self::Io => "io",
             Self::Daemon => "daemon",
@@ -108,6 +112,7 @@ impl ErrorKind {
             || message == "daemon is already running"
             || message == "daemon is not running (start with: camoufox serve)"
             || message == "daemon closed connection without responding"
+            || message == "daemon does not support --profile-dir; restart it: camoufox shutdown && camoufox serve"
             || [
                 "socket parent directory does not exist: ",
                 "failed to connect to daemon: ",
@@ -177,6 +182,9 @@ impl ErrorKind {
             .is_some_and(|id| !id.is_empty() && !id.chars().any(char::is_whitespace))
         {
             return Self::InstanceNotFound;
+        }
+        if matches!(page_detail, Some("was closed" | "crashed")) {
+            return Self::PageClosed;
         }
         if page_detail == Some("not found") {
             return Self::PageNotFound;
@@ -331,6 +339,29 @@ mod tests {
         "timed out waiting for daemon after 30s (the daemon may still complete the request)",
         Daemon
     );
+
+    #[test]
+    fn closed_and_crashed_pages_have_a_distinct_kind() {
+        for message in [
+            "page p1 was closed",
+            "page p2 crashed",
+            "evaluate failed: page p1 was closed",
+            "--frame #inner: page p2 crashed",
+        ] {
+            assert_eq!(
+                ErrorKind::classify(message).as_str(),
+                "page_closed",
+                "{message}"
+            );
+        }
+        for message in [
+            "page  was closed",
+            "page p1 crashed unexpectedly",
+            "page script error: page p1 was closed",
+        ] {
+            assert_eq!(ErrorKind::classify(message), ErrorKind::Other, "{message}");
+        }
+    }
 
     #[test]
     fn wrapped_causes_and_precedence() {
@@ -510,6 +541,7 @@ mod tests {
             (ErrorKind::Navigation, "navigation"),
             (ErrorKind::InstanceNotFound, "instance_not_found"),
             (ErrorKind::PageNotFound, "page_not_found"),
+            (ErrorKind::PageClosed, "page_closed"),
             (ErrorKind::InvalidArgument, "invalid_argument"),
             (ErrorKind::Io, "io"),
             (ErrorKind::Daemon, "daemon"),

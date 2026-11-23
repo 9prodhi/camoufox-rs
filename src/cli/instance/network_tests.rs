@@ -143,7 +143,6 @@ impl Harness {
             version: None,
             profile_dir: ProfileDir::Temp(tempfile::tempdir().unwrap()),
             profile_reservation: None,
-            profile_dir_path: None,
             pages: HashMap::from([(
                 "p".into(),
                 ManagedMainFrame {
@@ -358,6 +357,70 @@ fn record_unreadable_bodies_are_skipped_and_index_is_published() {
     let (index, _) = crate::cli::cassette::load(&dir).unwrap();
     assert_eq!(index.exchanges.len(), 1);
     assert_eq!(index.exchanges[0].url, "https://example.com/good");
+}
+
+#[test]
+fn record_body_read_failure_is_skipped_without_losing_later_exchanges() {
+    let harness = Harness::new(|method, params| match method {
+        "Network.getResponseBody" if params["requestId"] == "r1" => Err("no resource".into()),
+        // Base64 for "hello".
+        "Network.getResponseBody" => Ok(json!({"base64body": "aGVsbG8=", "evicted": false})),
+        _ => Ok(json!({})),
+    });
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("cassette");
+    let manager = &harness.manager;
+    manager.record_start("mock", "p", &dir, &[]).unwrap();
+    harness.exchange("r1");
+    harness.exchange("r2");
+    harness.wait_for("Network.getResponseBody", 2);
+    let result = manager.record_stop("mock", "p").unwrap();
+    assert_eq!(result["exchanges"], 1);
+    assert_eq!(
+        result["skipped"],
+        json!([{
+            "method": "GET",
+            "url": "https://example.com/r1",
+            "reason": "reading response body (status 200): no resource"
+        }])
+    );
+    assert!(dir
+        .join("bodies")
+        .join(crate::cli::cassette::sha256(b"hello"))
+        .is_file());
+    let (index, _) = crate::cli::cassette::load(&dir).unwrap();
+    assert_eq!(index.exchanges.len(), 1);
+    assert_eq!(index.exchanges[0].url, "https://example.com/r2");
+    let mut repeated = result;
+    repeated["repeated"] = json!(true);
+    assert_eq!(manager.record_stop("mock", "p").unwrap(), repeated);
+}
+
+#[test]
+fn record_evicted_body_is_skipped_without_storing_body() {
+    let harness = Harness::new(|method, _| match method {
+        "Network.getResponseBody" => Ok(json!({"base64body": "", "evicted": true})),
+        _ => Ok(json!({})),
+    });
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("cassette");
+    let manager = &harness.manager;
+    manager.record_start("mock", "p", &dir, &[]).unwrap();
+    harness.exchange("r1");
+    harness.wait_for("Network.getResponseBody", 1);
+    let result = manager.record_stop("mock", "p").unwrap();
+    assert_eq!(result["exchanges"], 0);
+    assert_eq!(
+        result["skipped"],
+        json!([{
+            "method": "GET",
+            "url": "https://example.com/r1",
+            "reason": "response body was evicted during recording"
+        }])
+    );
+    assert_eq!(std::fs::read_dir(dir.join("bodies")).unwrap().count(), 0);
+    let (index, _) = crate::cli::cassette::load(&dir).unwrap();
+    assert!(index.exchanges.is_empty());
 }
 
 #[test]

@@ -31,20 +31,8 @@ For more information, try '--help'.
 #[test]
 fn external_dispatch_runs_script_with_args_env_and_exit_code() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
-    let script_path = temp_dir.path().join("camoufox-hello");
 
-    let script_content = "#!/bin/sh\n\
-        echo \"args: $@\"\n\
-        echo \"socket: $CAMOUFOX_SOCKET\"\n\
-        exit 7\n";
-    fs::write(&script_path, script_content).expect("write script");
-
-    #[cfg(unix)]
-    {
-        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).expect("set permissions");
-    }
+    write_script(temp_dir.path(), "camoufox-hello", "#!/bin/sh\necho \"args: $@\"\necho \"socket: $CAMOUFOX_SOCKET\"\necho \"json: $CAMOUFOX_JSON\"\nexit 7\n", 0o755);
 
     let original_path = std::env::var_os("PATH").unwrap_or_default();
     let mut new_path = temp_dir.path().as_os_str().to_os_string();
@@ -53,6 +41,10 @@ fn external_dispatch_runs_script_with_args_env_and_exit_code() {
 
     let output = Command::new(camoufox_bin())
         .env("PATH", &new_path)
+        .env("XDG_RUNTIME_DIR", temp_dir.path())
+        .env_remove("CAMOUFOX_SOCKET")
+        .env_remove("CAMOUFOX_JSON")
+        .arg("--json")
         .arg("hello")
         .arg("foo")
         .arg("bar")
@@ -67,28 +59,24 @@ fn external_dispatch_runs_script_with_args_env_and_exit_code() {
         stdout.contains("args: foo bar --flag baz"),
         "stdout must contain passed arguments, got:\n{stdout}"
     );
-    assert!(
-        stdout.contains("socket: "),
-        "stdout must contain CAMOUFOX_SOCKET, got:\n{stdout}"
+    assert_eq!(
+        stdout,
+        format!(
+            "args: foo bar --flag baz\nsocket: {}/camoufox/daemon.sock\njson: 1\n",
+            temp_dir.path().display()
+        )
     );
 }
 
 #[test]
 fn external_dispatch_respects_custom_socket_flag() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
-    let script_path = temp_dir.path().join("camoufox-hello");
-
-    let script_content = "#!/bin/sh\n\
-        echo \"socket: $CAMOUFOX_SOCKET\"\n\
-        exit 7\n";
-    fs::write(&script_path, script_content).expect("write script");
-
-    #[cfg(unix)]
-    {
-        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).expect("set permissions");
-    }
+    write_script(
+        temp_dir.path(),
+        "camoufox-hello",
+        "#!/bin/sh\necho \"socket: $CAMOUFOX_SOCKET\"\nexit 7\n",
+        0o755,
+    );
 
     let original_path = std::env::var_os("PATH").unwrap_or_default();
     let mut new_path = temp_dir.path().as_os_str().to_os_string();
@@ -98,6 +86,7 @@ fn external_dispatch_respects_custom_socket_flag() {
     let custom_socket = "/tmp/test-camoufox-custom.sock";
     let output = Command::new(camoufox_bin())
         .env("PATH", &new_path)
+        .env("CAMOUFOX_SOCKET", "/unused/environment.sock")
         .arg("--socket")
         .arg(custom_socket)
         .arg("hello")
@@ -147,36 +136,43 @@ fn external_dispatch_near_miss_preserves_clap_suggestions() {
 
 #[test]
 fn external_dispatch_path_separator_rejected_as_unrecognized() {
-    let output = Command::new(camoufox_bin())
-        .arg("some/path")
-        .output()
-        .expect("run camoufox");
-
-    assert_eq!(output.status.code(), Some(2), "exit code must be 2");
-    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
-    assert_eq!(
-        stderr, PINNED_PATH_SEPARATOR_STDERR,
-        "stderr must be byte-identical to pinned clap error"
-    );
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("executed");
+    for name in ["some/path", "../cmd"] {
+        let script = format!("camoufox-{name}");
+        fs::create_dir_all(temp.path().join(&script).parent().unwrap()).unwrap();
+        write_script(temp.path(), &script,
+            "#!/bin/sh\necho SEPARATOR_EXECUTED\nprintf ran > \"$CAMOUFOX_DISPATCH_MARKER\"\nexit 42\n", 0o755);
+        let output = Command::new(camoufox_bin())
+            .env("PATH", temp.path())
+            .env("CAMOUFOX_DISPATCH_MARKER", &marker)
+            .arg(name)
+            .output()
+            .expect("run camoufox");
+        assert_eq!(output.status.code(), Some(2), "exit code must be 2");
+        assert!(
+            output.stdout.is_empty(),
+            "separator executable must not run"
+        );
+        assert!(
+            !marker.exists(),
+            "separator executable must not create its marker"
+        );
+        let expected = PINNED_PATH_SEPARATOR_STDERR.replace("some/path", name);
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), expected);
+    }
 }
 
 #[test]
 fn external_dispatch_builtin_names_unaffected() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     // Place a shadowing binary on PATH with the same name as a built-in command.
-    let script_path = temp_dir.path().join("camoufox-list");
-
-    let script_content = "#!/bin/sh\n\
-        echo \"SHADOWED_EXTERNAL_CALLED\"\n\
-        exit 42\n";
-    fs::write(&script_path, script_content).expect("write script");
-
-    #[cfg(unix)]
-    {
-        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).expect("set permissions");
-    }
+    write_script(
+        temp_dir.path(),
+        "camoufox-list",
+        "#!/bin/sh\necho SHADOWED_EXTERNAL_CALLED\nexit 42\n",
+        0o755,
+    );
 
     let original_path = std::env::var_os("PATH").unwrap_or_default();
     let mut new_path = temp_dir.path().as_os_str().to_os_string();
@@ -289,7 +285,7 @@ fn external_dispatch_skips_non_executable_entries_and_missing_path() {
     }
 }
 
-/// Replaces the former in-process unit test that mutated PATH globally.
+/// PATH order selects the first executable, including executable symlink targets.
 #[cfg(unix)]
 #[test]
 fn external_dispatch_first_executable_on_path_wins_and_symlinks_resolve() {
@@ -397,5 +393,98 @@ fn external_dispatch_inherits_stdin_and_passes_args_verbatim() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "[a b][][--json][--socket][x]\nfrom stdin\n"
+    );
+}
+
+#[test]
+fn external_dispatch_resolves_relative_socket_against_client_cwd() {
+    let temp = tempfile::tempdir().unwrap();
+    write_script(
+        temp.path(),
+        "camoufox-tool",
+        "#!/bin/sh\nprintf '%s' \"$CAMOUFOX_SOCKET\"\n",
+        0o755,
+    );
+    let output = Command::new(camoufox_bin())
+        .current_dir(temp.path())
+        .env("PATH", temp.path())
+        .args(["--socket", "relative.sock", "tool"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.stdout,
+        temp.path()
+            .join("relative.sock")
+            .as_os_str()
+            .as_encoded_bytes()
+    );
+}
+
+#[test]
+fn external_dispatch_skips_relative_and_empty_path_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let absolute = temp.path().join("absolute");
+    let relative = temp.path().join("relative");
+    fs::create_dir(&absolute).unwrap();
+    fs::create_dir(&relative).unwrap();
+    write_script(
+        temp.path(),
+        "camoufox-tool",
+        "#!/bin/sh\necho unsafe-current\n",
+        0o755,
+    );
+    write_script(
+        &relative,
+        "camoufox-tool",
+        "#!/bin/sh\necho unsafe-relative\n",
+        0o755,
+    );
+    write_script(
+        &absolute,
+        "camoufox-tool",
+        "#!/bin/sh\necho absolute\n",
+        0o755,
+    );
+    for prefix in ["", ".", "relative"] {
+        let path = std::env::join_paths([std::path::Path::new(prefix), &absolute]).unwrap();
+        let output = Command::new(camoufox_bin())
+            .current_dir(temp.path())
+            .env("PATH", path)
+            .arg("tool")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, b"absolute\n");
+    }
+}
+
+#[test]
+fn external_dispatch_preserves_non_utf8_socket_path() {
+    use std::os::unix::ffi::OsStringExt;
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(b"runtime-\xff".to_vec()));
+    write_script(
+        temp.path(),
+        "camoufox-tool",
+        "#!/bin/sh\nprintf '%s' \"$CAMOUFOX_SOCKET\"\n",
+        0o755,
+    );
+    let output = Command::new(camoufox_bin())
+        .env("PATH", temp.path())
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("CAMOUFOX_SOCKET")
+        .arg("tool")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.stdout,
+        runtime
+            .join("camoufox/daemon.sock")
+            .as_os_str()
+            .as_encoded_bytes()
     );
 }

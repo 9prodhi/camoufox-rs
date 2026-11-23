@@ -37,7 +37,7 @@ pub struct Cli {
     pub json: bool,
 
     /// Path to the daemon Unix socket.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "CAMOUFOX_SOCKET")]
     pub socket: Option<String>,
 
     #[command(subcommand)]
@@ -80,9 +80,7 @@ pub enum Command {
         /// JavaScript dialog handling policy.
         #[arg(long, value_enum, default_value = "manual")]
         dialogs: DialogMode,
-        /// Persistent profile directory (must be absolute path).
-        /// Created with mode 0700 if it does not exist.
-        /// Omit to use an isolated temporary directory (deleted when the instance stops).
+        /// Absolute path; created or tightened to 0700, canonicalized, must be empty or an existing profile, never deleted on stop.
         #[arg(long)]
         profile_dir: Option<PathBuf>,
     },
@@ -537,7 +535,8 @@ pub enum Command {
     /// Built-in subcommand names always win. When `<name>` is not a built-in,
     /// the binary `camoufox-<name>` is looked up on `PATH` and executed with the
     /// remaining arguments, inheriting stdio, the current environment, and
-    /// `CAMOUFOX_SOCKET` set to the resolved daemon socket path.
+    /// `CAMOUFOX_SOCKET` set to the absolute daemon socket path, and
+    /// `CAMOUFOX_JSON=1` when the global `--json` flag is given.
     /// Exit code mirrors the child (signal → 128+n on Unix).
     ///
     /// Names containing path separators are treated as not found.
@@ -549,7 +548,8 @@ pub enum Command {
 ///
 /// Returns `Some(path)` if `camoufox-<name>` is found on `PATH` and is an
 /// executable file. Returns `None` if `name` is empty, contains path
-/// separators, or is not found on `PATH`.
+/// separators, or is not found on `PATH`. Relative and empty `PATH` entries
+/// are skipped.
 pub fn find_external_subcommand(name: &str) -> Option<PathBuf> {
     if name.is_empty() || name.contains(std::path::is_separator) {
         return None;
@@ -558,6 +558,9 @@ pub fn find_external_subcommand(name: &str) -> Option<PathBuf> {
     let bin_name = format!("camoufox-{name}");
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
+        if !dir.is_absolute() {
+            continue;
+        }
         let candidate = dir.join(&bin_name);
         #[cfg(unix)]
         {
@@ -584,14 +587,43 @@ mod tests {
 
     #[test]
     fn find_external_subcommand_rejects_empty_and_separators() {
-        assert!(find_external_subcommand("").is_none());
-        assert!(find_external_subcommand("foo/bar").is_none());
-        assert!(find_external_subcommand("../cmd").is_none());
+        use std::os::unix::fs::PermissionsExt;
+        // Isolate PATH in a child test process so parallel tests keep their
+        // environment. Both separator names lead to real executables if the
+        // lookup guard is removed.
+        const FIXTURE: &str = "CAMOUFOX_SEPARATOR_FIXTURE";
+        if let Some(dir) = std::env::var_os(FIXTURE) {
+            let dir = PathBuf::from(dir);
+            for name in ["foo/bar", "../cmd"] {
+                let candidate = dir.join(format!("camoufox-{name}"));
+                assert!(candidate.is_file(), "{}", candidate.display());
+                assert!(find_external_subcommand(name).is_none(), "{name}");
+            }
+            assert!(find_external_subcommand("").is_none());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["camoufox-foo/bar", "camoufox-../cmd"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\necho SEPARATOR_EXECUTED\nexit 42\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("PATH", dir.path())
+            .env(FIXTURE, dir.path())
+            .args([
+                "--exact",
+                "cli::commands::tests::find_external_subcommand_rejects_empty_and_separators",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
-
-    // Lookup of a binary on PATH is covered by subprocess tests in
-    // tests/dispatch.rs, which set PATH per child instead of mutating this
-    // process's environment while other tests run in parallel.
 }
 
 #[cfg(test)]

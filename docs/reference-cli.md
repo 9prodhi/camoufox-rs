@@ -10,8 +10,8 @@ The `camoufox` CLI communicates with a background daemon over a Unix domain sock
 
 The following flags are available across all subcommands:
 
-- `--socket <SOCKET>`: Path to the daemon Unix socket.
-  - If omitted, defaults to `$XDG_RUNTIME_DIR/camoufox/daemon.sock` when `XDG_RUNTIME_DIR` is set.
+- `--socket <SOCKET>`: Path to the daemon Unix socket (defaults to `CAMOUFOX_SOCKET` when set).
+  - If neither the flag nor `CAMOUFOX_SOCKET` is set, defaults to `$XDG_RUNTIME_DIR/camoufox/daemon.sock` when `XDG_RUNTIME_DIR` is set.
   - Otherwise, defaults to `/tmp/camoufox-<uid>/daemon.sock`.
   - For the default path, the runtime directory must be a real directory owned by the current UID with no group or other permissions (`mode & 0o077 == 0`). Symlinks and non-owner access are rejected.
   - If an explicit `--socket <SOCKET>` path is passed, this directory policy is skipped and only an existing parent directory is required.
@@ -45,7 +45,13 @@ Every daemon error includes a stable, machine-readable `kind` after `error`,
 with no `data` field. Branch on `kind` instead of parsing the human-readable
 `error` message. Messages are preserved verbatim; plain mode still prints
 `error: <message>` on stderr. Successful responses omit `kind`. Clients can
-also read responses from older daemons that omit `kind`.
+also read responses from older daemons that omit `kind`; the CLI classifies their
+error messages to backfill it. Clients must treat unknown kinds as `other`.
+
+The Rust types `ErrorKind`, `DaemonRequest`, `DaemonResponse`, and `LaunchOptions`
+are `#[non_exhaustive]`. Include a wildcard when matching enums, create responses
+with their constructors, and build launch options with `Default` plus field
+assignment.
 
 | Kind | Meaning |
 |---|---|
@@ -59,6 +65,7 @@ also read responses from older daemons that omit `kind`.
 | `navigation` | Navigation failed or was diverted into a download. |
 | `instance_not_found` | The requested browser instance does not exist. |
 | `page_not_found` | The requested page does not exist. |
+| `page_closed` | The requested page was closed or crashed. |
 | `invalid_argument` | An argument is invalid. |
 | `io` | A filesystem or I/O operation failed. |
 | `daemon` | The daemon rejected the request or is shutting down. |
@@ -143,7 +150,7 @@ Usage: camoufox launch [OPTIONS]
 - `--downloads-dir <DOWNLOADS_DIR>`: Directory to save downloads to (must be absolute; defaults to cancel).
 - `--bypass-csp`: Disable page Content-Security-Policy (needed for `--main-world` on strict-CSP sites; detectable by pages).
 - `--dialogs <DIALOGS>`: JavaScript dialog handling policy (`manual`, `accept`, `dismiss`) [default: `manual`].
-- `--profile-dir <PROFILE_DIR>`: Persistent profile directory (must be absolute path). Created with mode 0700 if missing; an existing directory with looser permissions is tightened to 0700 on Unix. Persistent profiles use the browser's default context: cookies, localStorage, IndexedDB, and other profile data survive relaunch. Stop or shutdown gracefully flushes storage before returning. A profile is reserved during launch and remains in use until the browser exits; concurrent launches on the same canonical directory are refused. Persistent profiles are never deleted on stop or shutdown. Without this flag, launches use a fresh temporary profile and private context.
+- `--profile-dir <PROFILE_DIR>`: Absolute path; created or tightened to 0700, canonicalized, must be empty or an existing profile, never deleted on stop. An existing profile contains `prefs.js` or `times.json`. Tightening clears only group/other read, write, and execute permissions, preserving special permission bits. Persistent profiles use the browser's default context: cookies, localStorage, IndexedDB, and other profile data survive relaunch. Stop or shutdown gracefully flushes storage before returning. A profile is reserved during launch and remains in use until the browser exits; concurrent launches on the same canonical directory are refused. Persistent profiles are never deleted on stop or shutdown. Without this flag, launches use a fresh temporary profile and private context.
 - `--socket <SOCKET>`: Path to the daemon Unix socket.
 - `--json`: Output as JSON.
 
@@ -155,6 +162,12 @@ JSON output shape:
   "pid": 12345
 }
 ```
+
+For a persistent launch, the success data also contains `"profile_dir"` with the
+canonical directory path. If an older daemon omits that confirmation after
+`--profile-dir`, the client exits 1 with kind `daemon` and error
+`daemon does not support --profile-dir; restart it: camoufox shutdown && camoufox serve`.
+Restart the daemon before retrying the persistent launch.
 
 ### `dialog`
 
@@ -1115,8 +1128,12 @@ camoufox custom-tool --flag arg
 ```
 
 If found, `camoufox` executes the binary with the remaining arguments, inheriting standard input/output/error, passing the current environment, and setting:
-- `CAMOUFOX_SOCKET`: The resolved filesystem path to the daemon Unix socket (respecting global `--socket`).
+
+- `CAMOUFOX_SOCKET`: The absolute daemon socket path (respecting global `--socket` and its environment default). Relative socket paths resolve against the client's working directory; filesystem path bytes are preserved.
+- `CAMOUFOX_JSON=1`: Set when the global `--json` flag is given. Place global options before the external subcommand name; arguments after the name pass through to the executable.
 
 The exit code mirrors the child process exit code (or `128 + signal` if terminated by a signal on Unix).
+
+Only absolute `PATH` entries are searched; relative and empty entries are skipped.
 
 Built-in command names always win over external binaries. Subcommand names containing path separators (such as `/`) are rejected as unrecognized subcommands. If no matching executable is found on `PATH`, `camoufox` exits with status 2 and clap's standard unrecognized subcommand error.

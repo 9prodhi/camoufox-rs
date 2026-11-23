@@ -1238,13 +1238,12 @@ fn downloads_dir_saves_file_at_uuid_path() {
     let downloads_dir = dir.path().to_path_buf();
 
     let manager = InstanceManager::new();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.downloads_dir = Some(downloads_dir.clone());
     let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            downloads_dir: Some(downloads_dir.clone()),
-            ..Default::default()
-        })
+        .launch_with(&launch_options)
         .expect("launch_with failed");
 
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
@@ -1311,13 +1310,12 @@ fn navigate_download_with_dir_still_returns_navigation_became_download_and_logs(
     let downloads_dir = dir.path().to_path_buf();
 
     let manager = InstanceManager::new();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.downloads_dir = Some(downloads_dir);
     let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            downloads_dir: Some(downloads_dir),
-            ..Default::default()
-        })
+        .launch_with(&launch_options)
         .expect("launch_with failed");
 
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
@@ -1422,14 +1420,12 @@ fn main_world_strict_csp_reports_bypass_hint() {
 
     let csp = CspServer::start();
     let manager = InstanceManager::new();
-    let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            bypass_csp: false,
-            ..Default::default()
-        })
-        .expect("launch failed");
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.bypass_csp = false;
+    let (instance_id, _version, _pid) =
+        manager.launch_with(&launch_options).expect("launch failed");
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
     let timeout = Duration::from_secs(30);
 
@@ -1471,14 +1467,12 @@ fn main_world_strict_csp_works_with_bypass_csp() {
 
     let csp = CspServer::start();
     let manager = InstanceManager::new();
-    let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            bypass_csp: true,
-            ..Default::default()
-        })
-        .expect("launch failed");
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.bypass_csp = true;
+    let (instance_id, _version, _pid) =
+        manager.launch_with(&launch_options).expect("launch failed");
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
     let timeout = Duration::from_secs(30);
 
@@ -1514,14 +1508,12 @@ fn main_world_unsafe_inline_works_without_flag() {
 
     let csp = CspServer::start();
     let manager = InstanceManager::new();
-    let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            bypass_csp: false,
-            ..Default::default()
-        })
-        .expect("launch failed");
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.bypass_csp = false;
+    let (instance_id, _version, _pid) =
+        manager.launch_with(&launch_options).expect("launch failed");
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
     let timeout = Duration::from_secs(30);
 
@@ -1557,14 +1549,12 @@ fn main_world_nonce_csp_feasibility() {
 
     let csp = CspServer::start();
     let manager = InstanceManager::new();
-    let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            bypass_csp: false,
-            ..Default::default()
-        })
-        .expect("launch failed");
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.bypass_csp = false;
+    let (instance_id, _version, _pid) =
+        manager.launch_with(&launch_options).expect("launch failed");
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
     let timeout = Duration::from_secs(30);
 
@@ -1602,14 +1592,12 @@ fn main_world_page_global_named_val_is_readable() {
 
     let csp = CspServer::start();
     let manager = InstanceManager::new();
-    let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            bypass_csp: false,
-            ..Default::default()
-        })
-        .expect("launch failed");
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.bypass_csp = false;
+    let (instance_id, _version, _pid) =
+        manager.launch_with(&launch_options).expect("launch failed");
     let page_id = manager.new_page(&instance_id).expect("new_page failed");
     let timeout = Duration::from_secs(30);
 
@@ -1724,14 +1712,11 @@ fn accept_policy_auto_handles() {
     use camoufox::cli::instance::{InstanceManager, LaunchOptions};
     let server = fixtures::DialogServer::start();
     let manager = InstanceManager::new();
-    let (instance, _, _) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            dialogs: DialogPolicy::Accept,
-            ..Default::default()
-        })
-        .unwrap();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.dialogs = DialogPolicy::Accept;
+    let (instance, _, _) = manager.launch_with(&launch_options).unwrap();
     let page = manager.new_page(&instance).unwrap();
     let timeout = Duration::from_secs(10);
     manager
@@ -4894,13 +4879,12 @@ fn launch_profile_dir_persists_after_stop() {
     let profile_path = profile_temp.path().canonicalize().expect("canonicalize");
 
     let manager = InstanceManager::new();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.profile_dir = Some(profile_path.to_string_lossy().into_owned());
     let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            profile_dir: Some(profile_path.to_string_lossy().into_owned()),
-            ..Default::default()
-        })
+        .launch_with(&launch_options)
         .expect("launch_with persistent profile failed");
 
     // Check list output shows profile_dir
@@ -4932,24 +4916,20 @@ fn launch_profile_dir_refuses_second_instance_on_same_dir() {
     let profile_path = profile_temp.path().canonicalize().expect("canonicalize");
 
     let manager = InstanceManager::new();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.profile_dir = Some(profile_path.to_string_lossy().into_owned());
     let (instance_id, _version, _pid) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            profile_dir: Some(profile_path.to_string_lossy().into_owned()),
-            ..Default::default()
-        })
+        .launch_with(&launch_options)
         .expect("first launch failed");
 
     // Second launch with same canonical path should be refused
-    let err = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            profile_dir: Some(profile_path.to_string_lossy().into_owned()),
-            ..Default::default()
-        })
-        .unwrap_err();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.profile_dir = Some(profile_path.to_string_lossy().into_owned());
+    let err = manager.launch_with(&launch_options).unwrap_err();
 
     assert_eq!(
         err,
@@ -4966,14 +4946,11 @@ fn launch_profile_dir_refuses_relative_path() {
     use camoufox::cli::instance::{InstanceManager, LaunchOptions};
 
     let manager = InstanceManager::new();
-    let err = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            profile_dir: Some("relative/profile/path".to_string()),
-            ..Default::default()
-        })
-        .unwrap_err();
+    let mut options = LaunchOptions::default();
+    options.headless = Some(true);
+    options.executable = Some(camoufox_bin());
+    options.profile_dir = Some("relative/profile/path".to_string());
+    let err = manager.launch_with(&options).unwrap_err();
 
     assert_eq!(
         err,
@@ -4991,22 +4968,20 @@ fn launch_profile_dir_list_shows_only_for_persistent() {
     let profile_path = profile_temp.path().canonicalize().expect("canonicalize");
 
     let manager = InstanceManager::new();
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.profile_dir = Some(profile_path.to_string_lossy().into_owned());
     let (inst1, _, _) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            profile_dir: Some(profile_path.to_string_lossy().into_owned()),
-            ..Default::default()
-        })
+        .launch_with(&launch_options)
         .expect("inst1 launch failed");
 
+    let mut launch_options = LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.executable = Some(camoufox_bin());
+    launch_options.profile_dir = None;
     let (inst2, _, _) = manager
-        .launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            profile_dir: None,
-            ..Default::default()
-        })
+        .launch_with(&launch_options)
         .expect("inst2 launch failed");
 
     let list = manager.list();
@@ -5035,12 +5010,11 @@ fn launch_profile_dir_aliases_collide_and_release_on_stop() {
     let profile = temp.path().join("profile");
     let link = temp.path().join("profile-link");
     let launch = |manager: &InstanceManager, dir: &std::path::Path| {
-        manager.launch_with(&LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            profile_dir: Some(dir.to_string_lossy().into_owned()),
-            ..Default::default()
-        })
+        let mut launch_options = LaunchOptions::default();
+        launch_options.headless = Some(true);
+        launch_options.executable = Some(camoufox_bin());
+        launch_options.profile_dir = Some(dir.to_string_lossy().into_owned());
+        manager.launch_with(&launch_options)
     };
 
     let manager = InstanceManager::new();
@@ -5110,12 +5084,10 @@ fn launch_profile_dir_persists_cookie_and_local_storage_across_relaunch() {
     for (persistent, shutdown) in [(false, false), (true, false), (false, true), (true, true)] {
         let profile = tempfile::tempdir().unwrap();
         let manager = InstanceManager::new();
-        let options = LaunchOptions {
-            headless: Some(true),
-            executable: Some(camoufox_bin()),
-            profile_dir: persistent.then(|| profile.path().display().to_string()),
-            ..Default::default()
-        };
+        let mut options = LaunchOptions::default();
+        options.headless = Some(true);
+        options.executable = Some(camoufox_bin());
+        options.profile_dir = persistent.then(|| profile.path().display().to_string());
         let (first, _, _) = manager.launch_with(&options).unwrap();
         let page = manager.new_page(&first).unwrap();
         manager
@@ -5183,12 +5155,10 @@ fn launch_profile_dir_reserves_before_browser_ready_and_releases_failed_spawn() 
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let manager = Arc::new(InstanceManager::new());
-    let options = LaunchOptions {
-        headless: Some(true),
-        executable: Some(wrapper.display().to_string()),
-        profile_dir: Some(profile.display().to_string()),
-        ..Default::default()
-    };
+    let mut options = LaunchOptions::default();
+    options.headless = Some(true);
+    options.executable = Some(wrapper.display().to_string());
+    options.profile_dir = Some(profile.display().to_string());
     let first = std::thread::spawn({
         let manager = Arc::clone(&manager);
         let options = options.clone();
@@ -5200,10 +5170,9 @@ fn launch_profile_dir_reserves_before_browser_ready_and_releases_failed_spawn() 
     }
     let started = marker.exists();
     let second = if started {
-        manager.launch_with(&LaunchOptions {
-            executable: Some(camoufox_bin()),
-            ..options.clone()
-        })
+        let mut launch_options = options.clone();
+        launch_options.executable = Some(camoufox_bin());
+        manager.launch_with(&launch_options)
     } else {
         Err("first child did not start".into())
     };
@@ -5224,22 +5193,18 @@ fn launch_profile_dir_reserves_before_browser_ready_and_releases_failed_spawn() 
         dir.path().join("missing-browser"),
         PathBuf::from("/bin/false"),
     ] {
-        let error = manager
-            .launch_with(&LaunchOptions {
-                executable: Some(executable.display().to_string()),
-                ..options.clone()
-            })
-            .unwrap_err();
+        let mut launch_options = options.clone();
+        launch_options.executable = Some(executable.display().to_string());
+        let error = manager.launch_with(&launch_options).unwrap_err();
         assert!(
             error.starts_with("failed to spawn browser:")
                 || error.starts_with("browser did not become ready:"),
             "{error}"
         );
+        let mut launch_options = options.clone();
+        launch_options.executable = Some(camoufox_bin());
         let (id, _, _) = manager
-            .launch_with(&LaunchOptions {
-                executable: Some(camoufox_bin()),
-                ..options.clone()
-            })
+            .launch_with(&launch_options)
             .expect("failed startup must release the profile reservation");
         manager.stop(&id).unwrap();
     }

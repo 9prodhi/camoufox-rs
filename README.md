@@ -82,6 +82,12 @@ Launch an instance:
 cargo run --features cli --bin camoufox -- launch
 ```
 
+For persistent browsing data, add `--profile-dir /absolute/path/to/profile` to
+`launch`. The directory must be empty or contain `prefs.js` or `times.json`.
+It is created or made private, canonicalized, and kept after stop. The daemon
+confirms the canonical path in launch success data; restart older daemons that
+cannot confirm persistent profile support.
+
 Create a page:
 
 ```bash
@@ -311,6 +317,7 @@ cargo run --features cli --bin camoufox -- --json list
 Socket resolution:
 
 - `--socket <path>` to override
+- else `CAMOUFOX_SOCKET` when set
 - else `$XDG_RUNTIME_DIR/camoufox/daemon.sock`
 - else `/tmp/camoufox-<uid>/daemon.sock`
 

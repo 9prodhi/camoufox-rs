@@ -375,7 +375,19 @@ pub struct ManagedMainFrame {
 /// New launch flags add a field here (and on `DaemonRequest::Launch`), so
 /// `launch_with`'s signature never changes. Flags that configure the browser
 /// context are mapped in `LaunchOptions::context_options`.
+/// Start with `Default` and assign fields to allow for future launch options:
+/// ```
+/// use camoufox::cli::instance::LaunchOptions;
+/// let mut options = LaunchOptions::default();
+/// options.headless = Some(true);
+/// ```
+/// External callers cannot construct this extensible type with a struct literal:
+/// ```compile_fail,E0639
+/// use camoufox::cli::instance::LaunchOptions;
+/// let options = LaunchOptions { ..Default::default() };
+/// ```
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct LaunchOptions {
     /// `None` means headless.
     pub headless: Option<bool>,
@@ -387,9 +399,7 @@ pub struct LaunchOptions {
     pub bypass_csp: bool,
     /// Policy for JavaScript dialogs.
     pub dialogs: DialogPolicy,
-    /// Persistent profile directory. When `Some`, the directory is used as-is
-    /// (created with mode 0700 if absent) and is never deleted on stop.
-    /// When `None`, a temporary directory is used and deleted on stop.
+    /// Absolute path; created or tightened to 0700, canonicalized, must be empty or an existing profile, never deleted on stop.
     pub profile_dir: Option<String>,
 }
 
@@ -451,79 +461,81 @@ impl ProfileDir {
     }
 }
 
-/// Prepares a persistent profile directory:
-/// - Must be an absolute path.
-/// - Created with mode 0700 if missing.
-/// - Existing directory with looser permissions is tightened to 0700 (Unix).
-/// - Returns the canonical path.
+/// Prepare an absolute persistent profile path, creating it or clearing group/other
+/// access. It must be empty or contain `prefs.js` or `times.json`. Returns the
+/// canonical path; persistent profiles are never deleted on stop.
 pub fn prepare_profile_dir(path_str: &str) -> Result<PathBuf, String> {
+    prepare_profile_dir_with_permissions(path_str, |path, permissions| {
+        std::fs::set_permissions(path, permissions)
+    })
+}
+
+fn prepare_profile_dir_with_permissions(
+    path_str: &str,
+    set_permissions: impl FnOnce(&Path, std::fs::Permissions) -> std::io::Result<()>,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
     let path = PathBuf::from(path_str);
     if !path.is_absolute() {
         return Err("invalid argument: --profile-dir must be an absolute path".to_string());
     }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if !path.exists() {
-            std::fs::create_dir_all(&path).map_err(|e| {
-                format!("failed to create profile directory {}: {e}", path.display())
-            })?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(
-                |e| {
-                    format!(
-                        "failed to set permissions on profile directory {}: {e}",
-                        path.display()
-                    )
-                },
-            )?;
-        } else {
-            let meta = std::fs::metadata(&path).map_err(|e| {
-                format!(
-                    "failed to inspect profile directory {}: {e}",
-                    path.display()
-                )
-            })?;
-            if !meta.is_dir() {
-                return Err(format!(
-                    "invalid argument: profile directory {} is not a directory",
-                    path.display()
-                ));
-            }
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(
-                    |e| {
-                        format!(
-                            "failed to set permissions on profile directory {}: {e}",
-                            path.display()
-                        )
-                    },
-                )?;
-            }
-        }
+    if !path.exists() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&path)
+            .map_err(|e| format!("failed to create profile directory {}: {e}", path.display()))?;
     }
-
-    #[cfg(not(unix))]
-    {
-        if !path.exists() {
-            std::fs::create_dir_all(&path).map_err(|e| {
-                format!("failed to create profile directory {}: {e}", path.display())
-            })?;
-        } else if !path.is_dir() {
+    let inspect_error = |e| {
+        format!(
+            "failed to inspect profile directory {}: {e}",
+            path.display()
+        )
+    };
+    let meta = std::fs::metadata(&path).map_err(inspect_error)?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "invalid argument: profile directory {} is not a directory",
+            path.display()
+        ));
+    }
+    if !path.join("prefs.js").is_file() && !path.join("times.json").is_file() {
+        let mut entries = std::fs::read_dir(&path).map_err(inspect_error)?;
+        if entries.next().transpose().map_err(inspect_error)?.is_some() {
             return Err(format!(
-                "invalid argument: profile directory {} is not a directory",
+                "invalid argument: profile directory is not empty and is not a browser profile: {}",
                 path.display()
             ));
         }
     }
-
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        set_permissions(&path, std::fs::Permissions::from_mode(mode & !0o077)).map_err(|e| {
+            format!(
+                "failed to set permissions on profile directory {}: {e}",
+                path.display()
+            )
+        })?;
+    }
     path.canonicalize().map_err(|e| {
         format!(
             "failed to canonicalize profile directory {}: {e}",
             path.display()
         )
     })
+}
+
+/// Browser launch details used to construct the daemon success response.
+pub(crate) struct LaunchedInstance {
+    /// Allocated instance identifier.
+    pub instance_id: String,
+    /// Browser version when available.
+    pub version: Option<String>,
+    /// Browser process identifier.
+    pub pid: u32,
+    /// Canonical persistent profile path; absent for temporary profiles.
+    pub profile_dir: Option<PathBuf>,
 }
 
 /// A running Camoufox browser instance managed by the daemon.
@@ -537,8 +549,6 @@ pub struct Instance {
     /// `Temp` deletes it when the handle is dropped.
     profile_dir: ProfileDir,
     profile_reservation: Option<ProfileReservation>,
-    /// Canonical path of the profile directory, used for collision detection.
-    pub profile_dir_path: Option<PathBuf>,
     pages: HashMap<String, ManagedMainFrame>,
     closed_pages: HashSet<String>,
     closed_pages_order: VecDeque<String>,
@@ -1932,10 +1942,9 @@ impl Instance {
 
     /// Returns the canonical profile directory path if persistent, else `None`.
     pub fn persistent_profile_dir(&self) -> Option<&std::path::Path> {
-        if self.profile_dir.is_persistent() {
-            self.profile_dir_path.as_deref()
-        } else {
-            None
+        match &self.profile_dir {
+            ProfileDir::Persistent(path) => Some(path),
+            ProfileDir::Temp(_) => None,
         }
     }
 }
@@ -2053,6 +2062,15 @@ impl InstanceManager {
         &self,
         options: &LaunchOptions,
     ) -> Result<(String, Option<String>, u32), String> {
+        self.launch_with_result(options)
+            .map(|result| (result.instance_id, result.version, result.pid))
+    }
+
+    /// Launch with the canonical persistent profile path included in the result.
+    pub(crate) fn launch_with_result(
+        &self,
+        options: &LaunchOptions,
+    ) -> Result<LaunchedInstance, String> {
         if self.is_closing() {
             return Err("daemon shutting down".into());
         }
@@ -2087,21 +2105,16 @@ impl InstanceManager {
         }
 
         let instance_id = format!("{:08x}", self.counter.fetch_add(1, Ordering::Relaxed) + 1);
-        let (profile_dir, profile_dir_path, profile_reservation) = match &options.profile_dir {
+        let (profile_dir, profile_reservation) = match &options.profile_dir {
             Some(dir_str) => {
                 let canonical = prepare_profile_dir(dir_str)?;
                 let reservation = ProfileReservation::reserve(&self.profiles, &canonical)?;
-                (
-                    ProfileDir::Persistent(canonical.clone()),
-                    Some(canonical),
-                    Some(reservation),
-                )
+                (ProfileDir::Persistent(canonical), Some(reservation))
             }
             None => {
                 let temp =
                     tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
-                let canonical = temp.path().canonicalize().ok();
-                (ProfileDir::Temp(temp), canonical, None)
+                (ProfileDir::Temp(temp), None)
             }
         };
         let headless = options.headless;
@@ -2172,7 +2185,6 @@ impl InstanceManager {
             pid,
             profile_dir,
             profile_reservation,
-            profile_dir_path,
             pages: HashMap::new(),
             closed_pages: HashSet::new(),
             closed_pages_order: VecDeque::new(),
@@ -2193,6 +2205,7 @@ impl InstanceManager {
         if let Some(reservation) = &instance.profile_reservation {
             reservation.bind(&instance_id);
         }
+        let profile_dir = instance.persistent_profile_dir().map(Path::to_path_buf);
         instances.insert(
             instance_id.clone(),
             InstanceEntry {
@@ -2206,7 +2219,12 @@ impl InstanceManager {
             },
         );
 
-        Ok((instance_id, version, pid))
+        Ok(LaunchedInstance {
+            instance_id,
+            version,
+            pid,
+            profile_dir,
+        })
     }
 
     /// List all instances.
@@ -3475,7 +3493,6 @@ mod tests {
             pid: 0,
             profile_dir: ProfileDir::Temp(tempfile::tempdir().unwrap()),
             profile_reservation: None,
-            profile_dir_path: None,
             pages: HashMap::from([(
                 "p1".into(),
                 ManagedMainFrame {
@@ -3509,6 +3526,63 @@ mod tests {
         drop(context);
         drop(tx);
         drop(conn);
+    }
+
+    #[test]
+    fn prepare_profile_dir_rejects_unrelated_contents_without_changing_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("documents");
+        std::fs::create_dir(&target).unwrap();
+        let file = target.join("fixture.pdf");
+        std::fs::write(&file, b"contents").unwrap();
+        let error = prepare_profile_dir(target.to_str().unwrap()).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "invalid argument: profile directory is not empty and is not a browser profile: {}",
+                target.display()
+            )
+        );
+        assert_eq!(std::fs::read(file).unwrap(), b"contents");
+        let manager = InstanceManager::new();
+        let error = manager
+            .launch_with(&LaunchOptions {
+                executable: Some("/nonexistent/camoufox-test-binary".into()),
+                profile_dir: Some(target.display().to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(
+            error.starts_with("invalid argument: profile directory is not empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn prepare_profile_dir_accepts_firefox_profile_markers() {
+        for marker in ["prefs.js", "times.json"] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(temp.path().join(marker), b"profile data").unwrap();
+            std::fs::write(temp.path().join("other-data"), b"contents").unwrap();
+            assert_eq!(
+                prepare_profile_dir(temp.path().to_str().unwrap()).unwrap(),
+                temp.path().canonicalize().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_profile_dir_preserves_special_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        for mode in [0o3777, 0o3750, 0o3700, 0o2750] {
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            prepare_profile_dir(temp.path().to_str().unwrap()).unwrap();
+            assert_eq!(
+                std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o7777,
+                mode & !0o077
+            );
+        }
     }
 
     #[test]
@@ -3579,6 +3653,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let dotted = format!("{}/./sub/../", real.display());
         std::fs::create_dir(real.join("sub")).unwrap();
+        std::fs::write(real.join("prefs.js"), b"// profile preferences").unwrap();
 
         let canonical = prepare_profile_dir(real.to_str().unwrap()).unwrap();
         assert_eq!(canonical, real.canonicalize().unwrap());
@@ -3673,15 +3748,9 @@ mod tests {
 
     #[test]
     fn prepare_profile_dir_create_failure_is_io_and_precedes_spawn() {
-        use std::os::unix::fs::PermissionsExt;
-        // Permission bits do not restrict root; the assertion needs a normal user.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
         let temp = tempfile::tempdir().unwrap();
-        let parent = temp.path().join("read-only");
-        std::fs::create_dir(&parent).unwrap();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = temp.path().join("regular-file");
+        std::fs::write(&parent, b"contents").unwrap();
         let target = parent.join("profile");
         let direct = prepare_profile_dir(target.to_str().unwrap()).unwrap_err();
         let manager = InstanceManager::new();
@@ -3692,7 +3761,6 @@ mod tests {
                 ..Default::default()
             })
             .unwrap_err();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
         for error in [direct, launched] {
             assert!(
                 error.starts_with(&format!(
@@ -3708,40 +3776,48 @@ mod tests {
         }
         assert!(!target.exists());
         assert!(manager.list().is_empty());
-        // The failed launch released its reservation: a retry gets the
-        // same I/O error rather than "already in use".
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let retry = prepare_profile_dir(target.to_str().unwrap()).unwrap_err();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(retry.starts_with("failed to create profile directory "));
+        // A preparation failure must not reserve the profile. Retry through
+        // launch_with so an accidental reservation cannot hide behind validation.
+        let retry = manager
+            .launch_with(&LaunchOptions {
+                executable: Some("/nonexistent/camoufox-test-binary".into()),
+                profile_dir: Some(target.display().to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(
+            retry.starts_with("failed to create profile directory "),
+            "{retry}"
+        );
+        assert!(!retry.contains("already in use"), "{retry}");
     }
 
     #[test]
     fn prepare_profile_dir_permission_failure_is_io() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        // A group/world-accessible directory owned by another user cannot be
-        // tightened. Only run where that is guaranteed: never as root (which
-        // could chmod it) and only on a directory this user does not own.
-        let uid = unsafe { libc::geteuid() };
-        let foreign = Path::new("/usr");
-        let Ok(meta) = std::fs::metadata(foreign) else {
-            return;
-        };
-        if uid == 0 || meta.uid() == uid || meta.permissions().mode() & 0o077 == 0 {
-            return;
-        }
-        let error = prepare_profile_dir("/usr").unwrap_err();
-        assert!(
-            error.starts_with("failed to set permissions on profile directory /usr: "),
-            "{error}"
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = prepare_profile_dir_with_permissions(temp.path().to_str().unwrap(), |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected chmod failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "failed to set permissions on profile directory {}: injected chmod failure",
+                temp.path().display()
+            )
         );
         assert_eq!(
             crate::cli::ipc::DaemonResponse::err(error).kind.as_deref(),
             Some("io")
         );
         assert_eq!(
-            std::fs::metadata(foreign).unwrap().permissions().mode(),
-            meta.permissions().mode()
+            std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777,
+            0o755
         );
     }
 

@@ -76,6 +76,7 @@ fn main() {
             dialogs,
             profile_dir,
         } => {
+            let persistent = profile_dir.is_some();
             let request = DaemonRequest::Launch {
                 headless: Some(!headed),
                 executable,
@@ -84,7 +85,15 @@ fn main() {
                 dialogs: dialogs.into(),
                 profile_dir: profile_dir.map(|p| p.to_string_lossy().into_owned()),
             };
-            run_client(&sock, &request, cli.json);
+            let result = send_request(&sock, &request).and_then(|response| {
+                if persistent && response.ok
+                    && response.data.as_ref().and_then(|data| data.get("profile_dir")).is_none()
+                {
+                    return Err("daemon does not support --profile-dir; restart it: camoufox shutdown && camoufox serve".into());
+                }
+                Ok(response)
+            });
+            print_client_result(result, cli.json);
         }
 
         Command::Dialog {
@@ -675,39 +684,45 @@ fn main() {
         }
 
         Command::External(args) => {
-            dispatch_external(&sock, &args);
+            dispatch_external(&sock, &args, cli.json);
         }
     }
 }
 
 /// Dispatches an external subcommand or exits with clap's unrecognized subcommand error.
-fn dispatch_external(sock: &std::path::Path, args: &[String]) -> ! {
-    if let Some(name) = args.first() {
-        if !name.contains(std::path::is_separator) {
-            if let Some(binary) = camoufox::cli::commands::find_external_subcommand(name) {
-                let status = std::process::Command::new(&binary)
-                    .args(&args[1..])
-                    .env("CAMOUFOX_SOCKET", sock.to_string_lossy().as_ref())
-                    .status()
-                    .unwrap_or_else(|e| {
-                        eprintln!("error: failed to execute external subcommand: {e}");
-                        std::process::exit(1);
-                    });
-
-                #[cfg(unix)]
-                let exit_code = {
-                    use std::os::unix::process::ExitStatusExt;
-                    status
-                        .code()
-                        .or_else(|| status.signal().map(|s| 128 + s))
-                        .unwrap_or(1)
-                };
-                #[cfg(not(unix))]
-                let exit_code = status.code().unwrap_or(1);
-
-                std::process::exit(exit_code);
-            }
+fn dispatch_external(sock: &std::path::Path, args: &[String], json_mode: bool) -> ! {
+    if let Some(binary) = args
+        .first()
+        .and_then(|name| camoufox::cli::commands::find_external_subcommand(name))
+    {
+        let path = std::path::absolute(sock).unwrap_or_else(|e| {
+            eprintln!("error: io error: failed to resolve daemon socket: {e}");
+            std::process::exit(1);
+        });
+        let mut command = std::process::Command::new(&binary);
+        command
+            .args(&args[1..])
+            .env("CAMOUFOX_SOCKET", path.as_os_str());
+        if json_mode {
+            command.env("CAMOUFOX_JSON", "1");
         }
+        let status = command.status().unwrap_or_else(|e| {
+            eprintln!("error: failed to execute external subcommand: {e}");
+            std::process::exit(1);
+        });
+
+        #[cfg(unix)]
+        let exit_code = {
+            use std::os::unix::process::ExitStatusExt;
+            status
+                .code()
+                .or_else(|| status.signal().map(|s| 128 + s))
+                .unwrap_or(1)
+        };
+        #[cfg(not(unix))]
+        let exit_code = status.code().unwrap_or(1);
+
+        std::process::exit(exit_code);
     }
 
     // Reparse the original argv so clap supplies its native error and suggestions.
@@ -778,7 +793,14 @@ fn fail(json_mode: bool, message: &str) -> ! {
 }
 
 fn run_client(sock: &std::path::Path, request: &DaemonRequest, json_mode: bool) {
-    match send_request(sock, request) {
+    print_client_result(send_request(sock, request), json_mode);
+}
+
+fn print_client_result(
+    result: Result<camoufox::cli::ipc::DaemonResponse, String>,
+    json_mode: bool,
+) {
+    match result {
         Ok(response) => {
             let ok = response.ok;
             print_response(&response, json_mode);

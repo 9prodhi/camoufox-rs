@@ -57,7 +57,18 @@ pub fn send_request(socket_path: &Path, request: &DaemonRequest) -> Result<Daemo
         return Err("daemon closed connection without responding".into());
     }
 
-    serde_json::from_str(&line).map_err(|e| format!("invalid response from daemon: {e}"))
+    let mut response: DaemonResponse =
+        serde_json::from_str(&line).map_err(|e| format!("invalid response from daemon: {e}"))?;
+    if !response.ok && response.kind.is_none() {
+        if let Some(message) = &response.error {
+            response.kind = Some(
+                crate::cli::error_kind::ErrorKind::classify(message)
+                    .as_str()
+                    .into(),
+            );
+        }
+    }
+    Ok(response)
 }
 
 #[cfg(test)]

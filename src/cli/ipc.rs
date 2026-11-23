@@ -16,6 +16,7 @@ fn default_timeout() -> u64 {
 /// A request from a CLI client to the daemon.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
+#[non_exhaustive]
 pub enum DaemonRequest {
     /// Ping the daemon. Returns instance count.
     Ping,
@@ -59,9 +60,7 @@ pub enum DaemonRequest {
         bypass_csp: bool,
         #[serde(default)]
         dialogs: crate::api::DialogPolicy,
-        /// Persistent profile directory. When set, the directory is used as-is
-        /// and is never deleted when the instance stops.
-        /// When absent, an isolated temporary directory is used (deleted on stop).
+        /// Absolute path; created or tightened to 0700, canonicalized, must be empty or an existing profile, never deleted on stop.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile_dir: Option<String>,
     },
@@ -428,7 +427,20 @@ impl DaemonRequest {
 pub use super::error_kind::ErrorKind;
 
 /// A response from the daemon to a CLI client.
+///
+/// Use the response constructors so future fields can be added:
+/// ```
+/// use camoufox::cli::ipc::DaemonResponse;
+/// let response = DaemonResponse::ok_empty();
+/// assert!(response.ok);
+/// ```
+/// External callers cannot construct this extensible type with a struct literal:
+/// ```compile_fail,E0639
+/// use camoufox::cli::ipc::DaemonResponse;
+/// let response = DaemonResponse { ok: true, error: None, kind: None, data: None };
+/// ```
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DaemonResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -496,6 +508,14 @@ mod tests {
             }
         };
     }
+
+    error_kind_case!(page_closed_kind, "page p1 was closed", "page_closed");
+    error_kind_case!(page_crashed_kind, "page p2 crashed", "page_closed");
+    error_kind_case!(
+        profile_unsupported_kind,
+        "daemon does not support --profile-dir; restart it: camoufox shutdown && camoufox serve",
+        "daemon"
+    );
 
     // src/cli/instance.rs: selector_box_in_frame, selector-not-found branch.
     error_kind_case!(

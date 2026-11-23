@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::cli::instance::{InstanceManager, LaunchOptions};
+use crate::cli::instance::{InstanceManager, LaunchOptions, LaunchedInstance};
 use crate::cli::ipc::{DaemonRequest, DaemonResponse};
 
 const MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -294,6 +294,15 @@ fn respond<T: Serialize>(result: Result<T, String>) -> DaemonResponse {
     }
 }
 
+fn launch_success_data(result: LaunchedInstance) -> serde_json::Value {
+    let mut data =
+        json!({"instance_id": result.instance_id, "version": result.version, "pid": result.pid});
+    if let Some(path) = result.profile_dir {
+        data["profile_dir"] = json!(path.to_string_lossy());
+    }
+    data
+}
+
 fn dispatch_guarded(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
     if mgr.is_closing() && !matches!(request, DaemonRequest::Shutdown) {
         return DaemonResponse::err("daemon shutting down");
@@ -330,7 +339,7 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
             dialogs,
             profile_dir,
         } => respond(
-            mgr.launch_with(&LaunchOptions {
+            mgr.launch_with_result(&LaunchOptions {
                 headless,
                 executable,
                 downloads_dir,
@@ -338,9 +347,7 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
                 dialogs,
                 profile_dir,
             })
-            .map(|(instance_id, version, pid)| {
-                json!({"instance_id": instance_id, "version": version, "pid": pid})
-            }),
+            .map(launch_success_data),
         ),
         DaemonRequest::Dialog { instance_id, page_id, action, text } => {
             let accept = match action.as_str() { "accept" => true, "dismiss" => false, _ => return DaemonResponse::err("dialog action must be accept or dismiss") };
@@ -464,6 +471,26 @@ mod tests {
                 let _ = thread.join();
             }
         }
+    }
+
+    #[test]
+    fn launch_success_formats_non_utf8_profile_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+        let data = launch_success_data(LaunchedInstance {
+            instance_id: "00000001".into(),
+            version: None,
+            pid: 123,
+            profile_dir: Some(PathBuf::from(std::ffi::OsString::from_vec(
+                b"/profile-\xff".to_vec(),
+            ))),
+        });
+        assert_eq!(
+            data,
+            json!({
+                "instance_id": "00000001", "version": null, "pid": 123,
+                "profile_dir": "/profile-\u{fffd}",
+            })
+        );
     }
 
     #[test]

@@ -151,13 +151,10 @@ fn cassette_offline_roundtrip(persistent: bool) {
     let dir = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
     let manager = InstanceManager::new();
-    let (instance, _, _) = manager
-        .launch_with(&camoufox::cli::instance::LaunchOptions {
-            headless: Some(true),
-            profile_dir: persistent.then(|| profile.path().display().to_string()),
-            ..Default::default()
-        })
-        .unwrap();
+    let mut launch_options = camoufox::cli::instance::LaunchOptions::default();
+    launch_options.headless = Some(true);
+    launch_options.profile_dir = persistent.then(|| profile.path().display().to_string());
+    let (instance, _, _) = manager.launch_with(&launch_options).unwrap();
     let page = manager.new_page(&instance).unwrap();
     manager
         .record_start(&instance, &page, dir.path(), &[])

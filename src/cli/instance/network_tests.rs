@@ -143,7 +143,6 @@ impl Harness {
             version: None,
             profile_dir: ProfileDir::Temp(tempfile::tempdir().unwrap()),
             profile_reservation: None,
-            profile_dir_path: None,
             pages: HashMap::from([(
                 "p".into(),
                 ManagedMainFrame {

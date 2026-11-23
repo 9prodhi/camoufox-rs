@@ -143,7 +143,7 @@ Usage: camoufox launch [OPTIONS]
 - `--downloads-dir <DOWNLOADS_DIR>`: Directory to save downloads to (must be absolute; defaults to cancel).
 - `--bypass-csp`: Disable page Content-Security-Policy (needed for `--main-world` on strict-CSP sites; detectable by pages).
 - `--dialogs <DIALOGS>`: JavaScript dialog handling policy (`manual`, `accept`, `dismiss`) [default: `manual`].
-- `--profile-dir <PROFILE_DIR>`: Persistent profile directory (must be absolute path). Created with mode 0700 if missing; an existing directory with looser permissions is tightened to 0700 on Unix. Persistent profiles are never deleted on stop or shutdown.
+- `--profile-dir <PROFILE_DIR>`: Persistent profile directory (must be absolute path). Created with mode 0700 if missing; an existing directory with looser permissions is tightened to 0700 on Unix. Persistent profiles use the browser's default context: cookies, localStorage, IndexedDB, and other profile data survive relaunch. Stop or shutdown gracefully flushes storage before returning. A profile is reserved during launch and remains in use until the browser exits; concurrent launches on the same canonical directory are refused. Persistent profiles are never deleted on stop or shutdown. Without this flag, launches use a fresh temporary profile and private context.
 - `--socket <SOCKET>`: Path to the daemon Unix socket.
 - `--json`: Output as JSON.
 

@@ -59,7 +59,9 @@ impl ProxyConfig {
     /// `browserContextId` field, suitable for `Browser.setContextProxy`.
     pub(crate) fn to_context_json(&self, context_id: &str) -> serde_json::Value {
         let mut obj = self.to_json();
-        obj["browserContextId"] = json!(context_id);
+        if !context_id.is_empty() {
+            obj["browserContextId"] = json!(context_id);
+        }
         obj
     }
 }
@@ -297,6 +299,26 @@ impl Browser {
         }
 
         Ok(ctx)
+    }
+
+    /// Configure the browser's default context, which uses the on-disk profile.
+    ///
+    /// Connect with [`BrowserOptions::attach_to_default_context`] set to `true`
+    /// to receive page and popup events. The default context has no protocol ID;
+    /// all options and page/cookie commands omit `browserContextId`.
+    /// Call [`Browser::close`] to flush profile storage and shut down its pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProtocolError`] if configuration fails.
+    pub fn default_context(
+        &self,
+        options: ContextOptions,
+    ) -> Result<BrowserContext, ProtocolError> {
+        let context =
+            BrowserContext::new(String::new(), &self.session, Arc::clone(&self.connection));
+        context.configure(&options)?;
+        Ok(context)
     }
 
     /// Set the browser-level proxy.

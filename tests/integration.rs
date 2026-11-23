@@ -5076,3 +5076,171 @@ fn launch_profile_dir_aliases_collide_and_release_on_stop() {
     manager.stop(&second).expect("stop second");
     assert!(profile.is_dir(), "persistent profile must survive stop");
 }
+
+/// Persistent launches use disk storage; temporary launches get fresh storage.
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_persists_cookie_and_local_storage_across_relaunch() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    struct StorageServer {
+        server: std::sync::Arc<tiny_http::Server>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for StorageServer {
+        fn drop(&mut self) {
+            self.server.unblock();
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+    let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+    let url = format!("http://{}/", server.server_addr());
+    let _server = StorageServer {
+        server: server.clone(),
+        worker: Some(std::thread::spawn(move || {
+            while let Ok(request) = server.recv() {
+                let _ = request.respond(tiny_http::Response::from_string(
+                    "<!doctype html><html><head><title>Storage</title><link rel='icon' href='data:,'></head><body id='storage'>Storage</body></html>"
+                ).with_header(tiny_http::Header::from_bytes("Content-Type", "text/html").unwrap()));
+            }
+        })),
+    };
+    let timeout = Duration::from_secs(15);
+    for (persistent, shutdown) in [(false, false), (true, false), (false, true), (true, true)] {
+        let profile = tempfile::tempdir().unwrap();
+        let manager = InstanceManager::new();
+        let options = LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            profile_dir: persistent.then(|| profile.path().display().to_string()),
+            ..Default::default()
+        };
+        let (first, _, _) = manager.launch_with(&options).unwrap();
+        let page = manager.new_page(&first).unwrap();
+        manager
+            .navigate(&first, &page, &url, timeout, Some("load"))
+            .unwrap();
+        assert_eq!(manager.evaluate_main_world(&first, &page,
+            "(() => { document.cookie = 'saved=value; Max-Age=3600; Path=/'; localStorage.setItem('saved', 'value'); return [document.cookie, localStorage.getItem('saved')]; })()",
+            timeout).unwrap(), serde_json::json!(["saved=value", "value"]));
+        if shutdown {
+            manager.shutdown_all();
+        } else {
+            manager.stop(&first).unwrap();
+        }
+
+        let (second, _, _) = manager.launch_with(&options).unwrap();
+        let page = manager.new_page(&second).unwrap();
+        manager
+            .navigate(&second, &page, &url, timeout, Some("load"))
+            .unwrap();
+        let state = manager
+            .evaluate_main_world(
+                &second,
+                &page,
+                "[document.cookie, localStorage.getItem('saved')]",
+                timeout,
+            )
+            .unwrap();
+        manager.stop(&second).unwrap();
+        assert_eq!(
+            state,
+            if persistent {
+                serde_json::json!(["saved=value", "value"])
+            } else {
+                serde_json::json!(["", null])
+            },
+            "persistent={persistent}, shutdown={shutdown}"
+        );
+    }
+}
+
+/// Hold the first child before browser startup so the launches overlap deterministically.
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_reserves_before_browser_ready_and_releases_failed_spawn() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("profile");
+    let marker = dir.path().join("started");
+    let gate = dir.path().join("gate");
+    let wrapper = dir.path().join("browser");
+    // Quote fixture paths even if a test runner uses a directory containing spaces.
+    let quote =
+        |path: &std::path::Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    std::fs::write(
+        &wrapper,
+        format!(
+        "#!/bin/sh\nprintf ready > {}\nwhile [ ! -f {} ]; do sleep 0.01; done\nexec {} \"$@\"\n",
+        quote(&marker), quote(&gate), quote(std::path::Path::new(&camoufox_bin()))
+    ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let manager = Arc::new(InstanceManager::new());
+    let options = LaunchOptions {
+        headless: Some(true),
+        executable: Some(wrapper.display().to_string()),
+        profile_dir: Some(profile.display().to_string()),
+        ..Default::default()
+    };
+    let first = std::thread::spawn({
+        let manager = Arc::clone(&manager);
+        let options = options.clone();
+        move || manager.launch_with(&options)
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let started = marker.exists();
+    let second = if started {
+        manager.launch_with(&LaunchOptions {
+            executable: Some(camoufox_bin()),
+            ..options.clone()
+        })
+    } else {
+        Err("first child did not start".into())
+    };
+    // Clean up even on the buggy implementation where the second launch succeeds.
+    if let Ok((id, _, _)) = &second {
+        manager.stop(id).unwrap();
+    }
+    std::fs::write(&gate, b"continue").unwrap();
+    let (id, _, _) = first.join().unwrap().unwrap();
+    manager.stop(&id).unwrap();
+    assert!(started, "first child must reach the startup gate");
+    assert_eq!(
+        second.unwrap_err(),
+        "invalid argument: profile directory already in use by a launch in progress"
+    );
+
+    for executable in [
+        dir.path().join("missing-browser"),
+        PathBuf::from("/bin/false"),
+    ] {
+        let error = manager
+            .launch_with(&LaunchOptions {
+                executable: Some(executable.display().to_string()),
+                ..options.clone()
+            })
+            .unwrap_err();
+        assert!(
+            error.starts_with("failed to spawn browser:")
+                || error.starts_with("browser did not become ready:"),
+            "{error}"
+        );
+        let (id, _, _) = manager
+            .launch_with(&LaunchOptions {
+                executable: Some(camoufox_bin()),
+                ..options.clone()
+            })
+            .expect("failed startup must release the profile reservation");
+        manager.stop(&id).unwrap();
+    }
+}

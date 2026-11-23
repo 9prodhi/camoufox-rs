@@ -1,10 +1,11 @@
-//! Browser context (isolated profile) wrapper.
+//! Browser context wrapper for isolated sessions and the persistent default context.
 //!
-//! A [`BrowserContext`] represents an isolated browser context within the
-//! Camoufox browser. Each context has its own cookies, cache, local storage,
+//! A [`BrowserContext`] represents a browser context within the Camoufox browser. Each context has its own cookies, cache, local storage,
 //! and other browsing data. Contexts are created via
-//! [`Browser::new_context`](crate::api::browser::Browser::new_context)
-//! and destroyed via [`BrowserContext::close`].
+//! [`Browser::new_context`](crate::api::browser::Browser::new_context), or the
+//! persistent default context via [`Browser::default_context`](crate::api::Browser::default_context).
+//! Close isolated contexts via [`BrowserContext::close`]; close the browser to
+//! flush and shut down the default context.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -227,7 +228,7 @@ pub struct Cookie {
 // BrowserContext
 // ---------------------------------------------------------------------------
 
-/// A browser context (isolated profile).
+/// A browser context (an isolated session or the browser's default context).
 ///
 /// Each context is an independent browsing session with its own cookies,
 /// cache, and local storage. Pages created within a context share its
@@ -246,7 +247,7 @@ pub struct Cookie {
 /// from [`Browser::new_context`](crate::api::browser::Browser::new_context)),
 /// it will also be cleaned up automatically when the pipe disconnects.
 pub struct BrowserContext {
-    /// The server-assigned context ID.
+    /// The server-assigned context ID, or empty for the default context.
     context_id: String,
     /// Cloned root session handle (context commands go through root).
     /// `Session` is `Clone` and backed by `Arc<Mutex<...>>` internally.
@@ -307,7 +308,8 @@ impl BrowserContext {
             .collect()
     }
 
-    /// Returns the context ID assigned by the browser.
+    /// Returns the context ID assigned by the browser, or an empty string for
+    /// the default context (whose ID is omitted on the wire).
     pub fn context_id(&self) -> &str {
         &self.context_id
     }
@@ -327,10 +329,13 @@ impl BrowserContext {
         &self.session
     }
 
-    /// Helper: build a JSON object with `browserContextId` included.
+    /// Include an ID only for private contexts; Juggler addresses the default
+    /// context by omitting the optional field, never by sending null or "".
     fn ctx_params(&self, extra: serde_json::Value) -> serde_json::Value {
         let mut obj = if extra.is_object() { extra } else { json!({}) };
-        obj["browserContextId"] = json!(self.context_id);
+        if !self.context_id.is_empty() {
+            obj["browserContextId"] = json!(self.context_id);
+        }
         obj
     }
 
@@ -587,10 +592,10 @@ impl BrowserContext {
     /// and constructs the `MainFrame`.
     pub fn new_main_frame(&self) -> Result<MainFrame, ProtocolError> {
         let mut inflight = self.registry.begin_new_page();
-        let result = match self.session().send(
-            "Browser.newPage",
-            json!({ "browserContextId": self.context_id }),
-        ) {
+        let result = match self
+            .session()
+            .send("Browser.newPage", self.ctx_params(json!({})))
+        {
             Ok(res) => res,
             Err(e) => {
                 inflight.mark_failed();
@@ -657,10 +662,9 @@ impl BrowserContext {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn get_cookies(&self) -> Result<Vec<Cookie>, ProtocolError> {
-        let result = self.session().send(
-            "Browser.getCookies",
-            json!({ "browserContextId": self.context_id }),
-        )?;
+        let result = self
+            .session()
+            .send("Browser.getCookies", self.ctx_params(json!({})))?;
 
         let cookies: Vec<Cookie> = result
             .get("cookies")
@@ -677,10 +681,8 @@ impl BrowserContext {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn clear_cookies(&self) -> Result<(), ProtocolError> {
-        self.session().send(
-            "Browser.clearCookies",
-            json!({ "browserContextId": self.context_id }),
-        )?;
+        self.session()
+            .send("Browser.clearCookies", self.ctx_params(json!({})))?;
         Ok(())
     }
 
@@ -703,11 +705,10 @@ impl BrowserContext {
     ) -> Result<(), ProtocolError> {
         self.session().send(
             "Browser.grantPermissions",
-            json!({
-                "browserContextId": self.context_id,
+            self.ctx_params(json!({
                 "origin": origin,
                 "permissions": permissions,
-            }),
+            })),
         )?;
         Ok(())
     }
@@ -718,10 +719,8 @@ impl BrowserContext {
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn reset_permissions(&self) -> Result<(), ProtocolError> {
-        self.session().send(
-            "Browser.resetPermissions",
-            json!({ "browserContextId": self.context_id }),
-        )?;
+        self.session()
+            .send("Browser.resetPermissions", self.ctx_params(json!({})))?;
         Ok(())
     }
 
@@ -780,16 +779,19 @@ impl BrowserContext {
     /// Remove this context and close all its pages.
     ///
     /// Sends `Browser.removeBrowserContext`. This method consumes `self`
-    /// to prevent further use.
+    /// to prevent further use. For the default context this only drops the
+    /// handle: shut down its browser with [`Browser::close`](crate::api::Browser::close)
+    /// to close pages and flush profile storage.
     ///
     /// # Errors
     ///
     /// Returns a [`ProtocolError`] if the command fails.
     pub fn close(self) -> Result<(), ProtocolError> {
-        self.session().send(
-            "Browser.removeBrowserContext",
-            json!({ "browserContextId": self.context_id }),
-        )?;
+        if self.context_id.is_empty() {
+            return Ok(());
+        }
+        self.session()
+            .send("Browser.removeBrowserContext", self.ctx_params(json!({})))?;
         Ok(())
     }
 
@@ -798,10 +800,12 @@ impl BrowserContext {
     /// Unlike [`close`](BrowserContext::close), this does not consume `self`
     /// and silently ignores errors.
     pub(crate) fn try_remove(&self) {
-        let _ = self.session().send_may_fail(
-            "Browser.removeBrowserContext",
-            json!({ "browserContextId": self.context_id }),
-        );
+        if self.context_id.is_empty() {
+            return;
+        }
+        let _ = self
+            .session()
+            .send_may_fail("Browser.removeBrowserContext", self.ctx_params(json!({})));
     }
 }
 
@@ -918,6 +922,75 @@ mod tests {
                     closed: self.closed,
                 }),
             )
+        }
+    }
+
+    #[test]
+    fn default_context_commands_omit_optional_id() {
+        let (transport, in_tx, out_rx) = TestTransport::new();
+        let conn = Arc::new(Connection::new(Box::new(transport)));
+        let context = BrowserContext::new(String::new(), &conn.root_session(), Arc::clone(&conn));
+        let responder = thread::spawn(move || {
+            let mut requests = Vec::new();
+            while let Ok(request) = out_rx.recv_timeout(Duration::from_secs(1)) {
+                in_tx
+                    .send(RawMessage {
+                        id: request["id"].as_i64(),
+                        method: None,
+                        params: None,
+                        result: Some(json!({ "cookies": [] })),
+                        error: None,
+                        session_id: None,
+                    })
+                    .unwrap();
+                let done = request["method"] == "Browser.resetPermissions";
+                requests.push(request);
+                if done {
+                    break;
+                }
+            }
+            requests
+        });
+        context
+            .configure(&ContextOptions {
+                user_agent: Some("Example Browser".into()),
+                viewport: Some(Viewport {
+                    width: 800,
+                    height: 600,
+                }),
+                extra_http_headers: vec![("X-Example".into(), "value".into())],
+                bypass_csp: true,
+                download_options: Some(DownloadOptions {
+                    behavior: Some("cancel".into()),
+                    downloads_dir: None,
+                }),
+                proxy: Some(ProxyConfig {
+                    r#type: "http".into(),
+                    host: "localhost".into(),
+                    port: 8080,
+                    bypass: vec![],
+                    username: None,
+                    password: None,
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        context.set_request_interception(true).unwrap();
+        context.set_cookies(&[]).unwrap();
+        context.get_cookies().unwrap();
+        context.clear_cookies().unwrap();
+        context
+            .grant_permissions("https://example.com", &["geo"])
+            .unwrap();
+        context.reset_permissions().unwrap();
+        let requests = responder.join().unwrap();
+        context.close().unwrap();
+        assert!(requests.len() >= 12);
+        for request in requests {
+            assert!(
+                request["params"].get("browserContextId").is_none(),
+                "{request}"
+            );
         }
     }
 

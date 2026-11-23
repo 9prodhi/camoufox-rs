@@ -106,6 +106,19 @@ impl ErrorKind {
 
         if message == "daemon shutting down"
             || message == "daemon is already running"
+            || message == "daemon is not running (start with: camoufox serve)"
+            || message == "daemon closed connection without responding"
+            || [
+                "socket parent directory does not exist: ",
+                "failed to connect to daemon: ",
+                "failed to send request: ",
+                "failed to flush: ",
+                "failed to read response: ",
+                "invalid response from daemon: ",
+                "timed out waiting for daemon after ",
+            ]
+            .iter()
+            .any(|prefix| message.starts_with(prefix))
             || message == "request line too large or missing newline"
             || message.starts_with("invalid request: ")
         {
@@ -185,6 +198,10 @@ impl ErrorKind {
             "failed to write screenshot: ",
             "failed to create temp dir: ",
             "failed to create downloads dir ",
+            "failed to create profile directory ",
+            "failed to set permissions on profile directory ",
+            "failed to canonicalize profile directory ",
+            "failed to inspect profile directory ",
             "failed to create runtime directory: ",
             "cannot inspect runtime directory ",
             "insecure runtime directory ",
@@ -239,6 +256,81 @@ fn frame_cause(scoped: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::ErrorKind;
+
+    macro_rules! classification_regression {
+        ($name:ident, $message:literal, $kind:ident) => {
+            #[test]
+            fn $name() {
+                assert_eq!(ErrorKind::classify($message), ErrorKind::$kind);
+            }
+        };
+    }
+
+    classification_regression!(
+        profile_create_is_io,
+        "failed to create profile directory /profile: denied",
+        Io
+    );
+    classification_regression!(
+        profile_permissions_are_io,
+        "failed to set permissions on profile directory /profile: denied",
+        Io
+    );
+    classification_regression!(
+        profile_canonicalize_is_io,
+        "failed to canonicalize profile directory /profile: denied",
+        Io
+    );
+    classification_regression!(
+        profile_inspect_is_io,
+        "failed to inspect profile directory /profile: denied",
+        Io
+    );
+    classification_regression!(
+        client_not_running_is_daemon,
+        "daemon is not running (start with: camoufox serve)",
+        Daemon
+    );
+    classification_regression!(
+        client_socket_parent_is_daemon,
+        "socket parent directory does not exist: /missing",
+        Daemon
+    );
+    classification_regression!(
+        client_connect_is_daemon,
+        "failed to connect to daemon: denied",
+        Daemon
+    );
+    classification_regression!(
+        client_send_is_daemon,
+        "failed to send request: broken pipe",
+        Daemon
+    );
+    classification_regression!(
+        client_flush_is_daemon,
+        "failed to flush: broken pipe",
+        Daemon
+    );
+    classification_regression!(
+        client_read_is_daemon,
+        "failed to read response: reset",
+        Daemon
+    );
+    classification_regression!(
+        client_eof_is_daemon,
+        "daemon closed connection without responding",
+        Daemon
+    );
+    classification_regression!(
+        client_invalid_response_is_daemon,
+        "invalid response from daemon: expected value",
+        Daemon
+    );
+    classification_regression!(
+        client_timeout_is_daemon,
+        "timed out waiting for daemon after 30s (the daemon may still complete the request)",
+        Daemon
+    );
 
     #[test]
     fn wrapped_causes_and_precedence() {

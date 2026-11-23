@@ -536,6 +536,7 @@ pub struct Instance {
     /// Profile directory handle. `Persistent` keeps the directory after stop;
     /// `Temp` deletes it when the handle is dropped.
     profile_dir: ProfileDir,
+    profile_reservation: Option<ProfileReservation>,
     /// Canonical path of the profile directory, used for collision detection.
     pub profile_dir_path: Option<PathBuf>,
     pages: HashMap<String, ManagedMainFrame>,
@@ -1917,6 +1918,7 @@ impl Instance {
             mut child,
             close_timeout,
             profile_dir,
+            profile_reservation,
             ..
         } = self;
         let _ = browser.close();
@@ -1924,6 +1926,7 @@ impl Instance {
             .map_err(|e| format!("failed to stop browser: {e}"));
         // Keep the profile alive through kill + wait, including error paths.
         drop(profile_dir);
+        drop(profile_reservation);
         result
     }
 
@@ -1955,10 +1958,61 @@ struct InstanceEntry {
     downloads: Arc<crate::cli::downloads::DownloadLog>,
 }
 
+// A lease spans startup, registration and shutdown. Dropping it releases the
+// canonical path even when spawn, readiness or protocol bootstrap fails.
+struct ProfileReservation {
+    profiles: Arc<Mutex<HashMap<PathBuf, Option<String>>>>,
+    path: PathBuf,
+}
+
+impl ProfileReservation {
+    fn reserve(
+        profiles: &Arc<Mutex<HashMap<PathBuf, Option<String>>>>,
+        path: &Path,
+    ) -> Result<Self, String> {
+        let mut owners = profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(owner) = owners.get(path) {
+            return Err(match owner {
+                Some(id) => {
+                    format!("invalid argument: profile directory already in use by instance {id}")
+                }
+                None => {
+                    "invalid argument: profile directory already in use by a launch in progress"
+                        .into()
+                }
+            });
+        }
+        owners.insert(path.to_owned(), None);
+        Ok(Self {
+            profiles: Arc::clone(profiles),
+            path: path.to_owned(),
+        })
+    }
+
+    fn bind(&self, id: &str) {
+        self.profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.path.clone(), Some(id.to_owned()));
+    }
+}
+
+impl Drop for ProfileReservation {
+    fn drop(&mut self) {
+        self.profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.path);
+    }
+}
+
 /// Manages all browser instances for the daemon.
 #[derive(Default)]
 pub struct InstanceManager {
     instances: Mutex<HashMap<String, InstanceEntry>>,
+    profiles: Arc<Mutex<HashMap<PathBuf, Option<String>>>>,
     closing: AtomicBool,
     counter: AtomicU64,
 }
@@ -1974,6 +2028,7 @@ impl InstanceManager {
     pub fn new() -> Self {
         InstanceManager {
             instances: Mutex::new(HashMap::new()),
+            profiles: Arc::default(),
             counter: AtomicU64::new(0),
             closing: AtomicBool::new(false),
         }
@@ -2032,33 +2087,21 @@ impl InstanceManager {
         }
 
         let instance_id = format!("{:08x}", self.counter.fetch_add(1, Ordering::Relaxed) + 1);
-        let (profile_dir, profile_dir_path) = match &options.profile_dir {
+        let (profile_dir, profile_dir_path, profile_reservation) = match &options.profile_dir {
             Some(dir_str) => {
                 let canonical = prepare_profile_dir(dir_str)?;
-                let instances = self
-                    .instances
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                for (id, entry) in instances.iter() {
-                    let managed = entry
-                        .managed
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Some(inst) = &managed.instance {
-                        if inst.profile_dir_path.as_ref() == Some(&canonical) {
-                            return Err(format!(
-                                "invalid argument: profile directory already in use by instance {id}"
-                            ));
-                        }
-                    }
-                }
-                (ProfileDir::Persistent(canonical.clone()), Some(canonical))
+                let reservation = ProfileReservation::reserve(&self.profiles, &canonical)?;
+                (
+                    ProfileDir::Persistent(canonical.clone()),
+                    Some(canonical),
+                    Some(reservation),
+                )
             }
             None => {
                 let temp =
                     tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
                 let canonical = temp.path().canonicalize().ok();
-                (ProfileDir::Temp(temp), canonical)
+                (ProfileDir::Temp(temp), canonical, None)
             }
         };
         let headless = options.headless;
@@ -2075,6 +2118,7 @@ impl InstanceManager {
             env: user_agent_env(&executable, &inherited_env_keys),
             executable,
             profile_dir: Some(profile_dir.path().to_owned()),
+            persistent: profile_dir.is_persistent(),
             headless: headless.unwrap_or(true),
             close_timeout: Duration::from_secs(10),
             ..Default::default()
@@ -2092,15 +2136,26 @@ impl InstanceManager {
         let transport = PipeTransport::new(launched.command_pipe, launched.response_pipe);
         let conn = Connection::new(Box::new(transport));
         let session = conn.root_session();
-        let browser = Browser::connect(conn, session, BrowserOptions::default())
-            .map_err(|e| format!("bootstrap failed: {}", e.message))?;
+        let browser = Browser::connect(
+            conn,
+            session,
+            BrowserOptions {
+                attach_to_default_context: profile_dir.is_persistent(),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("bootstrap failed: {}", e.message))?;
 
         let version = browser.version().map(|s| s.to_owned());
 
-        // Create a default context.
-        let context = browser
-            .new_context(options.context_options())
-            .map_err(|e| format!("failed to create context: {}", e.message))?;
+        // Persistent profiles store browsing data in Firefox's default context.
+        // Temporary profiles keep using an isolated, remove-on-detach context.
+        let context = if profile_dir.is_persistent() {
+            browser.default_context(options.context_options())
+        } else {
+            browser.new_context(options.context_options())
+        }
+        .map_err(|e| format!("failed to create context: {}", e.message))?;
 
         let closer = Arc::clone(browser.connection());
         let download_log = crate::cli::downloads::DownloadLog::new(
@@ -2116,6 +2171,7 @@ impl InstanceManager {
             version: version.clone(),
             pid,
             profile_dir,
+            profile_reservation,
             profile_dir_path,
             pages: HashMap::new(),
             closed_pages: HashSet::new(),
@@ -2133,6 +2189,9 @@ impl InstanceManager {
             drop(instances);
             let _ = instance.stop();
             return Err("daemon shutting down".into());
+        }
+        if let Some(reservation) = &instance.profile_reservation {
+            reservation.bind(&instance_id);
         }
         instances.insert(
             instance_id.clone(),
@@ -3412,6 +3471,7 @@ mod tests {
             version: None,
             pid: 0,
             profile_dir: ProfileDir::Temp(tempfile::tempdir().unwrap()),
+            profile_reservation: None,
             profile_dir_path: None,
             pages: HashMap::from([(
                 "p1".into(),

@@ -517,12 +517,11 @@ fn json_err_shape_io() {
 }
 
 #[test]
-fn json_err_no_kind_today() {
-    // Before the error-kind task lands, `kind` must be absent.
-    // After it lands, `kind` will be present but that is explicitly allowed.
+fn json_err_shape_allows_additive_kind() {
+    // Error responses allow the additive string `kind` field.
     let resp = DaemonResponse::err("some error");
     let v: Value = serde_json::to_value(&resp).expect("serialize");
-    // `kind` being absent is currently expected; being present (string) is tolerated.
+    // Keep the shape compatible with responses that omit the optional field.
     if let Some(kind) = v.get("kind") {
         assert!(
             kind.is_string(),
@@ -689,6 +688,7 @@ fn ping_nonexistent_socket_parent_json_shape() {
     assert_eq!(out.status.code(), Some(1));
     let v: Value = serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert_error_shape(&v, "socket parent directory does not exist: /nonexistent");
+    assert_eq!(v["kind"], "daemon");
 }
 
 #[test]
@@ -739,6 +739,7 @@ fn ping_daemon_not_running_json_shape() {
     assert_eq!(out.status.code(), Some(1));
     let v: Value = serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert_error_shape(&v, "daemon is not running (start with: camoufox serve)");
+    assert_eq!(v["kind"], "daemon");
 }
 
 // ---------------------------------------------------------------------------

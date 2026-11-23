@@ -136,10 +136,29 @@ fn rendered(manager: &InstanceManager, instance: &str, page: &str) -> Value {
 #[test]
 #[ignore]
 fn cassette_offline_roundtrip_misses_body_matching_and_occurrences() {
+    cassette_offline_roundtrip(false);
+}
+
+#[test]
+#[ignore]
+fn cassette_offline_roundtrip_in_default_context() {
+    cassette_offline_roundtrip(true);
+}
+
+fn cassette_offline_roundtrip(persistent: bool) {
     let fixture = Fixture::start();
     let url = format!("{}/", fixture.origin);
     let dir = tempfile::tempdir().unwrap();
-    let (manager, instance, page) = launch();
+    let profile = tempfile::tempdir().unwrap();
+    let manager = InstanceManager::new();
+    let (instance, _, _) = manager
+        .launch_with(&camoufox::cli::instance::LaunchOptions {
+            headless: Some(true),
+            profile_dir: persistent.then(|| profile.path().display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    let page = manager.new_page(&instance).unwrap();
     manager
         .record_start(&instance, &page, dir.path(), &[])
         .unwrap();

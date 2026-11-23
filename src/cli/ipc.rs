@@ -385,13 +385,16 @@ pub enum DaemonRequest {
     },
 }
 
+const CASSETTE_STOP_TIMEOUT_SECS: u64 = 300;
+
 impl DaemonRequest {
     /// Operation budget, before the client's transport margin.
     pub fn timeout_secs(&self) -> u64 {
         match self {
             Self::Launch { .. } => 180,
-            Self::RecordStop { .. } | Self::ReplayStop { .. } => 300,
-            Self::Shutdown => 20,
+            Self::RecordStop { .. } | Self::ReplayStop { .. } => CASSETTE_STOP_TIMEOUT_SECS,
+            Self::Shutdown => 20 + super::network::FINALIZE_TIMEOUT_SECS,
+            Self::Stop { .. } | Self::CloseTab { .. } => 60 + super::network::FINALIZE_TIMEOUT_SECS,
             Self::Downloads { wait_secs, .. } => wait_secs.unwrap_or(0).saturating_add(10),
             Self::Navigate { timeout_secs, .. }
             | Self::Evaluate { timeout_secs, .. }
@@ -417,11 +420,7 @@ impl DaemonRequest {
     }
 
     pub fn read_timeout(&self) -> std::time::Duration {
-        let seconds = match self {
-            Self::RecordStop { .. } | Self::ReplayStop { .. } => 300,
-            _ => self.timeout_secs().saturating_add(30),
-        };
-        std::time::Duration::from_secs(seconds)
+        std::time::Duration::from_secs(self.timeout_secs().saturating_add(30))
     }
 }
 
@@ -697,7 +696,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(request.timeout_secs(), 300);
-            assert_eq!(request.read_timeout().as_secs(), 300);
+            assert_eq!(request.read_timeout().as_secs(), 330);
         }
     }
 
@@ -738,7 +737,6 @@ mod tests {
         let default_methods = [
             "Ping",
             "List",
-            "Stop",
             "NewPage",
             "Click",
             "Cookies",
@@ -746,7 +744,6 @@ mod tests {
             "Forward",
             "Reload",
             "SetHeader",
-            "CloseTab",
         ];
         for method in default_methods {
             let request: DaemonRequest = serde_json::from_value(if matches!(method, "Ping" | "List" | "Shutdown") {
@@ -756,7 +753,18 @@ mod tests {
             }).unwrap();
             assert_eq!(request.read_timeout().as_secs(), 90, "{method}");
         }
-        assert_eq!(DaemonRequest::Shutdown.read_timeout().as_secs(), 50);
+        assert_eq!(DaemonRequest::Shutdown.read_timeout().as_secs(), 65);
+        for request in [
+            DaemonRequest::Stop {
+                instance_id: "i".into(),
+            },
+            DaemonRequest::CloseTab {
+                instance_id: "i".into(),
+                page_id: "p".into(),
+            },
+        ] {
+            assert_eq!(request.read_timeout().as_secs(), 105);
+        }
         let launch = DaemonRequest::Launch {
             headless: None,
             executable: None,

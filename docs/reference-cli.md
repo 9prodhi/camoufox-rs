@@ -1018,6 +1018,15 @@ publishes `index.json` using a temporary file and rename, and returns:
 {"dir":"/absolute/cassette","exchanges":8,"bodies":6,"skipped":[]}
 ```
 
+Plain stop output is `recorded N exchanges, B bodies: DIR`. Each omitted
+exchange adds a stderr line `skipped: METHOD URL (reason)`. Repeating stop
+returns the last result with `"repeated":true` and prints
+`note: recording was already stopped` on stderr. A failed start clears the
+previous stop result. Instance stop, shutdown, and close-tab allow a total of
+15 seconds to finalize recordings before closing the connection; remaining
+body reads are skipped with reason `finalize deadline exceeded`, and the index
+is still published.
+
 ### `replay`
 
 Serve a page's HTTP requests entirely from a cassette. The original server can
@@ -1034,7 +1043,8 @@ offline behavior, replay rejects cassettes containing redirect responses
 these exchanges remains supported.
 
 Replay validates the format, version, metadata, and every referenced body's
-SHA-256 and length before enabling interception. Invalid cassettes return
+SHA-256 and length before enabling interception. The index must be a regular,
+non-symlink file of at most 64 MiB. Invalid cassettes return
 `invalid argument: ...`. An unsupported format or version returns
 `invalid argument: unsupported cassette format/version` before validating the
 version-specific schema. Body validation streams from disk; bodies are read on
@@ -1048,8 +1058,7 @@ no body (`null`) from an empty body. For `multipart/form-data`, every occurrence
 of the declared boundary is replaced with a fixed token before hashing, so
 identical form submissions match despite randomly generated boundaries. Other
 request bodies are hashed as raw bytes. Replay decodes and hashes request bodies
-only when `--match-body` is enabled. Older v1 multipart hashes can still match
-byte-identical requests. Repeated requests consume responses in
+only when `--match-body` is enabled. Repeated requests consume responses in
 recorded request order; after the final occurrence, that response is reused.
 Matched requests receive the recorded status, headers, and decoded body.
 `Content-Encoding`, `Transfer-Encoding`, and the original `Content-Length` are
@@ -1063,6 +1072,14 @@ all unmatched requests, including those beyond the list limit. Replay disables
 the page's cache while interception is active. Stop first resolves requests
 accepted before its stop boundary, then disables interception and restores caching; later requests
 resume normal network behavior.
+
+Plain stop output is `replayed N requests, M misses`, where M is
+`missed_total` (or the listed entry count for older daemons). Stderr lists
+`missed: METHOD URL`, adding ` (xN)` for repeated misses. If the bounded list
+omits misses, stderr adds `... and N more not listed`. Repeating stop returns
+the last result with `"repeated":true` and prints
+`note: replay was already stopped` on stderr. A failed start clears the
+previous stop result.
 
 Start returns `{"replaying":true,"dir":"/absolute/cassette"}`. Stop returns:
 

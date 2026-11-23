@@ -563,7 +563,12 @@ fn help_contains_all_builtin_subcommands() {
         .expect("run camoufox --help");
 
     // `--help` exits 0.
-    assert_eq!(out.status.code(), Some(0), "--help must exit 0");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--help must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let commands_section = stdout
@@ -626,7 +631,12 @@ fn help_contains_all_builtin_subcommands() {
     .map(String::from)
     .collect();
 
-    assert_eq!(found_subcommands, expected_subcommands);
+    assert_eq!(
+        found_subcommands,
+        expected_subcommands,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -639,7 +649,8 @@ fn mistyped_subcommand_exits_2_with_error_on_stderr() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "mistyped subcommand must exit with code 2"
+        "mistyped subcommand must exit with code 2; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -651,7 +662,8 @@ fn mistyped_subcommand_exits_2_with_error_on_stderr() {
     // Stdout must be empty for a parse error.
     assert!(
         out.stdout.is_empty(),
-        "stdout must be empty for a parse error"
+        "stdout must be empty for a parse error; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -670,8 +682,10 @@ fn mistyped_subcommand_stderr_exact_golden() {
     let expected = "error: unrecognized subcommand 'navgate'\n\n  tip: some similar subcommands exist: 'evaluate', 'navigate'\n\nUsage: camoufox [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n";
 
     assert_eq!(
-        normalised, expected,
-        "stderr golden mismatch for mistyped subcommand"
+        normalised,
+        expected,
+        "stderr golden mismatch for mistyped subcommand; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -687,15 +701,21 @@ fn ping_nonexistent_socket_parent_exits_1_stderr() {
     assert_eq!(
         out.status.code(),
         Some(1),
-        "exit code must be 1 for connection error"
+        "exit code must be 1 for connection error; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         stderr.trim(),
         "error: socket parent directory does not exist: /nonexistent",
-        "stderr golden mismatch for missing socket parent"
+        "stderr golden mismatch for missing socket parent; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert!(out.stdout.is_empty(), "stdout must be empty");
+    assert!(
+        out.stdout.is_empty(),
+        "stdout must be empty; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -705,10 +725,20 @@ fn ping_nonexistent_socket_parent_json_shape() {
         .output()
         .expect("run camoufox --json ping --socket /nonexistent/no.sock");
 
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: Value = serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert_error_shape(&v, "socket parent directory does not exist: /nonexistent");
-    assert_eq!(v["kind"], "daemon");
+    assert_eq!(
+        v["kind"],
+        "daemon",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -731,13 +761,15 @@ fn ping_daemon_not_running_exits_1_stderr() {
     assert_eq!(
         out.status.code(),
         Some(1),
-        "exit code must be 1 when daemon is not running"
+        "exit code must be 1 when daemon is not running; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         stderr.trim(),
         "error: daemon is not running (start with: camoufox serve)",
-        "stderr golden mismatch for daemon-not-running"
+        "stderr golden mismatch for daemon-not-running; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -756,10 +788,20 @@ fn ping_daemon_not_running_json_shape() {
         .output()
         .expect("run camoufox --json ping --socket <missing>");
 
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: Value = serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert_error_shape(&v, "daemon is not running (start with: camoufox serve)");
-    assert_eq!(v["kind"], "daemon");
+    assert_eq!(
+        v["kind"],
+        "daemon",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -771,9 +813,17 @@ fn client_argument_validation_json_golden() {
         (vec!["click", "i", "p1", "invalid", "2"], "X coordinate must be an integer when a Y coordinate is given (got \"invalid\"); for a selector click, omit the Y argument"),
     ] {
         let output = Command::new(bin()).arg("--json").args(args).output().unwrap();
-        assert_eq!(output.status.code(), Some(2), "{output:?}");
-        assert!(output.stderr.is_empty());
-        assert_eq!(String::from_utf8(output.stdout).unwrap(), format!("{{\n  \"ok\": false,\n  \"error\": {},\n  \"kind\": \"invalid_argument\"\n}}\n", serde_json::to_string(message).unwrap()));
+        assert_eq!(output.status.code(),
+Some(2),
+"{output:?}; stderr: {}",
+String::from_utf8_lossy(&output.stderr));
+        assert!(output.stderr.is_empty(),
+"stderr: {}",
+String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout),
+format!("{{\n  \"ok\": false,\n  \"error\": {},\n  \"kind\": \"invalid_argument\"\n}}\n", serde_json::to_string(message).unwrap()),
+"stderr: {}",
+String::from_utf8_lossy(&output.stderr));
     }
 }
 
@@ -785,21 +835,38 @@ fn screenshot_relative_path_with_removed_cwd_is_io_error() {
             args.insert(0, "--json");
         }
         let output = run_in_removed_cwd(&args);
-        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{output:?}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let message = "io error: resolve screenshot path: No such file or directory (os error 2)";
         if json {
-            assert!(output.stderr.is_empty());
+            assert!(
+                output.stderr.is_empty(),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert_eq!(
-                String::from_utf8(output.stdout).unwrap(),
+                String::from_utf8_lossy(&output.stdout),
                 format!(
                     "{{\n  \"ok\": false,\n  \"error\": \"{message}\",\n  \"kind\": \"io\"\n}}\n"
-                )
+                ),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
         } else {
-            assert!(output.stdout.is_empty());
+            assert!(
+                output.stdout.is_empty(),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert_eq!(
-                String::from_utf8(output.stderr).unwrap(),
-                format!("error: {message}\n")
+                String::from_utf8_lossy(&output.stderr),
+                format!("error: {message}\n"),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
         }
     }
@@ -829,8 +896,17 @@ fn upload_relative_path_with_removed_cwd_is_io_error() {
     let upload = ["upload", "i", "p1", "#file", "fixture.pdf"];
 
     let out = run_in_removed_cwd(&[&["--socket", sock][..], &upload].concat());
-    assert_eq!(out.status.code(), Some(1), "{out:?}");
-    assert!(out.stdout.is_empty());
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{out:?}; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.starts_with("error: io error: resolve upload path: "),
@@ -838,13 +914,27 @@ fn upload_relative_path_with_removed_cwd_is_io_error() {
     );
 
     let out = run_in_removed_cwd(&[&["--json", "--socket", sock][..], &upload].concat());
-    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{out:?}; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: Value = serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
-    assert!(v["error"]
-        .as_str()
-        .unwrap()
-        .starts_with("io error: resolve upload path: "));
-    assert_eq!(v["kind"], "io");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("io error: resolve upload path: "),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        v["kind"],
+        "io",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Absolute paths never consult the cwd and reach the (absent) daemon.
     let out = run_in_removed_cwd(&[
@@ -857,7 +947,12 @@ fn upload_relative_path_with_removed_cwd_is_io_error() {
         "#file",
         "/fixture.pdf",
     ]);
-    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{out:?}; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: Value = serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert_error_shape(&v, "daemon is not running (start with: camoufox serve)");
 }
@@ -881,7 +976,8 @@ fn daemon_guard_ignores_ambient_socket() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "{stdout}\n{}",
+        "{stdout}\n{}; stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(stdout.contains("1 passed"), "{stdout}");
@@ -1021,8 +1117,13 @@ impl DaemonGuard {
         let mut full_args = vec!["--json"];
         full_args.extend_from_slice(args);
         let out = self.run(&full_args);
-        serde_json::from_slice(&out.stdout)
-            .unwrap_or_else(|e| panic!("JSON parse failed for {:?}: {e}", args))
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "JSON parse failed for {:?}: {e}; stderr: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
     }
 }
 
@@ -1164,10 +1265,20 @@ fn browser_integration_full_session() {
     assert_eq!(
         stop_second.status.code(),
         Some(0),
-        "stop of second instance must succeed"
+        "stop of second instance must succeed; stderr: {}",
+        String::from_utf8_lossy(&stop_second.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&stop_second.stdout).trim(), "ok");
-    assert!(stop_second.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&stop_second.stdout).trim(),
+        "ok",
+        "stderr: {}",
+        String::from_utf8_lossy(&stop_second.stderr)
+    );
+    assert!(
+        stop_second.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop_second.stderr)
+    );
 
     #[cfg(target_os = "linux")]
     assert!(
@@ -1186,28 +1297,53 @@ fn browser_integration_full_session() {
     // 2. new-page
     // -----------------------------------------------------------------------
     let np_out = daemon.run(&["new-page", &instance_id]);
-    assert_eq!(np_out.status.code(), Some(0), "new-page must exit 0");
+    assert_eq!(
+        np_out.status.code(),
+        Some(0),
+        "new-page must exit 0; stderr: {}",
+        String::from_utf8_lossy(&np_out.stderr)
+    );
     let np_stdout = String::from_utf8_lossy(&np_out.stdout);
     let page_id = np_stdout.trim().to_string();
-    assert!(!page_id.is_empty(), "new-page must print page_id on stdout");
-    assert!(np_out.stderr.is_empty(), "new-page stderr must be empty");
+    assert!(
+        !page_id.is_empty(),
+        "new-page must print page_id on stdout; stderr: {}",
+        String::from_utf8_lossy(&np_out.stderr)
+    );
+    assert!(
+        np_out.stderr.is_empty(),
+        "new-page stderr must be empty; stderr: {}",
+        String::from_utf8_lossy(&np_out.stderr)
+    );
 
     // JSON golden for new-page.
     let np_json = daemon.run_json(&["new-page", &instance_id]);
     assert_eq!(np_json["ok"], true);
-    assert!(np_json["data"]["page_id"].is_string());
+    assert!(
+        np_json["data"]["page_id"].is_string(),
+        "stderr: {}",
+        String::from_utf8_lossy(&np_out.stderr)
+    );
 
     // -----------------------------------------------------------------------
     // 3. navigate to local fixture (plain + JSON)
     // -----------------------------------------------------------------------
     let nav_out = daemon.run(&["navigate", &instance_id, &page_id, &server.url]);
-    assert_eq!(nav_out.status.code(), Some(0), "navigate must exit 0");
-    let nav_stdout = String::from_utf8_lossy(&nav_out.stdout);
-    assert!(
-        nav_stdout.contains("ok (navigation_id:") && nav_stdout.contains("status=200"),
-        "navigate stdout must be 'ok (navigation_id: ...) status=200'; got: {nav_stdout}"
+    assert_eq!(
+        nav_out.status.code(),
+        Some(0),
+        "navigate must exit 0; stderr: {}",
+        String::from_utf8_lossy(&nav_out.stderr)
     );
-    assert!(nav_out.stderr.is_empty(), "navigate stderr must be empty");
+    let nav_stdout = String::from_utf8_lossy(&nav_out.stdout);
+    assert!(nav_stdout.contains("ok (navigation_id:") && nav_stdout.contains("status=200"),
+"navigate stdout must be 'ok (navigation_id: ...) status=200'; got: {nav_stdout}; stderr: {}",
+String::from_utf8_lossy(&nav_out.stderr));
+    assert!(
+        nav_out.stderr.is_empty(),
+        "navigate stderr must be empty; stderr: {}",
+        String::from_utf8_lossy(&nav_out.stderr)
+    );
 
     let nav_json = daemon.run_json(&["navigate", &instance_id, &page_id, &server.url]);
     assert_eq!(nav_json["ok"], true);
@@ -1221,36 +1357,85 @@ fn browser_integration_full_session() {
     // 4. text
     // -----------------------------------------------------------------------
     let text_out = daemon.run(&["text", &instance_id, &page_id]);
-    assert_eq!(text_out.status.code(), Some(0), "text must exit 0");
+    assert_eq!(
+        text_out.status.code(),
+        Some(0),
+        "text must exit 0; stderr: {}",
+        String::from_utf8_lossy(&text_out.stderr)
+    );
     let text_str = String::from_utf8_lossy(&text_out.stdout);
     assert!(
         text_str.contains("Regression Fixture"),
-        "text must contain page content; got: {text_str}"
+        "text must contain page content; got: {text_str}; stderr: {}",
+        String::from_utf8_lossy(&text_out.stderr)
     );
     assert!(
         text_str.contains("Hello from fixture."),
-        "text must contain fixture paragraph; got: {text_str}"
+        "text must contain fixture paragraph; got: {text_str}; stderr: {}",
+        String::from_utf8_lossy(&text_out.stderr)
     );
-    assert!(!text_str.contains('<'), "text must not contain HTML markup");
-    assert!(text_out.stderr.is_empty(), "text stderr must be empty");
+    assert!(
+        !text_str.contains('<'),
+        "text must not contain HTML markup; stderr: {}",
+        String::from_utf8_lossy(&text_out.stderr)
+    );
+    assert!(
+        text_out.stderr.is_empty(),
+        "text stderr must be empty; stderr: {}",
+        String::from_utf8_lossy(&text_out.stderr)
+    );
 
     let text_json = daemon.run_json(&["text", &instance_id, &page_id]);
     assert_eq!(text_json["ok"], true);
-    assert_eq!(text_json["data"]["text"], text_str.trim_end());
+    assert_eq!(
+        text_json["data"]["text"],
+        text_str.trim_end(),
+        "stderr: {}",
+        String::from_utf8_lossy(&text_out.stderr)
+    );
 
     // -----------------------------------------------------------------------
     // 5. fill
     // -----------------------------------------------------------------------
     let fill_out = daemon.run(&["fill", &instance_id, &page_id, "#inp", "test value"]);
-    assert_eq!(fill_out.status.code(), Some(0), "fill must exit 0");
+    assert_eq!(
+        fill_out.status.code(),
+        Some(0),
+        "fill must exit 0; stderr: {}",
+        String::from_utf8_lossy(&fill_out.stderr)
+    );
     let fill_stdout = String::from_utf8_lossy(&fill_out.stdout);
     let fill_parsed: Value =
         serde_json::from_str(&fill_stdout).expect("fill plain output must be JSON pretty-print");
-    assert_eq!(fill_parsed["filled"], true);
-    assert_eq!(fill_parsed["selector"], "#inp");
-    assert_eq!(fill_parsed["tag"], "input");
-    assert_eq!(fill_parsed["value"], "test value");
-    assert!(fill_out.stderr.is_empty(), "fill stderr must be empty");
+    assert_eq!(
+        fill_parsed["filled"],
+        true,
+        "stderr: {}",
+        String::from_utf8_lossy(&fill_out.stderr)
+    );
+    assert_eq!(
+        fill_parsed["selector"],
+        "#inp",
+        "stderr: {}",
+        String::from_utf8_lossy(&fill_out.stderr)
+    );
+    assert_eq!(
+        fill_parsed["tag"],
+        "input",
+        "stderr: {}",
+        String::from_utf8_lossy(&fill_out.stderr)
+    );
+    assert_eq!(
+        fill_parsed["value"],
+        "test value",
+        "stderr: {}",
+        String::from_utf8_lossy(&fill_out.stderr)
+    );
+    assert!(
+        fill_out.stderr.is_empty(),
+        "fill stderr must be empty; stderr: {}",
+        String::from_utf8_lossy(&fill_out.stderr)
+    );
 
     let fill_json = daemon.run_json(&["fill", &instance_id, &page_id, "#inp", "test value"]);
     assert_eq!(fill_json["ok"], true);
@@ -1263,15 +1448,44 @@ fn browser_integration_full_session() {
     // 6. select
     // -----------------------------------------------------------------------
     let sel_out = daemon.run(&["select", &instance_id, &page_id, "#sel", "b"]);
-    assert_eq!(sel_out.status.code(), Some(0), "select must exit 0");
+    assert_eq!(
+        sel_out.status.code(),
+        Some(0),
+        "select must exit 0; stderr: {}",
+        String::from_utf8_lossy(&sel_out.stderr)
+    );
     let sel_stdout = String::from_utf8_lossy(&sel_out.stdout);
     let sel_parsed: Value =
         serde_json::from_str(&sel_stdout).expect("select plain output must be JSON pretty-print");
-    assert_eq!(sel_parsed["selected"], true);
-    assert_eq!(sel_parsed["selector"], "#sel");
-    assert_eq!(sel_parsed["option_value"], "b");
-    assert_eq!(sel_parsed["option_text"], "Beta");
-    assert!(sel_out.stderr.is_empty(), "select stderr must be empty");
+    assert_eq!(
+        sel_parsed["selected"],
+        true,
+        "stderr: {}",
+        String::from_utf8_lossy(&sel_out.stderr)
+    );
+    assert_eq!(
+        sel_parsed["selector"],
+        "#sel",
+        "stderr: {}",
+        String::from_utf8_lossy(&sel_out.stderr)
+    );
+    assert_eq!(
+        sel_parsed["option_value"],
+        "b",
+        "stderr: {}",
+        String::from_utf8_lossy(&sel_out.stderr)
+    );
+    assert_eq!(
+        sel_parsed["option_text"],
+        "Beta",
+        "stderr: {}",
+        String::from_utf8_lossy(&sel_out.stderr)
+    );
+    assert!(
+        sel_out.stderr.is_empty(),
+        "select stderr must be empty; stderr: {}",
+        String::from_utf8_lossy(&sel_out.stderr)
+    );
 
     let sel_json = daemon.run_json(&["select", &instance_id, &page_id, "#sel", "b"]);
     assert_eq!(sel_json["ok"], true);
@@ -1284,15 +1498,42 @@ fn browser_integration_full_session() {
     // 7. click (by selector)
     // -----------------------------------------------------------------------
     let click_out = daemon.run(&["click", &instance_id, &page_id, "#btn"]);
-    assert_eq!(click_out.status.code(), Some(0), "click must exit 0");
+    assert_eq!(
+        click_out.status.code(),
+        Some(0),
+        "click must exit 0; stderr: {}",
+        String::from_utf8_lossy(&click_out.stderr)
+    );
     let click_stdout = String::from_utf8_lossy(&click_out.stdout);
     let click_parsed: Value =
         serde_json::from_str(&click_stdout).expect("click plain output must be JSON pretty-print");
-    assert_eq!(click_parsed["clicked"], true);
-    assert_eq!(click_parsed["selector"], "#btn");
-    assert!(click_parsed["x"].is_number());
-    assert!(click_parsed["y"].is_number());
-    assert!(click_out.stderr.is_empty(), "click stderr must be empty");
+    assert_eq!(
+        click_parsed["clicked"],
+        true,
+        "stderr: {}",
+        String::from_utf8_lossy(&click_out.stderr)
+    );
+    assert_eq!(
+        click_parsed["selector"],
+        "#btn",
+        "stderr: {}",
+        String::from_utf8_lossy(&click_out.stderr)
+    );
+    assert!(
+        click_parsed["x"].is_number(),
+        "stderr: {}",
+        String::from_utf8_lossy(&click_out.stderr)
+    );
+    assert!(
+        click_parsed["y"].is_number(),
+        "stderr: {}",
+        String::from_utf8_lossy(&click_out.stderr)
+    );
+    assert!(
+        click_out.stderr.is_empty(),
+        "click stderr must be empty; stderr: {}",
+        String::from_utf8_lossy(&click_out.stderr)
+    );
 
     let click_json = daemon.run_json(&["click", &instance_id, &page_id, "#btn"]);
     assert_eq!(click_json["ok"], true);
@@ -1305,14 +1546,24 @@ fn browser_integration_full_session() {
     // 8. evaluate — string result
     // -----------------------------------------------------------------------
     let eval_out = daemon.run(&["evaluate", &instance_id, &page_id, "document.title"]);
-    assert_eq!(eval_out.status.code(), Some(0), "evaluate must exit 0");
+    assert_eq!(
+        eval_out.status.code(),
+        Some(0),
+        "evaluate must exit 0; stderr: {}",
+        String::from_utf8_lossy(&eval_out.stderr)
+    );
     let eval_str = String::from_utf8_lossy(&eval_out.stdout);
     assert_eq!(
         eval_str.trim(),
         "Regression Fixture",
-        "evaluate string result must be unquoted"
+        "evaluate string result must be unquoted; stderr: {}",
+        String::from_utf8_lossy(&eval_out.stderr)
     );
-    assert!(eval_out.stderr.is_empty(), "evaluate stderr must be empty");
+    assert!(
+        eval_out.stderr.is_empty(),
+        "evaluate stderr must be empty; stderr: {}",
+        String::from_utf8_lossy(&eval_out.stderr)
+    );
 
     let eval_json = daemon.run_json(&["evaluate", &instance_id, &page_id, "document.title"]);
     assert_eq!(eval_json["ok"], true);
@@ -1327,10 +1578,16 @@ fn browser_integration_full_session() {
         &page_id,
         "(() => { throw new Error('boom'); })()",
     ]);
-    assert_eq!(err_out.status.code(), Some(1), "evaluate error must exit 1");
+    assert_eq!(
+        err_out.status.code(),
+        Some(1),
+        "evaluate error must exit 1; stderr: {}",
+        String::from_utf8_lossy(&err_out.stderr)
+    );
     assert!(
         err_out.stdout.is_empty(),
-        "stdout must be empty on evaluate error"
+        "stdout must be empty on evaluate error; stderr: {}",
+        String::from_utf8_lossy(&err_out.stderr)
     );
     let err_stderr = String::from_utf8_lossy(&err_out.stderr);
     assert!(
@@ -1357,9 +1614,23 @@ fn browser_integration_full_session() {
     // 10. Stop the instance and verify it disappears from list and profile dir is removed.
     // -----------------------------------------------------------------------
     let stop_out = daemon.run(&["stop", &instance_id]);
-    assert_eq!(stop_out.status.code(), Some(0), "stop must exit 0");
-    assert_eq!(String::from_utf8_lossy(&stop_out.stdout).trim(), "ok");
-    assert!(stop_out.stderr.is_empty(), "stop stderr must be empty");
+    assert_eq!(
+        stop_out.status.code(),
+        Some(0),
+        "stop must exit 0; stderr: {}",
+        String::from_utf8_lossy(&stop_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&stop_out.stdout).trim(),
+        "ok",
+        "stderr: {}",
+        String::from_utf8_lossy(&stop_out.stderr)
+    );
+    assert!(
+        stop_out.stderr.is_empty(),
+        "stop stderr must be empty; stderr: {}",
+        String::from_utf8_lossy(&stop_out.stderr)
+    );
 
     let list_json = daemon.run_json(&["list"]);
     assert_eq!(list_json["ok"], true);
@@ -1496,7 +1767,12 @@ fn browser_integration_interception_off_by_default() {
     let page_id = np_json["data"]["page_id"].as_str().unwrap().to_string();
 
     let nav_out = daemon.run(&["navigate", &instance_id, &page_id, &server.url]);
-    assert_eq!(nav_out.status.code(), Some(0));
+    assert_eq!(
+        nav_out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&nav_out.stderr)
+    );
 
     let log = daemon.log_content();
     assert!(
@@ -1556,7 +1832,11 @@ fn browser_cli_launch_profile_dir_is_listed_and_survives_stop() {
     let listed = daemon.run_json(&["list"]);
     assert_eq!(listed["data"]["instances"][0]["profile_dir"], canonical);
     let plain = daemon.run(&["list"]);
-    assert!(plain.status.success());
+    assert!(
+        plain.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
     let stdout = String::from_utf8_lossy(&plain.stdout);
     assert!(
         stdout.starts_with(&instance)
@@ -1577,7 +1857,11 @@ fn browser_cli_launch_profile_dir_is_listed_and_survives_stop() {
     assert_eq!(second["kind"], "invalid_argument");
 
     let stopped = daemon.run(&["stop", &instance]);
-    assert!(stopped.status.success(), "{stopped:?}");
+    assert!(
+        stopped.status.success(),
+        "{stopped:?}; stderr: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
     assert_eq!(daemon.run_json(&["list"])["data"]["instances"], json!([]));
     assert!(
         profile.join("prefs.js").is_file(),

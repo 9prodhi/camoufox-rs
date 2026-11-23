@@ -237,13 +237,11 @@ fn spawn_inner(config: &LaunchConfig) -> Result<LaunchedProcess, ProcessError> {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::os::unix::fs::PermissionsExt;
 
     fn script(source: &str) -> (tempfile::TempDir, LaunchConfig) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("browser.sh");
-        std::fs::write(&path, format!("#!/bin/sh\n{source}\n")).expect("write script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        crate::test_script::write_script(&path, &format!("#!/bin/sh\n{source}\n"), 0o700);
         let config = LaunchConfig {
             executable: path,
             profile_dir: Some(dir.path().to_owned()),

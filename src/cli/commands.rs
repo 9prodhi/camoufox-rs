@@ -587,7 +587,6 @@ mod tests {
 
     #[test]
     fn find_external_subcommand_rejects_empty_and_separators() {
-        use std::os::unix::fs::PermissionsExt;
         // Isolate PATH in a child test process so parallel tests keep their
         // environment. Both separator names lead to real executables if the
         // lookup guard is removed.
@@ -606,8 +605,11 @@ mod tests {
         for name in ["camoufox-foo/bar", "camoufox-../cmd"] {
             let path = dir.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, "#!/bin/sh\necho SEPARATOR_EXECUTED\nexit 42\n").unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_script::write_script(
+                &path,
+                "#!/bin/sh\necho SEPARATOR_EXECUTED\nexit 42\n",
+                0o755,
+            );
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .env("PATH", dir.path())
@@ -620,11 +622,16 @@ mod tests {
             .unwrap();
         assert!(
             output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stdout)
+            "stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("1 passed"), "{stdout}");
+        assert!(
+            stdout.contains("1 passed"),
+            "{stdout}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 

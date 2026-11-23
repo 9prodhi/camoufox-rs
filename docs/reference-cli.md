@@ -1161,6 +1161,6 @@ If found, `camoufox` executes the binary with the remaining arguments, inheritin
 
 The exit code mirrors the child process exit code (or `128 + signal` if terminated by a signal on Unix).
 
-Only absolute `PATH` entries are searched; relative and empty entries are skipped.
+Only absolute `PATH` entries are searched; relative and empty entries are skipped. On Unix, a `Text file busy` spawn failure is retried up to five total attempts, with 10, 20, 30, and 40 ms delays. Other spawn failures are reported immediately.
 
 Built-in command names always win over external binaries. Subcommand names containing path separators (such as `/`) are rejected as unrecognized subcommands. If no matching executable is found on `PATH`, `camoufox` exits with status 2 and clap's standard unrecognized subcommand error.

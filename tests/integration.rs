@@ -22,6 +22,87 @@ use camoufox::transport::pipe::PipeTransport;
 
 mod fixtures;
 
+/// Exercise both output modes through the real CLI and a private daemon socket.
+#[cfg(feature = "cli")]
+#[test]
+#[ignore]
+fn cli_error_kind_missing_selector_preserves_plain_stderr() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct PrivateDaemon {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+    }
+    impl Drop for PrivateDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let result = thread.join();
+                if !std::thread::panicking() {
+                    result.unwrap().unwrap();
+                }
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let server = fixtures::ClickServer::start();
+    let manager = Arc::new(InstanceManager::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let _daemon = PrivateDaemon {
+        stop: Arc::clone(&stop),
+        thread: Some(std::thread::spawn({
+            let manager = Arc::clone(&manager);
+            let socket = socket.clone();
+            move || camoufox::cli::daemon::serve(&socket, manager, stop)
+        })),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "private daemon did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (instance, _, _) = manager.launch_with(&LaunchOptions::default()).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &server.url,
+            Duration::from_secs(30),
+            Some("load"),
+        )
+        .unwrap();
+
+    let run = |json_mode: bool| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_camoufox"));
+        command.arg("--socket").arg(&socket);
+        if json_mode {
+            command.arg("--json");
+        }
+        command.args(["click", &instance, &page, "#missing", "--timeout", "5"]);
+        command.output().unwrap()
+    };
+    let json = run(true);
+    assert_eq!(json.status.code(), Some(1));
+    assert!(json.stderr.is_empty(), "{:?}", json.stderr);
+    let response: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["kind"], "selector_not_found");
+    assert_eq!(response["error"], "selector not found: #missing");
+    assert!(response.get("data").is_none());
+
+    let plain = run(false);
+    assert_eq!(plain.status.code(), Some(1));
+    assert!(plain.stdout.is_empty());
+    assert_eq!(plain.stderr, b"error: selector not found: #missing\n");
+}
+
 /// Resolved the same way as the daemon: see [`camoufox::config::default_executable`].
 fn camoufox_bin() -> String {
     camoufox::config::default_executable()

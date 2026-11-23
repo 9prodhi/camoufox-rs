@@ -34,11 +34,40 @@ On daemon or execution errors, the envelope returns:
 ```json
 {
   "ok": false,
-  "error": "error description"
+  "error": "error description",
+  "kind": "other"
 }
 ```
 
 and the process exits with code `1`. Client-side argument validation errors exit with code `2`.
+
+Every daemon error includes a stable, machine-readable `kind` after `error`,
+with no `data` field. Branch on `kind` instead of parsing the human-readable
+`error` message. Messages are preserved verbatim; plain mode still prints
+`error: <message>` on stderr. Successful responses omit `kind`. Clients can
+also read responses from older daemons that omit `kind`.
+
+| Kind | Meaning |
+|---|---|
+| `selector_not_found` | No element matches the requested selector. |
+| `timeout` | An operation exceeded its deadline. |
+| `dialog_open` | A JavaScript dialog is blocking the operation. |
+| `frame_detached` | A scoped frame was detached. |
+| `frame_not_found` | No element matches a frame selector. |
+| `not_iframe` | A frame selector matched an element other than an iframe. |
+| `shadow_root` | A selector cannot access an open shadow root. |
+| `navigation` | Navigation failed or was diverted into a download. |
+| `instance_not_found` | The requested browser instance does not exist. |
+| `page_not_found` | The requested page does not exist. |
+| `invalid_argument` | An argument is invalid. |
+| `io` | A filesystem or I/O operation failed. |
+| `daemon` | The daemon rejected the request or is shutting down. |
+| `other` | The error does not match a known category. |
+
+Classification recognizes established message prefixes and frame/operation
+wrappers. Specific causes take precedence: a navigation timeout has kind
+`timeout`. Unrecognized errors, including arbitrary page script exceptions,
+use `other`.
 
 Commands that return a void result (such as `stop` and `shutdown`) return `{"ok": true}` with no `data` field. For commands that produce output data, the "JSON output shape" blocks documented below represent the inner payload of this `data` field.
 

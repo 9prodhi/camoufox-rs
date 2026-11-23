@@ -2,6 +2,7 @@ pub mod client;
 pub mod commands;
 pub mod daemon;
 pub mod downloads;
+pub mod error_kind;
 pub mod instance;
 pub mod ipc;
 pub mod output;

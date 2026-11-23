@@ -468,6 +468,27 @@ mod tests {
     }
 
     #[test]
+    fn invalid_request_has_daemon_kind() {
+        let daemon = TestDaemon::start();
+        let mut stream = UnixStream::connect(&daemon.path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"{\n").unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["kind"], "daemon");
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid request: "));
+        assert!(response.get("data").is_none());
+        assert!(daemon.request(DaemonRequest::Ping).ok);
+    }
+
+    #[test]
     fn shutdown_text_does_not_stop_daemon() {
         let daemon = TestDaemon::start();
         assert!(
@@ -491,6 +512,7 @@ mod tests {
         manager.begin_shutdown();
         let response = dispatch_guarded(DaemonRequest::List, &manager);
         assert!(!response.ok);
+        assert_eq!(serde_json::to_value(&response).unwrap()["kind"], "daemon");
         assert!(format!("{response:?}").contains("daemon shutting down"));
     }
 
@@ -550,6 +572,7 @@ mod tests {
         BufReader::new(stream).read_line(&mut line).unwrap();
         let response: DaemonResponse = serde_json::from_str(&line).unwrap();
         assert!(!response.ok);
+        assert_eq!(serde_json::to_value(&response).unwrap()["kind"], "daemon");
         assert!(response.error.unwrap().contains("too large"));
         assert!(daemon.request(DaemonRequest::Ping).ok);
     }

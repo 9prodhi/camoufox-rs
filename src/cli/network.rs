@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
@@ -15,29 +16,34 @@ use crate::protocol::EventMessage;
 
 use super::cassette::{self, Exchange, Matcher, Recorder};
 
+/// Total body-drain budget for instance and page cleanup.
+pub(crate) const FINALIZE_TIMEOUT_SECS: u64 = 15;
+const MAX_REPLAY_MISSES: usize = 1000;
+
+type Deadline = Arc<Mutex<Option<Instant>>>;
+
 /// Owns one page's recording or replay subscription and worker.
 pub(crate) struct NetworkSession {
     recording: bool,
+    finalize_deadline: Deadline,
     sender: Arc<Mutex<Option<mpsc::Sender<EventMessage>>>>,
     guard: Option<SubscriptionGuard>,
     worker: Option<JoinHandle<Result<Value, String>>>,
 }
 
 impl NetworkSession {
-    fn record(
-        page: Arc<MainFrame>,
-        connection: Arc<Connection>,
-        recorder: Recorder,
-    ) -> Result<Self, String> {
-        Self::spawn(page, connection, Mode::Record(recorder))
-    }
-
     fn replay(
         page: Arc<MainFrame>,
         connection: Arc<Connection>,
         replay: Replay,
+        deadline: Deadline,
     ) -> Result<Self, String> {
-        let session = Self::spawn(Arc::clone(&page), connection, Mode::Replay(replay))?;
+        let session = Self::spawn(
+            Arc::clone(&page),
+            connection,
+            Mode::Replay(replay),
+            deadline,
+        )?;
         if let Err(e) = page.set_request_interception(true) {
             let _ = page.set_request_interception(false);
             return Err(e.message);
@@ -49,6 +55,7 @@ impl NetworkSession {
         page: Arc<MainFrame>,
         connection: Arc<Connection>,
         mode: Mode,
+        finalize_deadline: Deadline,
     ) -> Result<Self, String> {
         let recording = matches!(mode, Mode::Record(_));
         let filters = match &mode {
@@ -60,12 +67,14 @@ impl NetworkSession {
         let key = page.session().key().to_owned();
         let id = connection.on_event_any(&key, event_callback(filters, Arc::clone(&sender)));
         let guard = SubscriptionGuard::session(connection, &key, "*", id);
+        let worker_deadline = Arc::clone(&finalize_deadline);
         let worker = std::thread::Builder::new()
             .name("camoufox-cassette".into())
-            .spawn(move || run(page, mode, rx))
+            .spawn(move || run(page, mode, rx, worker_deadline))
             .map_err(|e| format!("io error: starting network worker: {e}"))?;
         Ok(Self {
             recording,
+            finalize_deadline,
             sender,
             guard: Some(guard),
             worker: Some(worker),
@@ -109,9 +118,6 @@ pub(super) struct Replay {
     matcher: Matcher,
     match_body: bool,
     bodies: cassette::Bodies,
-    // Encoded lazily with a 16 MiB target; one larger body can exceed it.
-    encoded: HashMap<String, String>,
-    encoded_bytes: usize,
     served: u64,
     missed: Vec<Value>,
     missed_keys: HashMap<(String, String), usize>,
@@ -131,8 +137,6 @@ impl Replay {
             matcher: Matcher::new(index.exchanges, match_body),
             match_body,
             bodies,
-            encoded: HashMap::new(),
-            encoded_bytes: 0,
             served: 0,
             missed: Vec::new(),
             missed_keys: HashMap::new(),
@@ -140,20 +144,9 @@ impl Replay {
         })
     }
 
-    fn body(&mut self, hash: &str) -> Result<&str, String> {
-        // Revalidate even cache hits: mutation must never serve different data.
-        let bytes = self.bodies[hash].read(hash)?;
-        if !self.encoded.contains_key(hash) {
-            let encoded = STANDARD.encode(bytes);
-            const CACHE_BYTES: usize = 16 * 1024 * 1024;
-            if self.encoded_bytes.saturating_add(encoded.len()) > CACHE_BYTES {
-                self.encoded.clear();
-                self.encoded_bytes = 0;
-            }
-            self.encoded_bytes += encoded.len();
-            self.encoded.insert(hash.into(), encoded);
-        }
-        Ok(&self.encoded[hash])
+    fn body(&self, hash: &str) -> Result<String, String> {
+        // Read and revalidate on every fulfillment, including repeated matches.
+        Ok(STANDARD.encode(self.bodies[hash].read(hash)?))
     }
 
     fn miss(&mut self, method: &str, url: &str) {
@@ -162,7 +155,7 @@ impl Replay {
         if let Some(&i) = self.missed_keys.get(&key) {
             let count = self.missed[i]["count"].as_u64().unwrap() + 1;
             self.missed[i]["count"] = json!(count);
-        } else if self.missed.len() < 1000 {
+        } else if self.missed.len() < MAX_REPLAY_MISSES {
             self.missed_keys.insert(key, self.missed.len());
             self.missed
                 .push(json!({"method":method, "url":url, "count":1}));
@@ -232,10 +225,6 @@ enum Mode {
 }
 
 fn request_body(params: &Value) -> Result<Option<String>, String> {
-    request_body_hash(params, true)
-}
-
-fn request_body_hash(params: &Value, normalize: bool) -> Result<Option<String>, String> {
     let body = match params.get("postData") {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::String(body)) => body,
@@ -245,13 +234,7 @@ fn request_body_hash(params: &Value, normalize: bool) -> Result<Option<String>, 
     };
     STANDARD
         .decode(body)
-        .map(|raw| {
-            Some(cassette::sha256(&if normalize {
-                normalize_multipart(params, raw)
-            } else {
-                raw
-            }))
-        })
+        .map(|raw| Some(cassette::sha256(&normalize_multipart(params, raw))))
         .map_err(|e| format!("io error: invalid network request body: {e}"))
 }
 
@@ -303,166 +286,200 @@ fn normalize_multipart(params: &Value, raw: Vec<u8>) -> Vec<u8> {
     normalized
 }
 
+fn handle_replay_event(
+    page: &MainFrame,
+    replay: &mut Replay,
+    event: &EventMessage,
+) -> Result<(), String> {
+    let p = &event.params;
+    let Some(id) = p["requestId"].as_str() else {
+        return Ok(());
+    };
+    if event.method != "Network.requestWillBeSent" || p["isIntercepted"] != true {
+        return Ok(());
+    }
+    let method = p["method"].as_str().unwrap_or("");
+    let url = p["url"].as_str().unwrap_or("");
+    let body = if replay.match_body {
+        request_body(p)
+    } else {
+        Ok(None)
+    };
+    let matched = body
+        .ok()
+        .and_then(|body| replay.matcher.take(method, url, body.as_deref()));
+    if let Some(exchange) = matched {
+        let body = match replay.body(&exchange.body_sha256) {
+            Ok(body) => body,
+            Err(e) => {
+                page.abort_intercepted_request(id, "blockedbyclient");
+                return Err(e);
+            }
+        };
+        let headers = cassette::replay_headers(&exchange.headers, exchange.body_len);
+        let borrowed: Vec<_> = headers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
+        page.fulfill_intercepted_request(id, exchange.status, "", &borrowed, &body);
+        replay.served += 1;
+    } else {
+        page.abort_intercepted_request(id, "blockedbyclient");
+        replay.miss(method, url);
+    }
+    Ok(())
+}
+
+fn deadline_exceeded(deadline: &Mutex<Option<Instant>>) -> bool {
+    deadline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+#[derive(Default)]
+struct RecordEvents {
+    pending: HashMap<String, Exchange>,
+    next_seq: u64,
+}
+
+fn handle_record_event(
+    page: &MainFrame,
+    recorder: &mut Recorder,
+    events: &mut RecordEvents,
+    event: &EventMessage,
+    deadline: &Mutex<Option<Instant>>,
+) -> Result<(), String> {
+    let p = &event.params;
+    let Some(id) = p["requestId"].as_str() else {
+        return Ok(());
+    };
+    // Recording never enables interception or changes requests/cache.
+    // All frame traffic shares this page session in Juggler.
+    match event.method.as_str() {
+        "Network.requestWillBeSent" => {
+            let body = request_body(p)?;
+            events.pending.insert(
+                id.into(),
+                Exchange {
+                    seq: events.next_seq,
+                    method: p["method"].as_str().unwrap_or("").into(),
+                    url: p["url"].as_str().unwrap_or("").into(),
+                    request_body_sha256: body,
+                    status: 0,
+                    headers: Vec::new(),
+                    body_sha256: String::new(),
+                    body_len: 0,
+                },
+            );
+            events.next_seq += 1;
+        }
+        "Network.responseReceived" => {
+            if let Some(exchange) = events.pending.get_mut(id) {
+                exchange.status = p["status"].as_u64().unwrap_or(0) as u16;
+                let headers = p["headers"]
+                    .as_array()
+                    .map(|headers| {
+                        headers
+                            .iter()
+                            .filter_map(|h| {
+                                Some((h["name"].as_str()?.into(), h["value"].as_str()?.into()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                exchange.headers = cassette::scrub_headers(headers);
+            }
+        }
+        "Network.requestFinished" => {
+            if let Some(mut exchange) = events.pending.remove(id) {
+                if exchange.status == 0 {
+                    return Ok(());
+                }
+                if deadline_exceeded(deadline) {
+                    recorder.skip(&exchange, "finalize deadline exceeded".into());
+                    return Ok(());
+                }
+                let response = page.get_response_body(id);
+                // The watchdog closes the connection to interrupt an in-flight
+                // read; queued body reads then skip without protocol calls.
+                if deadline_exceeded(deadline) {
+                    recorder.skip(&exchange, "finalize deadline exceeded".into());
+                    return Ok(());
+                }
+                let response = response.or_else(|e| {
+                    if exchange.redirects() {
+                        Ok((Vec::new(), false))
+                    } else {
+                        Err(e)
+                    }
+                });
+                let body = match response {
+                    Ok((body, false)) => body,
+                    Ok((_, true)) => {
+                        recorder.skip(
+                            &exchange,
+                            "response body was evicted during recording".into(),
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        recorder.skip(
+                            &exchange,
+                            format!(
+                                "reading response body (status {}): {}",
+                                exchange.status, e.message
+                            ),
+                        );
+                        return Ok(());
+                    }
+                };
+                exchange.body_sha256 = cassette::sha256(&body);
+                exchange.body_len = body.len() as u64;
+                recorder.store(exchange, &body)?;
+            }
+        }
+        "Network.requestFailed" => {
+            events.pending.remove(id);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn run(
     page: Arc<MainFrame>,
     mut mode: Mode,
     rx: mpsc::Receiver<EventMessage>,
+    deadline: Arc<Mutex<Option<Instant>>>,
 ) -> Result<Value, String> {
-    let mut pending: HashMap<String, Exchange> = HashMap::new();
-    let mut next_seq = 0;
+    let mut events = RecordEvents::default();
     let mut error = None;
     while let Ok(event) = rx.recv() {
-        let p = &event.params;
-        let Some(id) = p["requestId"].as_str() else {
-            continue;
-        };
-        match &mut mode {
-            Mode::Replay(replay) => {
-                if event.method != "Network.requestWillBeSent" || p["isIntercepted"] != true {
-                    continue;
-                }
-                let method = p["method"].as_str().unwrap_or("");
-                let url = p["url"].as_str().unwrap_or("");
-                let body = if replay.match_body {
-                    request_body(p)
-                } else {
-                    Ok(None)
-                };
-                let matched = body.ok().and_then(|body| {
-                    replay
-                        .matcher
-                        .take(method, url, body.as_deref())
-                        .or_else(|| {
-                            // Pre-normalization v1 cassettes stored raw multipart hashes.
-                            if replay.match_body && multipart_boundary(p).is_some() {
-                                let legacy = request_body_hash(p, false).ok()?;
-                                replay.matcher.take(method, url, legacy.as_deref())
-                            } else {
-                                None
-                            }
-                        })
-                });
-                if let Some(exchange) = matched {
-                    let body = match replay.body(&exchange.body_sha256) {
-                        Ok(body) => body,
-                        Err(e) => {
-                            page.abort_intercepted_request(id, "blockedbyclient");
-                            error.get_or_insert(e);
-                            continue;
-                        }
-                    };
-                    let headers = cassette::replay_headers(&exchange.headers, exchange.body_len);
-                    let borrowed: Vec<_> = headers
-                        .iter()
-                        .map(|(n, v)| (n.as_str(), v.as_str()))
-                        .collect();
-                    page.fulfill_intercepted_request(id, exchange.status, "", &borrowed, body);
-                    replay.served += 1;
-                } else {
-                    page.abort_intercepted_request(id, "blockedbyclient");
-                    replay.miss(method, url);
-                }
-            }
+        let result = match &mut mode {
+            Mode::Replay(replay) => handle_replay_event(&page, replay, &event),
             Mode::Record(recorder) => {
-                // Recording never enables interception or changes requests/cache.
-                // All frame traffic shares this page session in Juggler.
-                match event.method.as_str() {
-                    "Network.requestWillBeSent" => {
-                        let url = p["url"].as_str().unwrap_or("");
-                        let body = match request_body(p) {
-                            Ok(body) => body,
-                            Err(e) => {
-                                error.get_or_insert(e);
-                                continue;
-                            }
-                        };
-                        pending.insert(
-                            id.into(),
-                            Exchange {
-                                seq: next_seq,
-                                method: p["method"].as_str().unwrap_or("").into(),
-                                url: url.into(),
-                                request_body_sha256: body,
-                                status: 0,
-                                headers: Vec::new(),
-                                body_sha256: String::new(),
-                                body_len: 0,
-                            },
-                        );
-                        next_seq += 1;
-                    }
-                    "Network.responseReceived" => {
-                        if let Some(exchange) = pending.get_mut(id) {
-                            exchange.status = p["status"].as_u64().unwrap_or(0) as u16;
-                            let headers = p["headers"]
-                                .as_array()
-                                .map(|h| {
-                                    h.iter()
-                                        .filter_map(|h| {
-                                            Some((
-                                                h["name"].as_str()?.into(),
-                                                h["value"].as_str()?.into(),
-                                            ))
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            exchange.headers = cassette::scrub_headers(headers);
-                        }
-                    }
-                    "Network.requestFinished" => {
-                        if let Some(mut exchange) = pending.remove(id) {
-                            if exchange.status == 0 {
-                                continue;
-                            }
-                            let response = page.get_response_body(id).or_else(|e| {
-                                // Juggler removes redirected requests before body reads.
-                                if exchange.redirects() {
-                                    Ok((Vec::new(), false))
-                                } else {
-                                    Err(e)
-                                }
-                            });
-                            let body = match response {
-                                Ok((body, false)) => body,
-                                Ok((_, true)) => {
-                                    recorder.skip(
-                                        &exchange,
-                                        "response body was evicted during recording".into(),
-                                    );
-                                    continue;
-                                }
-                                Err(e) => {
-                                    recorder.skip(
-                                        &exchange,
-                                        format!(
-                                            "reading response body (status {}): {}",
-                                            exchange.status, e.message
-                                        ),
-                                    );
-                                    continue;
-                                }
-                            };
-                            exchange.body_sha256 = cassette::sha256(&body);
-                            exchange.body_len = body.len() as u64;
-                            if let Err(e) = recorder.store(exchange, &body) {
-                                error.get_or_insert(e);
-                            }
-                        }
-                    }
-                    "Network.requestFailed" => {
-                        pending.remove(id);
-                    }
-                    _ => {}
-                }
+                handle_record_event(&page, recorder, &mut events, &event, &deadline)
             }
+        };
+        if let Err(e) = result {
+            error.get_or_insert(e);
         }
     }
     if let Some(error) = error {
         return Err(error);
     }
     match mode {
-        Mode::Record(recorder) => recorder.finish(),
+        Mode::Record(mut recorder) => {
+            if deadline_exceeded(&deadline) {
+                let mut pending: Vec<_> = events.pending.into_values().collect();
+                pending.sort_by_key(|e| e.seq);
+                for exchange in pending {
+                    recorder.skip(&exchange, "finalize deadline exceeded".into());
+                }
+            }
+            recorder.finish()
+        }
         Mode::Replay(replay) => Ok(
             json!({"served": replay.served, "missed": replay.missed, "missed_total": replay.missed_total}),
         ),
@@ -507,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_encodes_bodies_lazily_and_reuses_cached_encoding() {
+    fn replay_encodes_on_demand_and_revalidates_repeated_reads() {
         let parent = tempfile::tempdir().unwrap();
         let dir = parent.path().join("cassette");
         let mut recorder = Recorder::new(&dir, &[]).unwrap();
@@ -528,12 +545,9 @@ mod tests {
             )
             .unwrap();
         recorder.finish().unwrap();
-        let mut replay = Replay::load(&dir, false).unwrap();
-        assert!(replay.encoded.is_empty());
-        let first = replay.body(&hash).unwrap().as_ptr();
+        let replay = Replay::load(&dir, false).unwrap();
         assert_eq!(replay.body(&hash).unwrap(), "aGVsbG8=");
-        assert_eq!(first, replay.body(&hash).unwrap().as_ptr());
-        // A cached encoding must still reject a file changed after its first use.
+        // Repeated reads must reject a file changed after its first use.
         std::fs::write(dir.join("bodies").join(&hash), b"wrong").unwrap();
         assert!(replay.body(&hash).unwrap_err().starts_with("io error:"));
     }
@@ -560,6 +574,7 @@ mod tests {
 /// Per-page network operations serialize independently of browser commands.
 #[derive(Default)]
 pub(crate) struct NetworkState {
+    finalize_deadline: Deadline,
     session: Option<NetworkSession>,
     last_record_stop: Option<Result<Value, String>>,
     last_replay_stop: Option<Result<Value, String>>,
@@ -567,6 +582,11 @@ pub(crate) struct NetworkState {
 }
 
 impl NetworkState {
+    /// Share the deadline handle registered before acquiring page state.
+    pub fn set_finalize_deadline(&mut self, deadline: Deadline) {
+        self.finalize_deadline = deadline;
+    }
+
     fn idle(&self) -> Result<(), String> {
         if self.closed {
             return Err("invalid argument: page network session was closed".into());
@@ -585,11 +605,18 @@ impl NetworkState {
         connection: Arc<Connection>,
         dir: &std::path::Path,
         urls: &[String],
+        validation: Result<(), String>,
     ) -> Result<Value, String> {
+        self.last_record_stop = None;
+        validation?;
         self.idle()?;
         let recorder = Recorder::new(dir, urls)?;
-        self.session = Some(NetworkSession::record(page, connection, recorder)?);
-        self.last_record_stop = None;
+        self.session = Some(NetworkSession::spawn(
+            page,
+            connection,
+            Mode::Record(recorder),
+            Arc::clone(&self.finalize_deadline),
+        )?);
         Ok(json!({"recording":true, "dir":dir}))
     }
 
@@ -599,11 +626,18 @@ impl NetworkState {
         connection: Arc<Connection>,
         dir: &std::path::Path,
         match_body: bool,
+        validation: Result<(), String>,
     ) -> Result<Value, String> {
+        self.last_replay_stop = None;
+        validation?;
         self.idle()?;
         let replay = Replay::load(dir, match_body)?;
-        self.session = Some(NetworkSession::replay(page, connection, replay)?);
-        self.last_replay_stop = None;
+        self.session = Some(NetworkSession::replay(
+            page,
+            connection,
+            replay,
+            Arc::clone(&self.finalize_deadline),
+        )?);
         Ok(json!({"replaying":true, "dir":dir}))
     }
 
@@ -645,36 +679,59 @@ impl NetworkState {
         result
     }
 
-    pub fn close(&mut self) {
+    fn close(&mut self, deadline: Instant) {
         self.closed = true;
         if let Some(session) = self.session.take() {
-            if let Err(e) = session.stop() {
+            set_deadline(&session.finalize_deadline, deadline);
+            let recording = session.recording;
+            let result = session.stop();
+            if let Err(e) = &result {
                 log::warn!("network cassette cleanup: {e}");
+            }
+            if recording {
+                self.last_record_stop = Some(result);
+            } else {
+                self.last_replay_stop = Some(result);
             }
         }
     }
+}
+
+struct NetworkPage {
+    state: std::sync::Weak<Mutex<NetworkState>>,
+    deadline: Deadline,
 }
 
 /// Reach active page operations without acquiring the per-instance mutex.
 #[derive(Default)]
 pub(crate) struct NetworkSessions {
     closed: bool,
-    pages: Vec<std::sync::Weak<Mutex<NetworkState>>>,
+    pages: Vec<NetworkPage>,
 }
 
 impl NetworkSessions {
-    pub fn register(&mut self, state: &Arc<Mutex<NetworkState>>) -> Result<(), String> {
+    pub fn register(&mut self, state: &Arc<Mutex<NetworkState>>) -> Result<Deadline, String> {
         if self.closed {
             return Err("invalid argument: instance network sessions were closed".into());
         }
-        self.pages.retain(|p| p.strong_count() > 0);
-        if !self.pages.iter().any(|p| p.ptr_eq(&Arc::downgrade(state))) {
-            self.pages.push(Arc::downgrade(state));
+        self.pages.retain(|p| p.state.strong_count() > 0);
+        if let Some(page) = self
+            .pages
+            .iter()
+            .find(|p| p.state.ptr_eq(&Arc::downgrade(state)))
+        {
+            return Ok(Arc::clone(&page.deadline));
         }
-        Ok(())
+        let deadline = Arc::new(Mutex::new(None));
+        self.pages.push(NetworkPage {
+            state: Arc::downgrade(state),
+            deadline: Arc::clone(&deadline),
+        });
+        Ok(deadline)
     }
 
-    pub fn close_all(registry: &Mutex<Self>) {
+    pub fn close_all(registry: &Mutex<Self>, connection: &Arc<Connection>) {
+        let finalize = FinalizeDeadline::new(connection);
         // Keep this separate network-registry mutex through the drain: two
         // concurrent cleanup paths must both wait before either closes the
         // connection. No per-instance mutex is held here.
@@ -682,13 +739,90 @@ impl NetworkSessions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         registry.closed = true;
-        for page in std::mem::take(&mut registry.pages)
-            .into_iter()
-            .filter_map(|p| p.upgrade())
-        {
-            page.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .close();
+        let pages = std::mem::take(&mut registry.pages);
+        // Mark every worker before joining any of them. A concurrent record
+        // stop can own the page mutex while its worker is blocked reading.
+        for page in &pages {
+            set_deadline(&page.deadline, finalize.deadline);
         }
+        for page in pages.into_iter().filter_map(|p| p.state.upgrade()) {
+            close_network_state_before(&page, finalize.deadline);
+        }
+    }
+
+    pub fn close_page(
+        registry: &Mutex<Self>,
+        state: &Arc<Mutex<NetworkState>>,
+        connection: &Arc<Connection>,
+    ) {
+        let finalize = FinalizeDeadline::new(connection);
+        {
+            let registry = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(page) = registry
+                .pages
+                .iter()
+                .find(|p| p.state.ptr_eq(&Arc::downgrade(state)))
+            {
+                set_deadline(&page.deadline, finalize.deadline);
+            }
+        }
+        close_network_state_before(state, finalize.deadline);
+    }
+}
+
+fn set_deadline(deadline: &Mutex<Option<Instant>>, end: Instant) {
+    let mut deadline = deadline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *deadline = Some(deadline.map_or(end, |current| current.min(end)));
+}
+
+/// Close page network state while recovering poisoned cleanup locks.
+pub(crate) fn close_network_state(state: &Mutex<NetworkState>, connection: &Arc<Connection>) {
+    let finalize = FinalizeDeadline::new(connection);
+    close_network_state_before(state, finalize.deadline);
+}
+
+fn close_network_state_before(state: &Mutex<NetworkState>, deadline: Instant) {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .close(deadline);
+}
+
+/// One watchdog covers the whole drain, including all queued body reads.
+struct FinalizeDeadline {
+    deadline: Instant,
+    cancel: mpsc::Sender<()>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl FinalizeDeadline {
+    fn new(connection: &Arc<Connection>) -> Self {
+        let deadline = Instant::now() + Duration::from_secs(FINALIZE_TIMEOUT_SECS);
+        let (cancel, wait) = mpsc::channel();
+        let connection = Arc::clone(connection);
+        let worker = std::thread::spawn(move || {
+            if wait
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .is_err()
+            {
+                let _ = connection.close();
+            }
+        });
+        Self {
+            deadline,
+            cancel,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for FinalizeDeadline {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(());
+        let _ = self.worker.take().unwrap().join();
     }
 }

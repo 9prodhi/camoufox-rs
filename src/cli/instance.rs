@@ -645,10 +645,7 @@ impl Instance {
     /// Adopt any ready popups opened by this instance's pages.
     pub fn adopt_popups(&mut self, context: &crate::api::BrowserContext) {
         for page in self.adopt_popups_deferred(context) {
-            page.network
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .close();
+            super::network::close_network_state(&page.network, self.browser.connection());
         }
     }
 
@@ -1955,10 +1952,7 @@ impl Instance {
     /// Shut down this instance. Browser.close is followed by pipe EOF, which makes Camoufox exit.
     pub fn stop(self) -> Result<(), String> {
         for page in self.pages.values() {
-            page.network
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .close();
+            super::network::close_network_state(&page.network, self.browser.connection());
         }
         let Instance {
             browser,
@@ -2315,7 +2309,7 @@ impl InstanceManager {
             .remove(instance_id)
             .ok_or_else(|| Self::missing(instance_id))?;
         // Network workers still need the connection to read completed bodies.
-        super::network::NetworkSessions::close_all(&networks);
+        super::network::NetworkSessions::close_all(&networks, &closer);
         // Then interrupt other commands so the instance mutex frees promptly.
         let _ = closer.close();
         let inst = entry
@@ -2440,12 +2434,10 @@ impl InstanceManager {
         let inst = instance.as_mut().ok_or_else(|| Self::missing(id))?;
         let removed = inst.adopt_popups_deferred(context);
         let result = f(inst, context);
+        let connection = Arc::clone(inst.browser.connection());
         drop(entry);
         for page in removed {
-            page.network
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .close();
+            super::network::close_network_state(&page.network, &connection);
         }
         result
     }
@@ -2461,6 +2453,7 @@ impl InstanceManager {
             &mut super::network::NetworkState,
             Arc<MainFrame>,
             Arc<Connection>,
+            Result<(), String>,
         ) -> Result<T, String>,
     ) -> Result<T, String> {
         let registry = self
@@ -2470,26 +2463,32 @@ impl InstanceManager {
             .get(instance_id)
             .map(|e| Arc::clone(&e.networks))
             .ok_or_else(|| Self::missing(instance_id))?;
-        let (state, page, connection) = self.with_instance(instance_id, |inst, _| {
-            let page = if allow_dialog {
-                inst.page_any(page_id)?
-            } else {
-                inst.page(page_id)?
-            };
-            Ok((
-                Arc::clone(&page.network),
-                Arc::clone(&page.main_frame),
-                Arc::clone(inst.browser.connection()),
-            ))
-        })?;
-        registry
+        let (state, page, connection, validation) =
+            self.with_instance(instance_id, |inst, _| {
+                let page = inst.page_any(page_id)?;
+                // Carry page validation to the start operation so its previous
+                // stop result is cleared even when an open dialog rejects it.
+                let validation = if allow_dialog {
+                    Ok(())
+                } else {
+                    inst.page(page_id).map(|_| ())
+                };
+                Ok((
+                    Arc::clone(&page.network),
+                    Arc::clone(&page.main_frame),
+                    Arc::clone(inst.browser.connection()),
+                    validation,
+                ))
+            })?;
+        let deadline = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .register(&state)?;
         let mut state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(&mut state, page, connection)
+        state.set_finalize_deadline(deadline);
+        f(&mut state, page, connection, validation)
     }
 
     /// Begin passive HTTP recording for a page into an empty absolute directory.
@@ -2500,9 +2499,14 @@ impl InstanceManager {
         dir: &Path,
         urls: &[String],
     ) -> Result<serde_json::Value, String> {
-        self.with_network(instance_id, page_id, false, |state, page, connection| {
-            state.record(page, connection, dir, urls)
-        })
+        self.with_network(
+            instance_id,
+            page_id,
+            false,
+            |state, page, connection, validation| {
+                state.record(page, connection, dir, urls, validation)
+            },
+        )
     }
 
     /// Finalize a recording, or return its last stop result with `repeated` set.
@@ -2511,7 +2515,8 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
     ) -> Result<serde_json::Value, String> {
-        self.with_network(instance_id, page_id, true, |state, page, _| {
+        self.with_network(instance_id, page_id, true, |state, page, _, validation| {
+            validation?;
             state.stop(true, &page)
         })
     }
@@ -2524,9 +2529,14 @@ impl InstanceManager {
         dir: &Path,
         match_body: bool,
     ) -> Result<serde_json::Value, String> {
-        self.with_network(instance_id, page_id, false, |state, page, connection| {
-            state.replay(page, connection, dir, match_body)
-        })
+        self.with_network(
+            instance_id,
+            page_id,
+            false,
+            |state, page, connection, validation| {
+                state.replay(page, connection, dir, match_body, validation)
+            },
+        )
     }
 
     /// Disable interception and return replay counts, or repeat the last result.
@@ -2535,7 +2545,8 @@ impl InstanceManager {
         instance_id: &str,
         page_id: &str,
     ) -> Result<serde_json::Value, String> {
-        self.with_network(instance_id, page_id, true, |state, page, _| {
+        self.with_network(instance_id, page_id, true, |state, page, _, validation| {
+            validation?;
             state.stop(false, &page)
         })
     }
@@ -2968,14 +2979,21 @@ impl InstanceManager {
 
     /// Close a page.
     pub fn close_tab(&self, instance_id: &str, page_id: &str) -> Result<(), String> {
-        let state = self.with_instance(instance_id, |inst, _| {
-            Ok(inst.pages.get(page_id).map(|p| Arc::clone(&p.network)))
+        let networks = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(instance_id)
+            .map(|entry| Arc::clone(&entry.networks))
+            .ok_or_else(|| Self::missing(instance_id))?;
+        let (state, connection) = self.with_instance(instance_id, |inst, _| {
+            Ok((
+                inst.pages.get(page_id).map(|p| Arc::clone(&p.network)),
+                Arc::clone(inst.browser.connection()),
+            ))
         })?;
         if let Some(state) = state {
-            state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .close();
+            super::network::NetworkSessions::close_page(&networks, &state, &connection);
         }
         self.with_instance(instance_id, |inst, _| inst.close_tab(page_id))
     }
@@ -3030,7 +3048,7 @@ impl InstanceManager {
             .into_iter()
             .map(|(networks, closer)| {
                 std::thread::spawn(move || {
-                    super::network::NetworkSessions::close_all(&networks);
+                    super::network::NetworkSessions::close_all(&networks, &closer);
                     let _ = closer.close();
                 })
             })
@@ -3061,7 +3079,7 @@ impl InstanceManager {
                      ..
                  }| {
                     std::thread::spawn(move || {
-                        super::network::NetworkSessions::close_all(&networks);
+                        super::network::NetworkSessions::close_all(&networks, &closer);
                         let _ = closer.close();
                         let instance = entry
                             .lock()

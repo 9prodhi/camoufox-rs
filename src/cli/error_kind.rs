@@ -478,11 +478,15 @@ mod tests {
                 ErrorKind::InvalidArgument,
             ),
             (
-                "invalid argument: invalid cassette: unsupported version",
+                "invalid argument: unsupported cassette format/version",
                 ErrorKind::InvalidArgument,
             ),
             (
-                "io error: response body was evicted during recording",
+                "io error: cassette body changed during replay",
+                ErrorKind::Io,
+            ),
+            (
+                "io error: reading cassette body: cassette body length changed",
                 ErrorKind::Io,
             ),
             (

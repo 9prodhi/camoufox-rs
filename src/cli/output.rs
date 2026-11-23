@@ -70,25 +70,57 @@ pub fn render(data: Option<&Value>) -> Rendered {
         return Rendered::out(format!("replaying: {}", data["dir"].as_str().unwrap_or("")));
     }
     if let (Some(exchanges), Some(bodies)) = (data.get("exchanges"), data.get("bodies")) {
-        return Rendered::out(format!(
+        let mut rendered = Rendered::out(format!(
             "recorded {exchanges} exchanges, {bodies} bodies: {}",
             data["dir"].as_str().unwrap_or("")
         ));
+        if let Some(skipped) = data["skipped"].as_array() {
+            for skip in skipped {
+                rendered.stderr.push(format!(
+                    "skipped: {} {} ({})",
+                    skip["method"].as_str().unwrap_or(""),
+                    skip["url"].as_str().unwrap_or(""),
+                    skip["reason"].as_str().unwrap_or("")
+                ));
+            }
+        }
+        if data["repeated"] == true {
+            rendered
+                .stderr
+                .push("note: recording was already stopped".into());
+        }
+        return rendered;
     }
     if let (Some(served), Some(missed)) = (
         data.get("served"),
         data.get("missed").and_then(Value::as_array),
     ) {
-        let mut rendered = Rendered::out(format!(
-            "replayed {served} requests, {} misses",
-            missed.len()
-        ));
+        let total = data["missed_total"].as_u64().unwrap_or(missed.len() as u64);
+        let mut rendered = Rendered::out(format!("replayed {served} requests, {total} misses"));
+        let mut listed: u64 = 0;
         for miss in missed {
+            let count = miss["count"].as_u64().unwrap_or(1);
+            listed = listed.saturating_add(count);
+            let suffix = if count > 1 {
+                format!(" (x{count})")
+            } else {
+                String::new()
+            };
             rendered.stderr.push(format!(
-                "missed: {} {}",
+                "missed: {} {}{suffix}",
                 miss["method"].as_str().unwrap_or(""),
                 miss["url"].as_str().unwrap_or("")
             ));
+        }
+        if total > listed {
+            rendered
+                .stderr
+                .push(format!("... and {} more not listed", total - listed));
+        }
+        if data["repeated"] == true {
+            rendered
+                .stderr
+                .push("note: replay was already stopped".into());
         }
         return rendered;
     }
@@ -637,6 +669,31 @@ mod cassette_output_tests {
         ));
         assert_eq!(rendered.stdout, "replayed 3 requests, 1 misses");
         assert_eq!(rendered.stderr, ["missed: GET https://example.com/miss"]);
+    }
+
+    #[test]
+    fn cassette_stop_renders_skips_repeats_and_total_misses() {
+        let record = render(Some(
+            &json!({"dir":"/tmp/cassette", "exchanges":1, "bodies":1,
+            "skipped":[{"method":"GET", "url":"https://example.com/large", "reason":"response body was evicted during recording"}], "repeated":true}),
+        ));
+        assert_eq!(
+            record.stdout,
+            "recorded 1 exchanges, 1 bodies: /tmp/cassette"
+        );
+        assert_eq!(record.stderr, ["skipped: GET https://example.com/large (response body was evicted during recording)", "note: recording was already stopped"]);
+        let replay = render(Some(&json!({"served":2, "missed_total":8,
+            "missed":[{"method":"GET", "url":"https://example.com/a", "count":3}, {"method":"POST", "url":"https://example.com/b", "count":1}], "repeated":true})));
+        assert_eq!(replay.stdout, "replayed 2 requests, 8 misses");
+        assert_eq!(
+            replay.stderr,
+            [
+                "missed: GET https://example.com/a (x3)",
+                "missed: POST https://example.com/b",
+                "... and 4 more not listed",
+                "note: replay was already stopped"
+            ]
+        );
     }
 
     #[test]

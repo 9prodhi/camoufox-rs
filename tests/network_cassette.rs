@@ -975,9 +975,30 @@ fn cassette_large_response_is_skipped_and_instance_stop_publishes_recording() {
     assert_eq!(index["exchanges"].as_array().unwrap().len(), 1);
     let (manager, instance, page) = launch();
     manager
+        .navigate(
+            &instance,
+            &page,
+            &format!("{}/frame", fixture.origin),
+            TIMEOUT,
+            Some("load"),
+        )
+        .unwrap();
+    drop(fixture);
+    manager
         .replay_start(&instance, &page, &final_dir, false)
         .unwrap();
-    manager.replay_stop(&instance, &page).unwrap();
+    assert_eq!(
+        eval(
+            &manager,
+            &instance,
+            &page,
+            "fetch('/data').then(r=>r.json()).then(v=>v.value)"
+        ),
+        "fetch result"
+    );
+    let result = manager.replay_stop(&instance, &page).unwrap();
+    assert_eq!(result["served"], 1);
+    assert_eq!(result["missed_total"], 0);
     manager.stop(&instance).unwrap();
 }
 
@@ -1009,9 +1030,19 @@ fn cassette_multipart_form_matches_new_random_boundaries() {
     for _ in 0..2 {
         assert_eq!(eval(&manager, &instance, &page, submit), recorded);
     }
+    let different = submit.replace("'field', 'value'", "'field', 'different'");
+    assert_eq!(
+        eval(
+            &manager,
+            &instance,
+            &page,
+            &format!("({different}).then(()=>false,()=>true)")
+        ),
+        true
+    );
     let result = manager.replay_stop(&instance, &page).unwrap();
     assert_eq!(result["served"], 2);
-    assert_eq!(result["missed_total"], 0);
+    assert_eq!(result["missed_total"], 1);
     manager.stop(&instance).unwrap();
 }
 
@@ -1092,10 +1123,15 @@ fn cassette_replay_suppresses_persistent_response_headers() {
         eval(&manager, &instance, &page, "localStorage.getItem('keep')"),
         "value"
     );
-    assert!(eval(&manager, &instance, &page, "document.cookie")
-        .as_str()
-        .unwrap()
-        .contains("keep=value"));
+    let cookies = eval(&manager, &instance, &page, "document.cookie");
+    let cookies = cookies.as_str().unwrap();
+    assert!(cookies.contains("keep=value"));
+    assert!(!cookies.contains("replayed="), "{cookies}");
+    let cookies = manager.cookies(&instance).unwrap();
+    assert!(cookies
+        .iter()
+        .any(|cookie| cookie["name"] == "keep" && cookie["value"] == "value"));
+    assert!(!cookies.iter().any(|cookie| cookie["name"] == "replayed"));
     manager.replay_stop(&instance, &page).unwrap();
     // A live response after stop must reach the server, not replay's disk cache.
     let before = fixture

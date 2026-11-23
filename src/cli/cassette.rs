@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 pub(super) const FORMAT: &str = "camoufox-cassette";
 pub(super) const VERSION: u32 = 1;
+const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -130,7 +131,7 @@ pub(super) struct Body {
 impl Body {
     pub fn read(&self, hash: &str) -> Result<Vec<u8>, String> {
         let read = || -> std::io::Result<Vec<u8>> {
-            let file = open_body(&self.path)?;
+            let file = open_regular_file(&self.path)?;
             if file.metadata()?.len() != self.len {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -150,16 +151,16 @@ impl Body {
     }
 }
 
-fn open_body(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
     // A replaced FIFO must not block validation or the replay worker.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "cassette body is not a regular file",
+            "cassette file is not a regular file",
         ));
     }
     Ok(file)
@@ -170,7 +171,14 @@ pub(super) type Bodies = HashMap<String, Body>;
 pub(super) fn load(dir: &Path) -> Result<(Index, Bodies), String> {
     absolute(dir)?;
     let invalid = |e| format!("invalid argument: invalid cassette: {e}");
-    let bytes = std::fs::read(dir.join("index.json")).map_err(|e| invalid(e.to_string()))?;
+    let file = open_regular_file(&dir.join("index.json")).map_err(|e| invalid(e.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_INDEX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| invalid(e.to_string()))?;
+    if bytes.len() as u64 > MAX_INDEX_BYTES {
+        return Err(invalid("index too large".into()));
+    }
     #[derive(Deserialize)]
     struct Header {
         format: String,
@@ -205,22 +213,12 @@ pub(super) fn load(dir: &Path) -> Result<(Index, Bodies), String> {
         }
         if !bodies.contains_key(&e.body_sha256) {
             let path = dir.join("bodies").join(&e.body_sha256);
-            let file = open_body(&path)
+            let file = open_regular_file(&path)
                 .map_err(|err| invalid(format!("body {}: {err}", e.body_sha256)))?;
             let mut file = file.take(e.body_len.saturating_add(1));
             let mut hash = Sha256::new();
-            let mut len = 0;
-            let mut buffer = [0; 64 * 1024];
-            loop {
-                let n = file
-                    .read(&mut buffer)
-                    .map_err(|err| invalid(format!("body {}: {err}", e.body_sha256)))?;
-                if n == 0 {
-                    break;
-                }
-                hash.update(&buffer[..n]);
-                len += n as u64;
-            }
+            let len = std::io::copy(&mut file, &mut hash)
+                .map_err(|err| invalid(format!("body {}: {err}", e.body_sha256)))?;
             if format!("{:x}", hash.finalize()) != e.body_sha256 {
                 return Err(invalid(format!("body {} sha256 mismatch", e.body_sha256)));
             }
@@ -234,12 +232,13 @@ pub(super) fn load(dir: &Path) -> Result<(Index, Bodies), String> {
 }
 
 fn check_directory(path: &Path) -> Result<(), String> {
+    check_directory_owner(path, unsafe { libc::getuid() })
+}
+
+fn check_directory_owner(path: &Path, uid: u32) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(path)
         .map_err(|e| format!("io error: inspecting cassette directory: {e}"))?;
-    if !meta.file_type().is_dir()
-        || meta.uid() != unsafe { libc::getuid() }
-        || meta.mode() & 0o077 != 0
-    {
+    if !meta.file_type().is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
         return Err(format!("invalid argument: insecure cassette directory {} (expected a real, owner-only directory owned by this uid)", path.display()));
     }
     Ok(())
@@ -406,6 +405,65 @@ mod tests {
             body_sha256: sha256(body),
             body_len: body.len() as u64,
         }
+    }
+
+    #[test]
+    fn cassette_rejects_oversized_index() {
+        let dir = private_dir();
+        let file = std::fs::File::create(dir.path().join("index.json")).unwrap();
+        file.set_len(64 * 1024 * 1024 + 1).unwrap();
+        assert_eq!(
+            load(dir.path()).unwrap_err(),
+            "invalid argument: invalid cassette: index too large"
+        );
+    }
+
+    #[test]
+    fn cassette_rejects_fifo_index_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = private_dir();
+        let path = dir.path().join("index.json");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // A delayed writer releases the old blocking open so a regression fails
+        // cleanly instead of hanging the test suite indefinitely.
+        let (done, finished) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            if finished
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err()
+            {
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path)
+                {
+                    let _ = file.write_all(b"{}");
+                }
+            }
+        });
+        let result = load(dir.path());
+        let _ = done.send(());
+        peer.join().unwrap();
+        assert!(result.unwrap_err().contains("not a regular file"));
+    }
+
+    #[test]
+    fn cassette_rejects_symlink_index_and_body() {
+        use std::os::unix::fs::symlink;
+        let parent = private_dir();
+        let target = parent.path().join("target");
+        std::fs::write(&target, serde_json::to_vec(&Index::new(vec![])).unwrap()).unwrap();
+        let dir = private_dir();
+        symlink(&target, dir.path().join("index.json")).unwrap();
+        assert!(load(dir.path()).is_err());
+        let e = exchange(b"hello", 0);
+        let dir = cassette_with(vec![e.clone()], &[b"hello"]);
+        let path = dir.path().join("bodies").join(&e.body_sha256);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&target, b"hello").unwrap();
+        symlink(target, path).unwrap();
+        assert!(load(dir.path()).is_err());
     }
 
     #[test]
@@ -851,14 +909,11 @@ mod tests {
                 .unwrap_err()
                 .starts_with("invalid argument:"));
         }
-        if unsafe { libc::getuid() } == 0 {
-            use std::os::unix::ffi::OsStrExt;
-            let name = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
-            assert_eq!(unsafe { libc::chown(name.as_ptr(), 65534, !0) }, 0);
-            let result = Recorder::new(&dir, &[]);
-            assert_eq!(unsafe { libc::chown(name.as_ptr(), 0, !0) }, 0);
-            assert!(result.unwrap_err().starts_with("invalid argument:"));
-        }
+        let uid = std::fs::metadata(&dir).unwrap().uid();
+        assert!(check_directory_owner(&dir, uid).is_ok());
+        assert!(check_directory_owner(&dir, uid.wrapping_add(1))
+            .unwrap_err()
+            .starts_with("invalid argument:"));
     }
 
     #[test]

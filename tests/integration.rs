@@ -8,6 +8,10 @@
 //! cargo test --all-features --test integration -- --ignored --test-threads=1
 //! ```
 
+#[cfg(all(unix, feature = "cli"))]
+#[path = "support/script.rs"]
+mod script;
+
 use std::path::PathBuf;
 use std::process::Child;
 use std::time::Duration;
@@ -5216,7 +5220,6 @@ fn launch_profile_dir_persists_cookie_and_local_storage_across_relaunch() {
 #[cfg(feature = "cli")]
 fn launch_profile_dir_reserves_before_browser_ready_and_releases_failed_spawn() {
     use camoufox::cli::instance::{InstanceManager, LaunchOptions};
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
 
     let dir = tempfile::tempdir().unwrap();
@@ -5227,15 +5230,14 @@ fn launch_profile_dir_reserves_before_browser_ready_and_releases_failed_spawn() 
     // Quote fixture paths even if a test runner uses a directory containing spaces.
     let quote =
         |path: &std::path::Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
-    std::fs::write(
+    script::write_script(
         &wrapper,
-        format!(
+        &format!(
         "#!/bin/sh\nprintf ready > {}\nwhile [ ! -f {} ]; do sleep 0.01; done\nexec {} \"$@\"\n",
         quote(&marker), quote(&gate), quote(std::path::Path::new(&camoufox_bin()))
     ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        0o700,
+    );
     let manager = Arc::new(InstanceManager::new());
     let mut options = LaunchOptions::default();
     options.headless = Some(true);

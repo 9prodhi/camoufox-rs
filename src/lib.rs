@@ -31,3 +31,7 @@ pub struct TutorialGettingStartedDoctests;
 #[cfg(doctest)]
 #[doc = include_str!("../docs/reference-library-api.md")]
 pub struct ReferenceLibraryApiDoctests;
+
+#[cfg(all(test, unix))]
+#[path = "../tests/support/script.rs"]
+mod test_script;

@@ -737,10 +737,25 @@ fn dispatch_external(sock: &std::path::Path, args: &[String], json_mode: bool) -
         } else {
             command.env_remove("CAMOUFOX_JSON");
         }
-        let status = command.status().unwrap_or_else(|e| {
-            eprintln!("error: failed to execute external subcommand: {e}");
-            std::process::exit(1);
-        });
+        let mut attempt = 1;
+        let child = loop {
+            match command.spawn() {
+                Ok(child) => break Ok(child),
+                Err(error) => match external_spawn_retry_delay(&error, attempt) {
+                    Some(delay) => {
+                        std::thread::sleep(delay);
+                        attempt += 1;
+                    }
+                    None => break Err(error),
+                },
+            }
+        };
+        let status = child
+            .and_then(|mut child| child.wait())
+            .unwrap_or_else(|e| {
+                eprintln!("error: failed to execute external subcommand: {e}");
+                std::process::exit(1);
+            });
 
         #[cfg(unix)]
         let exit_code = {
@@ -764,6 +779,17 @@ fn dispatch_external(sock: &std::path::Path, args: &[String], json_mode: bool) -
         .try_get_matches()
         .expect_err("unresolved external subcommands must be rejected by clap")
         .exit();
+}
+
+/// Delay before retrying a transient external-command spawn failure.
+fn external_spawn_retry_delay(error: &std::io::Error, attempt: u32) -> Option<std::time::Duration> {
+    #[cfg(unix)]
+    if (1..5).contains(&attempt) && error.raw_os_error() == Some(libc::ETXTBSY) {
+        return Some(std::time::Duration::from_millis(u64::from(attempt) * 10));
+    }
+    #[cfg(not(unix))]
+    let _ = (error, attempt);
+    None
 }
 
 /// Split `s` on the first `sep`, trimming whitespace around both halves.
@@ -916,6 +942,32 @@ mod tests {
         let cli =
             Cli::try_parse_from(["camoufox", "upload", "i", "p1", "input", "fixture.txt"]).unwrap();
         assert!(matches!(cli.command, Command::Upload { timeout: 30, .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_spawn_retries_text_file_busy_with_bounded_backoff() {
+        let error = std::io::Error::from_raw_os_error(libc::ETXTBSY);
+        for (attempt, milliseconds) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+            assert_eq!(
+                external_spawn_retry_delay(&error, attempt),
+                Some(std::time::Duration::from_millis(milliseconds))
+            );
+        }
+        for attempt in [0, 5, 6, u32::MAX] {
+            assert_eq!(external_spawn_retry_delay(&error, attempt), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_spawn_does_not_retry_other_errors() {
+        for code in [libc::EACCES, libc::ENOENT, libc::ENOEXEC, libc::EINTR] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_eq!(external_spawn_retry_delay(&error, 1), None);
+        }
+        let error = std::io::Error::other("Text file busy");
+        assert_eq!(external_spawn_retry_delay(&error, 1), None);
     }
 
     #[test]

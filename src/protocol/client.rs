@@ -531,6 +531,39 @@ impl Session {
         params: serde_json::Value,
         deadline: Duration,
     ) -> Result<serde_json::Value, ProtocolError> {
+        self.send_with_timeout_inner(method, params, deadline, None)
+    }
+
+    /// Observe a cleanup deadline even when it is armed after the request starts.
+    #[cfg(feature = "cli")]
+    pub(crate) fn send_with_finalize_deadline(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        deadline: &Mutex<Option<std::time::Instant>>,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.send_with_timeout_inner(method, params, DEFAULT_SEND_TIMEOUT, Some(deadline))
+    }
+
+    fn send_with_timeout_inner(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+        finalize_deadline: Option<&Mutex<Option<std::time::Instant>>>,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let started = std::time::Instant::now();
+        let remaining = || {
+            let normal = timeout.saturating_sub(started.elapsed());
+            finalize_deadline
+                .and_then(|d| *d.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+                .map_or(normal, |d| {
+                    normal.min(d.saturating_duration_since(std::time::Instant::now()))
+                })
+        };
+        if remaining().is_zero() {
+            return Err(ProtocolError::timeout(method, timeout));
+        }
         let (rx, id, value) = {
             let mut guard = self
                 .inner
@@ -607,24 +640,32 @@ impl Session {
             }
         }
 
-        // Block waiting for the response, bounded by the deadline.
-        match rx.recv_timeout(deadline) {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => {
-                // Free the pending slot so a late response is silently
-                // discarded by the reader thread (resolve returns false for
-                // unknown ids) and the slot is not leaked.
-                let mut guard = self
-                    .inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(session) = guard.sessions.get_mut(&self.session_key) {
-                    session.pending.remove(id);
+        // Only finalizable calls poll: a page can begin cleanup while this
+        // read is already in flight. Expiry removes this request's pending slot,
+        // leaving all other sessions on the shared connection usable.
+        loop {
+            let budget = remaining();
+            let wait = if finalize_deadline.is_some() {
+                budget.min(Duration::from_millis(20))
+            } else {
+                budget
+            };
+            match rx.recv_timeout(wait) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Timeout) if !remaining().is_zero() => continue,
+                Err(RecvTimeoutError::Timeout) => {
+                    let mut guard = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(session) = guard.sessions.get_mut(&self.session_key) {
+                        session.pending.remove(id);
+                    }
+                    return Err(ProtocolError::timeout(method, timeout));
                 }
-                Err(ProtocolError::timeout(method, deadline))
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                Err(ProtocolError::closed(Some(method.to_owned())))
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(ProtocolError::closed(Some(method.to_owned())));
+                }
             }
         }
     }

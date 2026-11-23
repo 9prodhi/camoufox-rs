@@ -19,6 +19,14 @@ const COMPRESSED: &[u8] = &[
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
+fn private_dir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
 struct Fixture {
     origin: String,
     stop: Arc<AtomicBool>,
@@ -79,6 +87,7 @@ impl Fixture {
                     "/head" => (Vec::new(), "text/plain", 200),
                     "/counter" => { counter += 1; (counter.to_string().into_bytes(), "text/plain", 200) },
                     "/echo" => (input, "text/plain", 200),
+                    "/large" => (vec![b'x'; 11 * 1024 * 1024], "application/octet-stream", 200),
                     "/binary" => (vec![0, 128, 255, 42], "application/octet-stream", 200),
                     _ => (b"missing".to_vec(), "text/plain", 404),
                 };
@@ -145,19 +154,17 @@ fn cassette_offline_roundtrip_in_default_context() {
     cassette_offline_roundtrip(true);
 }
 
+#[allow(clippy::field_reassign_with_default)]
 fn cassette_offline_roundtrip(persistent: bool) {
     let fixture = Fixture::start();
     let url = format!("{}/", fixture.origin);
-    let dir = tempfile::tempdir().unwrap();
-    let profile = tempfile::tempdir().unwrap();
+    let dir = private_dir();
+    let profile = private_dir();
     let manager = InstanceManager::new();
-    let (instance, _, _) = manager
-        .launch_with(&camoufox::cli::instance::LaunchOptions {
-            headless: Some(true),
-            profile_dir: persistent.then(|| profile.path().display().to_string()),
-            ..Default::default()
-        })
-        .unwrap();
+    let mut options = camoufox::cli::instance::LaunchOptions::default();
+    options.headless = Some(true);
+    options.profile_dir = persistent.then(|| profile.path().display().to_string());
+    let (instance, _, _) = manager.launch_with(&options).unwrap();
     let page = manager.new_page(&instance).unwrap();
     manager
         .record_start(&instance, &page, dir.path(), &[])
@@ -180,10 +187,9 @@ fn cassette_offline_roundtrip(persistent: bool) {
     let before = rendered(&manager, &instance, &page);
     let recorded = manager.record_stop(&instance, &page).unwrap();
     assert!(recorded["exchanges"].as_u64().unwrap() >= 11, "{recorded}");
-    assert!(manager
-        .record_stop(&instance, &page)
-        .unwrap_err()
-        .starts_with("invalid argument:"));
+    let mut repeated = recorded.clone();
+    repeated["repeated"] = json!(true);
+    assert_eq!(manager.record_stop(&instance, &page).unwrap(), repeated);
     let index: Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("index.json")).unwrap()).unwrap();
     for exchange in index["exchanges"].as_array().unwrap() {
@@ -265,17 +271,16 @@ fn cassette_offline_roundtrip(persistent: bool) {
     assert!(stopped["served"].as_u64().unwrap() >= 13);
     let misses = stopped["missed"].as_array().unwrap();
     assert!(
-        misses.contains(&json!({"method":"GET","url":format!("{}unrecorded", url)})),
+        misses.contains(&json!({"method":"GET","url":format!("{}unrecorded", url),"count":1})),
         "{stopped}"
     );
     assert!(
-        misses.contains(&json!({"method":"POST","url":format!("{}echo", url)})),
+        misses.contains(&json!({"method":"POST","url":format!("{}echo", url),"count":1})),
         "{stopped}"
     );
-    assert!(manager
-        .replay_stop(&instance, &replay)
-        .unwrap_err()
-        .starts_with("invalid argument:"));
+    let mut repeated = stopped.clone();
+    repeated["repeated"] = json!(true);
+    assert_eq!(manager.replay_stop(&instance, &replay).unwrap(), repeated);
     manager.stop(&instance).unwrap();
 }
 
@@ -283,7 +288,7 @@ fn cassette_offline_roundtrip(persistent: bool) {
 #[ignore]
 fn cassette_url_filter_and_active_page_cleanup() {
     let fixture = Fixture::start();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir();
     let (manager, instance, page) = launch();
     manager
         .record_start(&instance, &page, dir.path(), &["/data$".into()])
@@ -313,14 +318,14 @@ fn cassette_url_filter_and_active_page_cleanup() {
         .unwrap();
     manager.close_tab(&instance, &page).unwrap();
     let page = manager.new_page(&instance).unwrap();
-    let active = tempfile::tempdir().unwrap();
+    let active = private_dir();
     manager
         .record_start(&instance, &page, active.path(), &[])
         .unwrap();
     manager.close_tab(&instance, &page).unwrap();
     assert!(active.path().join("index.json").is_file());
     let page = manager.new_page(&instance).unwrap();
-    let recording = tempfile::tempdir().unwrap();
+    let recording = private_dir();
     manager
         .record_start(&instance, &page, recording.path(), &[])
         .unwrap();
@@ -336,7 +341,7 @@ fn cassette_url_filter_and_active_page_cleanup() {
 #[ignore]
 fn cassette_invalid_inputs_leave_page_usable() {
     let fixture = Fixture::start();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir();
     let (manager, instance, page) = launch();
     assert!(manager
         .record_start(&instance, &page, std::path::Path::new("relative"), &[])
@@ -406,7 +411,7 @@ struct CliDaemon {
 
 impl CliDaemon {
     fn new() -> Self {
-        let runtime = tempfile::tempdir().unwrap();
+        let runtime = private_dir();
         let socket = runtime
             .path()
             .join("daemon.sock")
@@ -466,7 +471,7 @@ impl Drop for CliDaemon {
 fn cassette_cli_daemon_commands_and_stop_restores_network() {
     let fixture = Fixture::start();
     let daemon = CliDaemon::new();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir();
     let dir_arg = dir.path().to_str().unwrap();
     let launched = daemon.run(&["launch"], true);
     let instance = launched["data"]["instance_id"].as_str().unwrap();
@@ -508,7 +513,7 @@ fn cassette_cli_daemon_commands_and_stop_restores_network() {
     let recorded = daemon.run(&["record", "stop", instance, page], true);
     assert_eq!(
         recorded["data"],
-        json!({"dir":dir_arg, "exchanges":3, "bodies":3})
+        json!({"dir":dir_arg, "exchanges":3, "bodies":3,"skipped":[]})
     );
     daemon.run(
         &[
@@ -539,7 +544,7 @@ fn cassette_cli_daemon_commands_and_stop_restores_network() {
     let stopped = daemon.run(&["replay", "stop", instance, page], true);
     assert_eq!(
         stopped["data"],
-        json!({"served":1, "missed":[{"method":"GET", "url":format!("{}/miss", fixture.origin)}]})
+        json!({"served":1, "missed_total":1, "missed":[{"method":"GET", "url":format!("{}/miss", fixture.origin), "count":1}]})
     );
     let fetched = daemon.run(
         &[
@@ -562,7 +567,7 @@ fn cassette_cli_daemon_commands_and_stop_restores_network() {
 #[ignore]
 fn cassette_redirect_recording_and_offline_validation() {
     let fixture = Fixture::start();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir();
     let (manager, instance, page) = launch();
     manager
         .navigate(
@@ -617,7 +622,7 @@ fn cassette_redirect_recording_and_offline_validation() {
 #[ignore]
 fn cassette_stop_drains_requests_before_disabling_interception() {
     let fixture = Fixture::start();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir();
     let (manager, instance, page) = launch();
     manager
         .navigate(
@@ -715,7 +720,7 @@ fn cassette_stop_drains_requests_before_disabling_interception() {
 #[ignore]
 fn cassette_skips_failed_and_non_http_requests_and_replay_restarts() {
     let fixture = Fixture::start();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir();
     // A closed, non-restricted local port makes the request fail at connect.
     let closed = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -786,7 +791,7 @@ fn cassette_skips_failed_and_non_http_requests_and_replay_restarts() {
         let stopped = manager.replay_stop(&instance, &page).unwrap();
         assert_eq!(
             stopped,
-            json!({"served":1, "missed":[{"method":"GET", "url":closed}]})
+            json!({"served":1, "missed_total":1, "missed":[{"method":"GET", "url":closed, "count":1}]})
         );
     }
     manager.stop(&instance).unwrap();
@@ -806,7 +811,7 @@ fn process_gone(pid: u64) -> bool {
 #[ignore]
 fn cassette_daemon_killed_mid_record_leaves_unpublished_cassette() {
     let fixture = Fixture::start();
-    let parent = tempfile::tempdir().unwrap();
+    let parent = private_dir();
     let dir = parent.path().join("cassette");
     let dir_arg = dir.to_str().unwrap();
     let mut daemon = CliDaemon::new();
@@ -843,7 +848,18 @@ fn cassette_daemon_killed_mid_record_leaves_unpublished_cassette() {
         true,
     );
     // Bodies are written as responses finish, so some exist before the kill.
-    assert!(std::fs::read_dir(dir.join("bodies")).unwrap().count() > 0);
+    let deadline = Instant::now() + TIMEOUT;
+    while std::fs::read_dir(dir.join("bodies"))
+        .unwrap()
+        .next()
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "no completed response body before daemon kill"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     daemon.child.kill().unwrap();
     daemon.child.wait().unwrap();
 
@@ -894,4 +910,216 @@ fn cassette_daemon_killed_mid_record_leaves_unpublished_cassette() {
     // The page is unaffected and replay is not active.
     daemon.run(&["replay", "stop", &instance, &page], false);
     daemon.run(&["stop", &instance], true);
+}
+
+#[test]
+#[ignore]
+fn cassette_large_response_is_skipped_and_instance_stop_publishes_recording() {
+    let fixture = Fixture::start();
+    let parent = private_dir();
+    let dir = parent.path().join("cassette");
+    let (manager, instance, page) = launch();
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &format!("{}/frame", fixture.origin),
+            TIMEOUT,
+            Some("load"),
+        )
+        .unwrap();
+    manager
+        .record_start(&instance, &page, &dir, &["/(large|data)$".into()])
+        .unwrap();
+    assert_eq!(
+        eval(
+            &manager,
+            &instance,
+            &page,
+            "fetch('/large').then(r=>r.arrayBuffer()).then(b=>b.byteLength)"
+        ),
+        11 * 1024 * 1024
+    );
+    assert_eq!(
+        eval(
+            &manager,
+            &instance,
+            &page,
+            "fetch('/data').then(r=>r.json()).then(v=>v.value)"
+        ),
+        "fetch result"
+    );
+    let result = manager.record_stop(&instance, &page).unwrap();
+    assert_eq!(result["exchanges"], 1, "{result}");
+    assert_eq!(
+        result["skipped"][0]["url"],
+        format!("{}/large", fixture.origin)
+    );
+    assert!(result["skipped"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("evicted"));
+    let final_dir = parent.path().join("cleanup");
+    manager
+        .record_start(&instance, &page, &final_dir, &["/data$".into()])
+        .unwrap();
+    eval(
+        &manager,
+        &instance,
+        &page,
+        "fetch('/data').then(r=>r.json())",
+    );
+    manager.stop(&instance).unwrap();
+    let index: Value =
+        serde_json::from_slice(&std::fs::read(final_dir.join("index.json")).unwrap()).unwrap();
+    assert_eq!(index["exchanges"].as_array().unwrap().len(), 1);
+    let (manager, instance, page) = launch();
+    manager
+        .replay_start(&instance, &page, &final_dir, false)
+        .unwrap();
+    manager.replay_stop(&instance, &page).unwrap();
+    manager.stop(&instance).unwrap();
+}
+
+#[test]
+#[ignore]
+fn cassette_multipart_form_matches_new_random_boundaries() {
+    let fixture = Fixture::start();
+    let dir = private_dir();
+    let (manager, instance, page) = launch();
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &format!("{}/frame", fixture.origin),
+            TIMEOUT,
+            Some("load"),
+        )
+        .unwrap();
+    let submit = "(() => { const body = new FormData(); body.append('field', 'value'); body.append('file', new Blob(['fixture content']), 'fixture.txt'); return fetch('/echo', {method:'POST', body}).then(r=>r.text()); })()";
+    manager
+        .record_start(&instance, &page, dir.path(), &[])
+        .unwrap();
+    let recorded = eval(&manager, &instance, &page, submit);
+    manager.record_stop(&instance, &page).unwrap();
+    drop(fixture);
+    manager
+        .replay_start(&instance, &page, dir.path(), true)
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(eval(&manager, &instance, &page, submit), recorded);
+    }
+    let result = manager.replay_stop(&instance, &page).unwrap();
+    assert_eq!(result["served"], 2);
+    assert_eq!(result["missed_total"], 0);
+    manager.stop(&instance).unwrap();
+}
+
+#[test]
+#[ignore]
+#[allow(clippy::field_reassign_with_default)]
+fn cassette_replay_suppresses_persistent_response_headers() {
+    let fixture = Fixture::start();
+    let dir = private_dir();
+    let profile = private_dir();
+    let manager = InstanceManager::new();
+    let mut options = camoufox::cli::instance::LaunchOptions::default();
+    options.headless = Some(true);
+    options.profile_dir = Some(profile.path().display().to_string());
+    let (instance, _, _) = manager.launch_with(&options).unwrap();
+    let page = manager.new_page(&instance).unwrap();
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &format!("{}/frame", fixture.origin),
+            TIMEOUT,
+            Some("load"),
+        )
+        .unwrap();
+    manager
+        .record_start(&instance, &page, dir.path(), &[])
+        .unwrap();
+    eval(
+        &manager,
+        &instance,
+        &page,
+        "fetch('/data').then(r=>r.text())",
+    );
+    manager.record_stop(&instance, &page).unwrap();
+    let index_path = dir.path().join("index.json");
+    let mut index: Value = serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+    index["exchanges"][0]["headers"] = json!([
+        ["Cache-Control", "public, max-age=31536000"],
+        ["Expires", "Wed, 01 Jan 2042 00:00:00 GMT"],
+        ["Pragma", "cache"],
+        ["Strict-Transport-Security", "max-age=31536000"],
+        ["Alt-Svc", "h2=\"example.com:443\""],
+        ["Service-Worker-Allowed", "/"],
+        ["Clear-Site-Data", "\"storage\", \"cookies\""],
+        ["Set-Cookie", "replayed=secret"],
+        ["Content-Type", "application/json"]
+    ]);
+    std::fs::write(index_path, index.to_string()).unwrap();
+    eval(
+        &manager,
+        &instance,
+        &page,
+        "localStorage.setItem('keep','value'); document.cookie='keep=value'; true",
+    );
+    manager
+        .replay_start(&instance, &page, dir.path(), false)
+        .unwrap();
+    let headers = eval(
+        &manager,
+        &instance,
+        &page,
+        "fetch('/data').then(async r=>{await r.text(); return Object.fromEntries(r.headers);})",
+    );
+    assert_eq!(headers["cache-control"], "no-store");
+    for name in [
+        "expires",
+        "pragma",
+        "strict-transport-security",
+        "alt-svc",
+        "service-worker-allowed",
+        "clear-site-data",
+        "set-cookie",
+    ] {
+        assert!(headers[name].is_null(), "{name}: {headers}");
+    }
+    assert_eq!(
+        eval(&manager, &instance, &page, "localStorage.getItem('keep')"),
+        "value"
+    );
+    assert!(eval(&manager, &instance, &page, "document.cookie")
+        .as_str()
+        .unwrap()
+        .contains("keep=value"));
+    manager.replay_stop(&instance, &page).unwrap();
+    // A live response after stop must reach the server, not replay's disk cache.
+    let before = fixture
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| *p == "/data")
+        .count();
+    eval(
+        &manager,
+        &instance,
+        &page,
+        "fetch('/data').then(r=>r.text())",
+    );
+    assert_eq!(
+        fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| *p == "/data")
+            .count(),
+        before + 1
+    );
+    manager.stop(&instance).unwrap();
 }

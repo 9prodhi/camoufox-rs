@@ -391,6 +391,7 @@ impl DaemonRequest {
     pub fn timeout_secs(&self) -> u64 {
         match self {
             Self::Launch { .. } => 180,
+            Self::RecordStop { .. } | Self::ReplayStop { .. } => 300,
             Self::Shutdown => 20,
             Self::Downloads { wait_secs, .. } => wait_secs.unwrap_or(0).saturating_add(10),
             Self::Navigate { timeout_secs, .. }
@@ -417,7 +418,11 @@ impl DaemonRequest {
     }
 
     pub fn read_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.timeout_secs().saturating_add(30))
+        let seconds = match self {
+            Self::RecordStop { .. } | Self::ReplayStop { .. } => 300,
+            _ => self.timeout_secs().saturating_add(30),
+        };
+        std::time::Duration::from_secs(seconds)
     }
 }
 
@@ -662,6 +667,18 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn cassette_stop_client_timeout_allows_draining() {
+        for method in ["RecordStop", "ReplayStop"] {
+            let request: DaemonRequest = serde_json::from_value(
+                json!({"method":method, "params":{"instance_id":"i", "page_id":"p"}}),
+            )
+            .unwrap();
+            assert_eq!(request.timeout_secs(), 300);
+            assert_eq!(request.read_timeout().as_secs(), 300);
+        }
     }
 
     #[test]

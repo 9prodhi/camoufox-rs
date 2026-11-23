@@ -31,17 +31,14 @@ use camoufox::config::LaunchConfig;
 use camoufox::process;
 use camoufox::protocol::client::Connection;
 use camoufox::transport::pipe::PipeTransport;
-use std::path::PathBuf;
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Configure the browser launch with a temporary profile directory
     let temp_dir = tempfile::tempdir()?;
     let mut config = LaunchConfig::default();
-    config.executable = PathBuf::from(std::env::var("CAMOUFOX_BIN").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap();
-        format!("{home}/.cache/camoufox/camoufox")
-    }));
+    // $CAMOUFOX_BIN, else the active/newest `camoufox fetch` install.
+    config.executable = camoufox::config::default_executable();
     config.profile_dir = Some(temp_dir.path().to_owned());
     config.headless = true;
 

@@ -20,16 +20,14 @@ const PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const EVALUATE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn camoufox_binary() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    for path in [
-        PathBuf::from(format!("{home}/.cache/camoufox/camoufox")),
-        PathBuf::from("/root/.cache/camoufox/camoufox"),
-    ] {
-        if path.exists() {
-            return path;
-        }
+    let path = camoufox::config::default_executable();
+    if !path.exists() {
+        panic!(
+            "Camoufox binary not found at {}. Set CAMOUFOX_BIN or run `camoufox fetch`.",
+            path.display()
+        );
     }
-    panic!("Camoufox binary not found in HOME/.cache/camoufox or /root/.cache/camoufox.");
+    path
 }
 
 fn extract_value(result: &serde_json::Value) -> serde_json::Value {

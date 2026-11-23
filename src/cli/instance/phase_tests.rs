@@ -247,7 +247,7 @@ impl Harness {
                 "p".into(),
                 ManagedMainFrame {
                     main_frame: Arc::new(main_frame),
-                    network: None,
+                    network: Default::default(),
                     headers: Vec::new(),
                 },
             )]),

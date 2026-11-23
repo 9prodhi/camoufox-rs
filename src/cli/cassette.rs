@@ -1,13 +1,17 @@
 //! Page network cassette storage and replay.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+pub(super) const FORMAT: &str = "camoufox-cassette";
+pub(super) const VERSION: u32 = 1;
 
 pub(super) fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -62,8 +66,8 @@ pub(super) struct Index {
 impl Index {
     fn new(exchanges: Vec<Exchange>) -> Self {
         Self {
-            format: "camoufox-cassette".into(),
-            version: 1,
+            format: FORMAT.into(),
+            version: VERSION,
             exchanges,
         }
     }
@@ -73,9 +77,22 @@ pub(super) fn scrub_headers(headers: Vec<(String, String)>) -> Vec<(String, Stri
     headers
         .into_iter()
         .filter(|(name, _)| {
-            !["set-cookie", "cookie", "authorization"]
-                .iter()
-                .any(|secret| name.eq_ignore_ascii_case(secret))
+            ![
+                "set-cookie",
+                "cookie",
+                "authorization",
+                "proxy-authorization",
+                "proxy-authenticate",
+                "www-authenticate",
+                "authentication-info",
+                "x-csrf-token",
+                "x-xsrf-token",
+                "x-auth-token",
+                "x-api-key",
+                "x-amz-security-token",
+            ]
+            .iter()
+            .any(|secret| name.eq_ignore_ascii_case(secret))
         })
         .collect()
 }
@@ -83,29 +100,87 @@ pub(super) fn scrub_headers(headers: Vec<(String, String)>) -> Vec<(String, Stri
 pub(super) fn replay_headers(headers: &[(String, String)], len: u64) -> Vec<(String, String)> {
     let mut headers = scrub_headers(headers.to_vec());
     headers.retain(|(name, _)| {
-        !["content-encoding", "content-length", "transfer-encoding"]
-            .iter()
-            .any(|h| name.eq_ignore_ascii_case(h))
+        ![
+            "content-encoding",
+            "content-length",
+            "transfer-encoding",
+            "cache-control",
+            "expires",
+            "pragma",
+            "strict-transport-security",
+            "alt-svc",
+            "service-worker-allowed",
+            "clear-site-data",
+            "set-cookie",
+        ]
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
     });
     headers.push(("Content-Length".into(), len.to_string()));
+    headers.push(("Cache-Control".into(), "no-store".into()));
     headers
 }
 
-type Bodies = HashMap<String, Vec<u8>>;
+#[derive(Debug)]
+pub(super) struct Body {
+    path: PathBuf,
+    len: u64,
+}
+
+impl Body {
+    pub fn read(&self, hash: &str) -> Result<Vec<u8>, String> {
+        let read = || -> std::io::Result<Vec<u8>> {
+            let file = open_body(&self.path)?;
+            if file.metadata()?.len() != self.len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "cassette body length changed",
+                ));
+            }
+            let mut bytes = Vec::new();
+            file.take(self.len.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        let bytes = read().map_err(|e| format!("io error: reading cassette body: {e}"))?;
+        if bytes.len() as u64 != self.len || sha256(&bytes) != hash {
+            return Err("io error: cassette body changed during replay".into());
+        }
+        Ok(bytes)
+    }
+}
+
+fn open_body(path: &Path) -> std::io::Result<std::fs::File> {
+    // A replaced FIFO must not block validation or the replay worker.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cassette body is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+pub(super) type Bodies = HashMap<String, Body>;
 
 pub(super) fn load(dir: &Path) -> Result<(Index, Bodies), String> {
     absolute(dir)?;
     let invalid = |e| format!("invalid argument: invalid cassette: {e}");
-    let index: Index = serde_json::from_slice(
-        &std::fs::read(dir.join("index.json")).map_err(|e| invalid(e.to_string()))?,
-    )
-    .map_err(|e| invalid(e.to_string()))?;
-    if index.format != "camoufox-cassette" {
-        return Err(invalid("unsupported format".into()));
+    let bytes = std::fs::read(dir.join("index.json")).map_err(|e| invalid(e.to_string()))?;
+    #[derive(Deserialize)]
+    struct Header {
+        format: String,
+        version: u32,
     }
-    if index.version != 1 {
-        return Err(invalid("unsupported version".into()));
+    let header: Header = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    if header.format != FORMAT || header.version != VERSION {
+        return Err("invalid argument: unsupported cassette format/version".into());
     }
+    let index: Index = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
     let mut bodies = HashMap::new();
     let mut seqs = HashSet::new();
     for e in &index.exchanges {
@@ -129,39 +204,72 @@ pub(super) fn load(dir: &Path) -> Result<(Index, Bodies), String> {
             return Err(invalid("invalid response headers".into()));
         }
         if !bodies.contains_key(&e.body_sha256) {
-            let body = std::fs::read(dir.join("bodies").join(&e.body_sha256))
+            let path = dir.join("bodies").join(&e.body_sha256);
+            let file = open_body(&path)
                 .map_err(|err| invalid(format!("body {}: {err}", e.body_sha256)))?;
-            if sha256(&body) != e.body_sha256 {
+            let mut file = file.take(e.body_len.saturating_add(1));
+            let mut hash = Sha256::new();
+            let mut len = 0;
+            let mut buffer = [0; 64 * 1024];
+            loop {
+                let n = file
+                    .read(&mut buffer)
+                    .map_err(|err| invalid(format!("body {}: {err}", e.body_sha256)))?;
+                if n == 0 {
+                    break;
+                }
+                hash.update(&buffer[..n]);
+                len += n as u64;
+            }
+            if format!("{:x}", hash.finalize()) != e.body_sha256 {
                 return Err(invalid(format!("body {} sha256 mismatch", e.body_sha256)));
             }
-            bodies.insert(e.body_sha256.clone(), body);
+            bodies.insert(e.body_sha256.clone(), Body { path, len });
         }
-        if bodies[&e.body_sha256].len() as u64 != e.body_len {
+        if bodies[&e.body_sha256].len != e.body_len {
             return Err(invalid(format!("body {} length mismatch", e.body_sha256)));
         }
     }
     Ok((index, bodies))
 }
 
+fn check_directory(path: &Path) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("io error: inspecting cassette directory: {e}"))?;
+    if !meta.file_type().is_dir()
+        || meta.uid() != unsafe { libc::getuid() }
+        || meta.mode() & 0o077 != 0
+    {
+        return Err(format!("invalid argument: insecure cassette directory {} (expected a real, owner-only directory owned by this uid)", path.display()));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(super) struct Recorder {
     dir: PathBuf,
-    filters: Vec<Regex>,
+    pub(super) filters: Vec<Regex>,
     exchanges: Vec<Exchange>,
     bodies: HashSet<String>,
+    skipped: Vec<Value>,
 }
 
 impl Recorder {
     pub fn new(dir: &Path, filters: &[String]) -> Result<Self, String> {
         absolute(dir)?;
+        // Remove trailing slash and dot spellings before lstat, which would
+        // otherwise follow a final symlink. Components preserves `..`.
+        let normalized: PathBuf = dir.components().collect();
+        let dir = normalized.as_path();
         let filters = filters
             .iter()
             .map(|r| Regex::new(r).map_err(|e| format!("invalid argument: invalid URL regex: {e}")))
             .collect::<Result<_, _>>()?;
-        if dir.exists() {
-            if !dir.is_dir() {
+        if let Ok(meta) = std::fs::symlink_metadata(dir) {
+            if !meta.is_dir() {
                 return Err("invalid argument: cassette path must be a directory".into());
             }
+            check_directory(dir)?;
             if std::fs::read_dir(dir)
                 .map_err(|e| format!("io error: {e}"))?
                 .next()
@@ -170,39 +278,55 @@ impl Recorder {
                 return Err("invalid argument: refusing non-empty cassette directory".into());
             }
         }
-        std::fs::create_dir_all(dir).map_err(|e| format!("io error: {e}"))?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("io error: {e}"))?;
+        check_directory(dir)?;
         // Reserve the directory atomically across independent instance workers.
-        std::fs::create_dir(dir.join("bodies")).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                "invalid argument: refusing non-empty cassette directory".into()
-            } else {
-                format!("io error: {e}")
-            }
-        })?;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir.join("bodies"))
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    "invalid argument: refusing non-empty cassette directory".into()
+                } else {
+                    format!("io error: {e}")
+                }
+            })?;
         Ok(Self {
             dir: dir.into(),
             filters,
             exchanges: Vec::new(),
             bodies: HashSet::new(),
+            skipped: Vec::new(),
         })
-    }
-
-    pub fn matches(&self, url: &str) -> bool {
-        self.filters.is_empty() || self.filters.iter().any(|r| r.is_match(url))
     }
 
     pub fn store(&mut self, exchange: Exchange, body: &[u8]) -> Result<(), String> {
         if self.bodies.insert(exchange.body_sha256.clone()) {
-            std::fs::write(self.dir.join("bodies").join(&exchange.body_sha256), body)
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(self.dir.join("bodies").join(&exchange.body_sha256))
+                .and_then(|mut file| file.write_all(body))
                 .map_err(|e| format!("io error: writing cassette body: {e}"))?;
         }
         self.exchanges.push(exchange);
         Ok(())
     }
 
+    pub fn skip(&mut self, exchange: &Exchange, reason: String) {
+        self.skipped
+            .push(json!({"method": exchange.method, "url": exchange.url, "reason": reason}));
+    }
+
     pub fn finish(mut self) -> Result<Value, String> {
         self.exchanges.sort_by_key(|e| e.seq);
-        let result = json!({"dir": self.dir, "exchanges": self.exchanges.len(), "bodies": self.bodies.len()});
+        let result = json!({"dir": self.dir, "exchanges": self.exchanges.len(), "bodies": self.bodies.len(), "skipped": self.skipped});
         let index = Index::new(self.exchanges);
         let mut temp =
             tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| format!("io error: {e}"))?;
@@ -263,6 +387,14 @@ impl Matcher {
 mod tests {
     use super::*;
 
+    fn private_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
     fn exchange(body: &[u8], seq: u64) -> Exchange {
         Exchange {
             seq,
@@ -280,8 +412,8 @@ mod tests {
     fn cassette_index_roundtrip_and_null_body() {
         let index = Index::new(vec![exchange(b"hello", 0)]);
         let json = serde_json::to_value(&index).unwrap();
-        assert_eq!(json["format"], "camoufox-cassette");
-        assert_eq!(json["version"], 1);
+        assert_eq!(json["format"], FORMAT);
+        assert_eq!(json["version"], VERSION);
         assert!(json["exchanges"][0]["request_body_sha256"].is_null());
         assert_eq!(
             json["exchanges"][0]["headers"][0],
@@ -307,7 +439,8 @@ mod tests {
             replayed,
             vec![
                 ("X-Test".into(), "ok".into()),
-                ("Content-Length".into(), "5".into())
+                ("Content-Length".into(), "5".into()),
+                ("Cache-Control".into(), "no-store".into())
             ]
         );
     }
@@ -346,7 +479,7 @@ mod tests {
 
     #[test]
     fn cassette_validation_missing_hash_length_version_and_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let e = exchange(b"hello", 0);
         std::fs::create_dir(dir.path().join("bodies")).unwrap();
         let write_index = |index: &Index| {
@@ -369,14 +502,14 @@ mod tests {
         write_index(&Index::new(vec![bad]));
         assert!(load(dir.path()).unwrap_err().contains("length"));
         let mut index = Index::new(vec![e]);
-        index.version = 2;
+        index.version = VERSION + 1;
         write_index(&index);
         assert!(load(dir.path()).unwrap_err().contains("version"));
-        index.version = 1;
+        index.version = VERSION;
         index.format = "other".into();
         write_index(&index);
         assert!(load(dir.path()).unwrap_err().contains("format"));
-        index.format = "camoufox-cassette".into();
+        index.format = FORMAT.into();
         index.exchanges[0].body_sha256 = "../outside".into();
         write_index(&index);
         assert!(load(dir.path()).unwrap_err().contains("sha256"));
@@ -388,7 +521,7 @@ mod tests {
     #[test]
     fn cassette_record_directory_and_regex_validation() {
         assert!(Recorder::new(std::path::Path::new("relative"), &[]).is_err());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         assert!(Recorder::new(dir.path(), &["[".into()])
             .unwrap_err()
             .contains("invalid argument:"));
@@ -405,12 +538,21 @@ mod tests {
 
     #[test]
     fn cassette_record_deduplicates_and_filters() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = private_dir();
         let dir = parent.path().join("cassette");
         let mut recorder = Recorder::new(&dir, &["/data$".into(), "/other$".into()]).unwrap();
-        assert!(recorder.matches("https://example.com/data"));
-        assert!(recorder.matches("https://example.com/other"));
-        assert!(!recorder.matches("https://example.com/script.js"));
+        assert!(recorder
+            .filters
+            .iter()
+            .any(|r| r.is_match("https://example.com/data")));
+        assert!(recorder
+            .filters
+            .iter()
+            .any(|r| r.is_match("https://example.com/other")));
+        assert!(!recorder
+            .filters
+            .iter()
+            .any(|r| r.is_match("https://example.com/script.js")));
         recorder.store(exchange(b"hello", 0), b"hello").unwrap();
         recorder.store(exchange(b"hello", 1), b"hello").unwrap();
         let result = recorder.finish().unwrap();
@@ -422,7 +564,7 @@ mod tests {
 
     /// Write `exchanges` plus a valid body for each into a fresh cassette dir.
     fn cassette_with(exchanges: Vec<Exchange>, bodies: &[&[u8]]) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         std::fs::create_dir(dir.path().join("bodies")).unwrap();
         for body in bodies {
             std::fs::write(dir.path().join("bodies").join(sha256(body)), body).unwrap();
@@ -485,12 +627,12 @@ mod tests {
         let dir = cassette_with(vec![low, high], &[b"hello"]);
         let (index, bodies) = load(dir.path()).unwrap();
         assert_eq!(index.exchanges.len(), 2);
-        assert_eq!(bodies.len(), 1, "shared bodies are loaded once");
+        assert_eq!(bodies.len(), 1, "shared bodies are validated once");
     }
 
     #[test]
     fn cassette_load_rejects_missing_malformed_and_unknown_index_fields() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let error = load(dir.path()).unwrap_err();
         assert!(
             error.starts_with("invalid argument: invalid cassette: "),
@@ -500,9 +642,9 @@ mod tests {
             "".to_owned(),
             "{".to_owned(),
             "[]".to_owned(),
-            r#"{"format":"camoufox-cassette","version":1}"#.to_owned(),
-            r#"{"format":"camoufox-cassette","version":1,"exchanges":[],"extra":true}"#.to_owned(),
-            serde_json::json!({"format":"camoufox-cassette","version":1,"exchanges":[{
+            json!({"format":FORMAT,"version":VERSION}).to_string(),
+            json!({"format":FORMAT,"version":VERSION,"exchanges":[],"extra":true}).to_string(),
+            serde_json::json!({"format":FORMAT,"version":VERSION,"exchanges":[{
                 "seq":0,"method":"GET","url":"https://example.com/","request_body_sha256":null,
                 "status":200,"headers":[],"body_sha256":sha256(b""),"body_len":0,"extra":1
             }]})
@@ -519,7 +661,7 @@ mod tests {
 
     #[test]
     fn cassette_empty_recording_finishes_and_loads() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = private_dir();
         let dir = parent.path().join("nested").join("cassette");
         let result = Recorder::new(&dir, &[]).unwrap().finish().unwrap();
         assert_eq!(result["exchanges"], 0);
@@ -534,7 +676,7 @@ mod tests {
 
     #[test]
     fn cassette_record_rejects_file_path_and_second_recorder_on_same_dir() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = private_dir();
         let file = parent.path().join("fixture.pdf");
         std::fs::write(&file, b"contents").unwrap();
         assert_eq!(
@@ -588,7 +730,7 @@ mod tests {
 
     #[test]
     fn cassette_store_write_error_is_io_and_leaves_no_index() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = private_dir();
         let dir = parent.path().join("cassette");
         let mut recorder = Recorder::new(&dir, &[]).unwrap();
         // Replace the reserved bodies/ directory with a regular file so the
@@ -610,7 +752,7 @@ mod tests {
 
     #[test]
     fn cassette_finish_reports_temp_file_failure_as_io() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = private_dir();
         let dir = parent.path().join("cassette");
         let mut recorder = Recorder::new(&dir, &[]).unwrap();
         recorder.store(exchange(b"hello", 0), b"hello").unwrap();
@@ -624,7 +766,7 @@ mod tests {
 
     #[test]
     fn cassette_finish_persist_failure_is_io_and_removes_temp_index() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = private_dir();
         let dir = parent.path().join("cassette");
         let mut recorder = Recorder::new(&dir, &[]).unwrap();
         recorder.store(exchange(b"hello", 0), b"hello").unwrap();
@@ -666,7 +808,209 @@ mod tests {
                 ("x-repeated".into(), "a".into()),
                 ("X-Repeated".into(), "b".into()),
                 ("Content-Length".into(), "0".into()),
+                ("Cache-Control".into(), "no-store".into()),
             ]
         );
+    }
+    #[test]
+    fn cassette_private_directories_and_body_files() {
+        use std::os::unix::fs::MetadataExt;
+        let parent = private_dir();
+        let dir = parent.path().join("cassette");
+        let mut recorder = Recorder::new(&dir, &[]).unwrap();
+        recorder.store(exchange(b"hello", 0), b"hello").unwrap();
+        recorder.finish().unwrap();
+        for (path, mode) in [
+            (dir.clone(), 0o700),
+            (dir.join("bodies"), 0o700),
+            (dir.join("bodies").join(sha256(b"hello")), 0o600),
+            (dir.join("index.json"), 0o600),
+        ] {
+            assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, mode);
+        }
+    }
+
+    #[test]
+    fn cassette_refuses_public_foreign_and_symlinked_directories() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let parent = private_dir();
+        let dir = parent.path().join("cassette");
+        std::fs::create_dir(&dir).unwrap();
+        for mode in [0o755, 0o710, 0o701] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(Recorder::new(&dir, &[])
+                .unwrap_err()
+                .starts_with("invalid argument:"));
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = parent.path().join("link");
+        symlink(&dir, &link).unwrap();
+        for spelling in [&link, &link.join(""), &link.join(".")] {
+            assert!(Recorder::new(spelling, &[])
+                .unwrap_err()
+                .starts_with("invalid argument:"));
+        }
+        if unsafe { libc::getuid() } == 0 {
+            use std::os::unix::ffi::OsStrExt;
+            let name = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(name.as_ptr(), 65534, !0) }, 0);
+            let result = Recorder::new(&dir, &[]);
+            assert_eq!(unsafe { libc::chown(name.as_ptr(), 0, !0) }, 0);
+            assert!(result.unwrap_err().starts_with("invalid argument:"));
+        }
+    }
+
+    #[test]
+    fn cassette_body_creation_never_overwrites_files_or_symlinks() {
+        use std::os::unix::fs::symlink;
+        for link in [false, true] {
+            let parent = private_dir();
+            let dir = parent.path().join("cassette");
+            let mut recorder = Recorder::new(&dir, &[]).unwrap();
+            let target = parent.path().join("keep");
+            std::fs::write(&target, b"keep").unwrap();
+            let body = dir.join("bodies").join(sha256(b"hello"));
+            if link {
+                symlink(&target, &body).unwrap();
+            } else {
+                std::fs::write(&body, b"keep").unwrap();
+            }
+            assert!(recorder
+                .store(exchange(b"hello", 0), b"hello")
+                .unwrap_err()
+                .starts_with("io error:"));
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+            assert_eq!(std::fs::read(&body).unwrap(), b"keep");
+        }
+    }
+
+    #[test]
+    fn cassette_scrubs_extended_credentials_case_insensitively() {
+        let names = [
+            "Proxy-Authorization",
+            "Proxy-Authenticate",
+            "WWW-Authenticate",
+            "Authentication-Info",
+            "X-CSRF-Token",
+            "X-XSRF-Token",
+            "X-Auth-Token",
+            "X-Api-Key",
+            "X-Amz-Security-Token",
+        ];
+        let mut headers: Vec<_> = names
+            .iter()
+            .flat_map(|n| {
+                [
+                    (n.to_uppercase(), "secret".into()),
+                    (n.to_lowercase(), "secret".into()),
+                ]
+            })
+            .collect();
+        headers.push((
+            "Location".into(),
+            "https://example.com/?key=verbatim".into(),
+        ));
+        assert_eq!(
+            scrub_headers(headers),
+            [(
+                "Location".into(),
+                "https://example.com/?key=verbatim".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn cassette_replay_strips_persistent_state_headers() {
+        let names = [
+            "Cache-Control",
+            "Expires",
+            "Pragma",
+            "Strict-Transport-Security",
+            "Alt-Svc",
+            "Service-Worker-Allowed",
+            "Clear-Site-Data",
+            "Set-Cookie",
+        ];
+        let headers: Vec<_> = names
+            .iter()
+            .flat_map(|n| {
+                [
+                    (n.to_uppercase(), "value".into()),
+                    (n.to_lowercase(), "value".into()),
+                ]
+            })
+            .collect();
+        assert_eq!(
+            replay_headers(&headers, 3),
+            [
+                ("Content-Length".into(), "3".into()),
+                ("Cache-Control".into(), "no-store".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn cassette_future_format_is_diagnosed_before_strict_schema() {
+        let dir = private_dir();
+        for header in [
+            json!({"format":FORMAT, "version":VERSION + 1, "new_field":true, "exchanges":"new schema"}),
+            json!({"format":"other", "version":VERSION, "new_field":true}),
+        ] {
+            std::fs::write(dir.path().join("index.json"), header.to_string()).unwrap();
+            assert_eq!(
+                load(dir.path()).unwrap_err(),
+                "invalid argument: unsupported cassette format/version"
+            );
+        }
+    }
+    #[test]
+    fn cassette_replay_body_changes_are_bounded_and_regular_files_only() {
+        use std::os::unix::ffi::OsStrExt;
+        let e = exchange(b"hello", 0);
+        let hash = e.body_sha256.clone();
+        let dir = cassette_with(vec![e], &[b"hello"]);
+        let (_, bodies) = load(dir.path()).unwrap();
+        let path = dir.path().join("bodies").join(&hash);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        assert!(bodies[&hash]
+            .read(&hash)
+            .unwrap_err()
+            .starts_with("io error:"));
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let writer = || {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&path)
+                    {
+                        if let Err(error) = file.write_all(b"hello") {
+                            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+                        }
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let peer = writer();
+        let result = bodies[&hash].read(&hash);
+        peer.join().unwrap();
+        assert!(result.unwrap_err().starts_with("io error:"));
+        let peer = writer();
+        let result = load(dir.path());
+        peer.join().unwrap();
+        assert!(result.unwrap_err().starts_with("invalid argument:"));
     }
 }

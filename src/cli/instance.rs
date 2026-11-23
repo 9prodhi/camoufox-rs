@@ -359,7 +359,7 @@ fn punctuation_descriptor(c: char) -> Option<(&'static str, u32)> {
 /// in the parent `HashMap` key; this struct just owns the frame.
 pub struct ManagedMainFrame {
     pub main_frame: Arc<MainFrame>,
-    pub(crate) network: Option<super::network::NetworkSession>,
+    pub(crate) network: Arc<Mutex<super::network::NetworkState>>,
     /// Extra HTTP headers set on this page so far. `Network.setExtraHTTPHeaders`
     /// replaces the whole set on every call, so the CLI keeps the accumulated
     /// list here and re-sends all of them.
@@ -634,6 +634,19 @@ impl Instance {
 
     /// Adopt any ready popups opened by this instance's pages.
     pub fn adopt_popups(&mut self, context: &crate::api::BrowserContext) {
+        for page in self.adopt_popups_deferred(context) {
+            page.network
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .close();
+        }
+    }
+
+    fn adopt_popups_deferred(
+        &mut self,
+        context: &crate::api::BrowserContext,
+    ) -> Vec<ManagedMainFrame> {
+        let mut removed = Vec::new();
         let mut closed_ids = Vec::new();
         for (page_id, mp) in &self.pages {
             if mp.main_frame.is_closed() || self.registry.is_detached(mp.main_frame.target_id()) {
@@ -641,7 +654,9 @@ impl Instance {
             }
         }
         for id in closed_ids {
-            self.pages.remove(&id);
+            if let Some(page) = self.pages.remove(&id) {
+                removed.push(page);
+            }
             self.record_closed_page(id);
         }
 
@@ -654,11 +669,12 @@ impl Instance {
                 page_id,
                 ManagedMainFrame {
                     main_frame: Arc::new(main_frame),
-                    network: None,
+                    network: Default::default(),
                     headers: Vec::new(),
                 },
             );
         }
+        removed
     }
 
     fn page_mut(&mut self, id: &str) -> Result<&mut ManagedMainFrame, String> {
@@ -695,7 +711,7 @@ impl Instance {
             page_id.clone(),
             ManagedMainFrame {
                 main_frame: Arc::new(main_frame),
-                network: None,
+                network: Default::default(),
                 headers: Vec::new(),
             },
         );
@@ -1913,6 +1929,12 @@ impl Instance {
 
     /// Shut down this instance. Browser.close is followed by pipe EOF, which makes Camoufox exit.
     pub fn stop(self) -> Result<(), String> {
+        for page in self.pages.values() {
+            page.network
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .close();
+        }
         let Instance {
             browser,
             mut child,
@@ -1953,6 +1975,7 @@ struct InstanceEntry {
     /// Closes the protocol connection: rejects in-flight requests and makes
     /// Camoufox exit (pipe EOF). Used by stop/shutdown.
     closer: Arc<Connection>,
+    networks: Arc<Mutex<super::network::NetworkSessions>>,
     /// Download events for this instance's context. `downloads --wait`
     /// blocks on it without taking the instance mutex.
     downloads: Arc<crate::cli::downloads::DownloadLog>,
@@ -2202,6 +2225,7 @@ impl InstanceManager {
                     _download_guards: download_guards,
                 })),
                 closer,
+                networks: Default::default(),
                 downloads: download_log,
             },
         );
@@ -2249,6 +2273,7 @@ impl InstanceManager {
         let InstanceEntry {
             managed: entry,
             closer,
+            networks,
             ..
         } = self
             .instances
@@ -2256,8 +2281,9 @@ impl InstanceManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(instance_id)
             .ok_or_else(|| Self::missing(instance_id))?;
-        // Interrupt any command running on this instance first, so the
-        // instance mutex below frees promptly.
+        // Network workers still need the connection to read completed bodies.
+        super::network::NetworkSessions::close_all(&networks);
+        // Then interrupt other commands so the instance mutex frees promptly.
         let _ = closer.close();
         let inst = entry
             .lock()
@@ -2379,8 +2405,58 @@ impl InstanceManager {
             instance, context, ..
         } = &mut *entry;
         let inst = instance.as_mut().ok_or_else(|| Self::missing(id))?;
-        inst.adopt_popups(context);
-        f(inst, context)
+        let removed = inst.adopt_popups_deferred(context);
+        let result = f(inst, context);
+        drop(entry);
+        for page in removed {
+            page.network
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .close();
+        }
+        result
+    }
+
+    // Look up the page under the instance lock; all validation, disk work,
+    // and draining then run under only this page's network-operation mutex.
+    fn with_network<T>(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        allow_dialog: bool,
+        f: impl FnOnce(
+            &mut super::network::NetworkState,
+            Arc<MainFrame>,
+            Arc<Connection>,
+        ) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let registry = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(instance_id)
+            .map(|e| Arc::clone(&e.networks))
+            .ok_or_else(|| Self::missing(instance_id))?;
+        let (state, page, connection) = self.with_instance(instance_id, |inst, _| {
+            let page = if allow_dialog {
+                inst.page_any(page_id)?
+            } else {
+                inst.page(page_id)?
+            };
+            Ok((
+                Arc::clone(&page.network),
+                Arc::clone(&page.main_frame),
+                Arc::clone(inst.browser.connection()),
+            ))
+        })?;
+        registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register(&state)?;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut state, page, connection)
     }
 
     /// Begin passive HTTP recording for a page into an empty absolute directory.
@@ -2391,36 +2467,19 @@ impl InstanceManager {
         dir: &Path,
         urls: &[String],
     ) -> Result<serde_json::Value, String> {
-        self.with_instance(instance_id, |inst, _| {
-            let connection = Arc::clone(inst.browser.connection());
-            let page = inst.page_mut(page_id)?;
-            if page.network.is_some() {
-                return Err(
-                    "invalid argument: record or replay is already active for this page".into(),
-                );
-            }
-            page.network = Some(super::network::NetworkSession::record(
-                Arc::clone(&page.main_frame),
-                connection,
-                dir,
-                urls,
-            )?);
-            Ok(json!({"recording": true, "dir": dir}))
+        self.with_network(instance_id, page_id, false, |state, page, connection| {
+            state.record(page, connection, dir, urls)
         })
     }
 
-    /// Finalize a page's recording and atomically publish its cassette index.
+    /// Finalize a recording, or return its last stop result with `repeated` set.
     pub fn record_stop(
         &self,
         instance_id: &str,
         page_id: &str,
     ) -> Result<serde_json::Value, String> {
-        self.with_instance(instance_id, |inst, _| {
-            let page = inst.page_mut(page_id)?;
-            if !page.network.as_ref().is_some_and(|s| s.is_recording()) {
-                return Err("invalid argument: recording is not active for this page".into());
-            }
-            page.network.take().unwrap().stop()
+        self.with_network(instance_id, page_id, true, |state, page, _| {
+            state.stop(true, &page)
         })
     }
 
@@ -2432,42 +2491,19 @@ impl InstanceManager {
         dir: &Path,
         match_body: bool,
     ) -> Result<serde_json::Value, String> {
-        self.with_instance(instance_id, |inst, _| {
-            let connection = Arc::clone(inst.browser.connection());
-            let page = inst.page_mut(page_id)?;
-            if page.network.is_some() {
-                return Err(
-                    "invalid argument: record or replay is already active for this page".into(),
-                );
-            }
-            page.network = Some(super::network::NetworkSession::replay(
-                Arc::clone(&page.main_frame),
-                connection,
-                dir,
-                match_body,
-            )?);
-            Ok(json!({"replaying": true, "dir": dir}))
+        self.with_network(instance_id, page_id, false, |state, page, connection| {
+            state.replay(page, connection, dir, match_body)
         })
     }
 
-    /// Disable interception and return the page's replay counts and misses.
+    /// Disable interception and return replay counts, or repeat the last result.
     pub fn replay_stop(
         &self,
         instance_id: &str,
         page_id: &str,
     ) -> Result<serde_json::Value, String> {
-        self.with_instance(instance_id, |inst, _| {
-            let page = inst.page_mut(page_id)?;
-            if page.network.as_ref().is_none_or(|s| s.is_recording()) {
-                return Err("invalid argument: replay is not active for this page".into());
-            }
-            // Stop accepting events and resolve every request already queued
-            // before disabling: Juggler resumes pending requests on disable.
-            let result = page.network.take().unwrap().stop();
-            page.main_frame
-                .set_request_interception(false)
-                .map_err(|e| e.message)?;
-            result
+        self.with_network(instance_id, page_id, true, |state, page, _| {
+            state.stop(false, &page)
         })
     }
 
@@ -2899,6 +2935,15 @@ impl InstanceManager {
 
     /// Close a page.
     pub fn close_tab(&self, instance_id: &str, page_id: &str) -> Result<(), String> {
+        let state = self.with_instance(instance_id, |inst, _| {
+            Ok(inst.pages.get(page_id).map(|p| Arc::clone(&p.network)))
+        })?;
+        if let Some(state) = state {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .close();
+        }
         self.with_instance(instance_id, |inst, _| inst.close_tab(page_id))
     }
 
@@ -2941,15 +2986,26 @@ impl InstanceManager {
     }
 
     pub(crate) fn close_all_connections(&self) {
-        let closers: Vec<_> = self
+        let entries: Vec<_> = self
             .instances
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
-            .map(|e| Arc::clone(&e.closer))
+            .map(|e| (Arc::clone(&e.networks), Arc::clone(&e.closer)))
             .collect();
-        for closer in closers {
-            let _ = closer.close();
+        let workers: Vec<_> = entries
+            .into_iter()
+            .map(|(networks, closer)| {
+                std::thread::spawn(move || {
+                    super::network::NetworkSessions::close_all(&networks);
+                    let _ = closer.close();
+                })
+            })
+            .collect();
+        for worker in workers {
+            if worker.join().is_err() {
+                log::warn!("connection shutdown worker panicked");
+            }
         }
     }
 
@@ -2968,14 +3024,18 @@ impl InstanceManager {
                 |InstanceEntry {
                      managed: entry,
                      closer,
+                     networks,
                      ..
                  }| {
                     std::thread::spawn(move || {
+                        super::network::NetworkSessions::close_all(&networks);
                         let _ = closer.close();
-                        let mut entry = entry
+                        let instance = entry
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if let Some(instance) = entry.instance.take() {
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .instance
+                            .take();
+                        if let Some(instance) = instance {
                             let _ = instance.stop();
                         }
                     })
@@ -3480,7 +3540,7 @@ mod tests {
                 "p1".into(),
                 ManagedMainFrame {
                     main_frame: Arc::new(main_frame),
-                    network: None,
+                    network: Default::default(),
                     headers: Vec::new(),
                 },
             )]),

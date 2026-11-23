@@ -981,23 +981,28 @@ camoufox record stop <INSTANCE_ID> <PAGE_ID>
 ```
 
 `--dir` must be absolute and either absent or empty. Recording refuses every
-non-empty directory, including existing cassettes. Repeat `--url` to include a
-request when its URL matches any regex; omit it to include all HTTP(S) URLs.
+non-empty directory, including existing cassettes. New cassette directories and
+`bodies/` are created with mode 0700; body files and `index.json` use mode 0600.
+An existing directory must be a real directory owned by the current user with
+no group or other permissions; insecure directories return `invalid argument: ...`.
+Repeat `--url` to include a request when its URL matches any regex; omit it to include all HTTP(S) URLs.
 Invalid regexes are rejected before creating the cassette directory.
 
-Recording uses passive page-session network events. It does not enable
-interception, rewrite requests, or change caching. Completed responses are read
-using `get_response_body` on a worker thread, keeping the protocol reader free.
+Recording observes page traffic without changing requests or caching.
 Failed requests and requests still in flight when recording stops are excluded.
-A body read/write failure or an evicted body makes `record stop` fail instead of
-publishing an incomplete index. Juggler does not expose redirect response bodies;
-redirects with a `Location` header are stored with an empty body.
+Responses whose bodies cannot be read are omitted from the cassette and reported
+in `skipped` with their method, URL, and reason; the remaining index is published.
+Camoufox buffers at most 10 MB per response and 100 MB of response bodies in total.
+Larger responses are marked evicted, and the oldest buffered bodies are evicted
+when the total limit is exceeded. Cassette write errors remain fatal and prevent
+index publication. Redirects with a `Location` header are stored with an empty
+body because their response bodies are unavailable.
 
 Start returns `{"recording":true,"dir":"/absolute/cassette"}`. Stop atomically
 publishes `index.json` using a temporary file and rename, and returns:
 
 ```json
-{"dir":"/absolute/cassette","exchanges":8,"bodies":6}
+{"dir":"/absolute/cassette","exchanges":8,"bodies":6,"skipped":[]}
 ```
 
 ### `replay`
@@ -1017,31 +1022,57 @@ these exchanges remains supported.
 
 Replay validates the format, version, metadata, and every referenced body's
 SHA-256 and length before enabling interception. Invalid cassettes return
-`invalid argument: ...`. Bodies are loaded into memory so changes to cassette
-files during replay cannot change the responses.
+`invalid argument: ...`. An unsupported format or version returns
+`invalid argument: unsupported cassette format/version` before validating the
+version-specific schema. Body validation streams from disk; bodies are read on
+demand during replay. Keep cassette files available and unchanged until replay
+stops: a missing or changed body aborts the request and makes replay stop report
+an I/O error.
 
 Matching uses the HTTP method and exact URL, including the query string.
-`--match-body` also compares the SHA-256 of the raw request body, distinguishing
-no body (`null`) from an empty body. Repeated requests consume responses in
+`--match-body` also compares the SHA-256 of the request body, distinguishing
+no body (`null`) from an empty body. For `multipart/form-data`, every occurrence
+of the declared boundary is replaced with a fixed token before hashing, so
+identical form submissions match despite randomly generated boundaries. Other
+request bodies are hashed as raw bytes. Replay decodes and hashes request bodies
+only when `--match-body` is enabled. Older v1 multipart hashes can still match
+byte-identical requests. Repeated requests consume responses in
 recorded request order; after the final occurrence, that response is reused.
 Matched requests receive the recorded status, headers, and decoded body.
 `Content-Encoding`, `Transfer-Encoding`, and the original `Content-Length` are
-removed; `Content-Length` is set to the decoded byte length. Unmatched requests
-are aborted and included in the stop result. Replay disables the page's cache
-while interception is active. Stop first resolves requests accepted before its
-stop boundary, then disables interception and restores caching; later requests
+removed; `Content-Length` is set to the decoded byte length. Replay also removes
+`Cache-Control`, `Expires`, `Pragma`, `Strict-Transport-Security`, `Alt-Svc`,
+`Service-Worker-Allowed`, `Clear-Site-Data`, and `Set-Cookie`, then adds
+`Cache-Control: no-store` to avoid persisting response state. Unmatched requests
+are aborted and included in the stop result, grouped by method and URL with a
+`count`. The list contains at most 1000 distinct entries; `missed_total` counts
+all unmatched requests, including those beyond the list limit. Replay disables
+the page's cache while interception is active. Stop first resolves requests
+accepted before its stop boundary, then disables interception and restores caching; later requests
 resume normal network behavior.
 
 Start returns `{"replaying":true,"dir":"/absolute/cassette"}`. Stop returns:
 
 ```json
-{"served":8,"missed":[{"method":"GET","url":"https://example.com/missing"}]}
+{"served":8,"missed_total":2,"missed":[{"method":"GET","url":"https://example.com/missing","count":2}]}
 ```
 
 Only one recording or replay may be active per page. Starting another, or
-stopping the wrong/inactive mode, returns `invalid argument: ...`. Closing a page
-or stopping its instance removes subscriptions and joins the worker. An active
-recording is finalized on cleanup when body reads and writes succeed.
+stopping the wrong mode, returns `invalid argument: ...`. A stop on a page that
+has already finished that mode returns its last result with `"repeated":true`;
+a stop on a page that has never run that mode returns `invalid argument: ...`.
+Both stop commands work while a JavaScript dialog is open and allow up to 300
+seconds for draining responses. Closing a page, stopping its instance, or shutting
+down the daemon finalizes an active recording before disconnecting the browser,
+provided cassette writes succeed. Abruptly killing the daemon cannot finalize it.
+
+Record and replay each apply to one page, including that page's subframes.
+Popups opened from it are not recorded or replayed. Requests handled by a service
+worker are not intercepted, so replay cannot replace their responses.
+
+Cassettes are trusted input. Served HTML and scripts run with the origin's real
+storage, including cookies, local storage, and service workers. Suppressing
+persistent response headers does not isolate served content from that storage.
 
 Both commands support the global `--socket` and `--json` options. JSON output
 wraps the documented payload in the usual `{"ok":true,"data":...}` response.
@@ -1066,9 +1097,14 @@ wraps the documented payload in the usual `{"ok":true,"data":...}` response.
 ```
 
 Bodies are decoded bytes, stored once per SHA-256 at `bodies/<sha256-hex>`.
-`Set-Cookie`, `Cookie`, and `Authorization` response headers are removed,
-case-insensitively, during recording. Request headers and raw request bodies
-are not persisted. URLs and response bodies are preserved as received.
+The following response headers are removed case-insensitively during recording:
+`Set-Cookie`, `Cookie`, `Authorization`, `Proxy-Authorization`, `Proxy-Authenticate`,
+`WWW-Authenticate`, `Authentication-Info`, `X-CSRF-Token`, `X-XSRF-Token`,
+`X-Auth-Token`, `X-Api-Key`, and `X-Amz-Security-Token`. Request headers and raw
+request bodies are not persisted; only request-body hashes are stored.
+URLs, including query strings and `Location` targets, and decoded response bodies
+are stored verbatim and may contain secrets. Header scrubbing does not remove
+secrets from those URLs or bodies.
 
 ### External Subcommands
 

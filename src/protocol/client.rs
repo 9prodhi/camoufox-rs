@@ -561,7 +561,7 @@ impl Session {
                     normal.min(d.saturating_duration_since(std::time::Instant::now()))
                 })
         };
-        if remaining().is_zero() {
+        if finalize_deadline.is_some() && remaining().is_zero() {
             return Err(ProtocolError::timeout(method, timeout));
         }
         let (rx, id, value) = {
@@ -1960,6 +1960,48 @@ mod tests {
         // don't inspect it here.
         let _ = h.out_rx.recv_timeout(std::time::Duration::from_secs(1));
 
+        teardown(h);
+    }
+
+    #[test]
+    fn zero_timeout_still_sends_request() {
+        let h = setup();
+        let session = h.conn.root_session();
+        let error = session
+            .send_with_timeout(
+                "Runtime.disposeObject",
+                json!({"objectId":"handle"}),
+                Duration::ZERO,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, ProtocolErrorKind::Timeout);
+        let request = h.out_rx.try_recv().expect("request was not sent");
+        assert_eq!(request["method"], "Runtime.disposeObject");
+        assert_eq!(request["params"], json!({"objectId":"handle"}));
+        assert!(h.conn.inner.lock().unwrap().sessions[""].pending.is_empty());
+        teardown(h);
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn expired_finalize_deadline_does_not_send_request() {
+        let h = setup();
+        let deadline = Mutex::new(Some(std::time::Instant::now()));
+        let error = h
+            .conn
+            .root_session()
+            .send_with_finalize_deadline(
+                "Network.getResponseBody",
+                json!({"requestId":"r"}),
+                &deadline,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, ProtocolErrorKind::Timeout);
+        assert!(matches!(
+            h.out_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(h.conn.inner.lock().unwrap().sessions[""].pending.is_empty());
         teardown(h);
     }
 

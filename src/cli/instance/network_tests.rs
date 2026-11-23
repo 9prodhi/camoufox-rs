@@ -217,29 +217,24 @@ impl Harness {
                 session_id: Some("other".into()),
             })
             .unwrap();
-        self.manager
-            .with_instance("mock", |inst, context| {
-                let tracked = context
-                    .registry()
-                    .claim("other-target", Duration::from_secs(2))
-                    .unwrap();
-                let page = MainFrame::from_tracked(
-                    tracked,
-                    self.connection.clone(),
-                    context.registry().clone(),
+        // with_instance adopts ready popups before running its closure.
+        // Wait for that adoption instead of racing it with an explicit claim.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let page_id = self
+                .manager
+                .with_instance(
+                    "mock",
+                    |inst, _| Ok(inst.page_id_for_target("other-target")),
                 )
                 .unwrap();
-                inst.pages.insert(
-                    "p2".into(),
-                    ManagedMainFrame {
-                        main_frame: Arc::new(page),
-                        network: Default::default(),
-                        headers: Vec::new(),
-                    },
-                );
-                Ok(())
-            })
-            .unwrap();
+            if let Some(page_id) = page_id {
+                assert_eq!(page_id, "p2");
+                break;
+            }
+            assert!(Instant::now() < deadline, "other-target was not adopted");
+            std::thread::yield_now();
+        }
     }
 
     fn assert_other_page_works(&self) {
@@ -1436,6 +1431,187 @@ fn popup_self_close_preserves_cassette_and_other_pages() {
     let result = harness.manager.record_stop("mock", "p").unwrap();
     assert_eq!(result["page_closed"], true);
     assert_eq!(result["repeated"], true);
+}
+
+struct CassetteWarnings(Mutex<Vec<String>>);
+
+static CASSETTE_WARNINGS: CassetteWarnings = CassetteWarnings(Mutex::new(Vec::new()));
+
+impl log::Log for CassetteWarnings {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() == log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            let message = record.args().to_string();
+            if message.starts_with("cassette for ") {
+                self.0.lock().unwrap().push(message);
+            }
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn capture_cassette_warnings() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        log::set_logger(&CASSETTE_WARNINGS).unwrap();
+        log::set_max_level(log::LevelFilter::Warn);
+    });
+}
+
+fn cassette_warning_count(page_id: &str) -> usize {
+    let prefix = format!("cassette for {page_id} not published: ");
+    CASSETTE_WARNINGS
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|message| message.starts_with(&prefix))
+        .count()
+}
+
+fn rename_page(harness: &Harness, page_id: &str) {
+    harness
+        .manager
+        .with_instance("mock", |inst, _| {
+            let page = inst.pages.remove("p").unwrap();
+            inst.pages.insert(page_id.into(), page);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn cleanup_does_not_report_previous_stop_failures() {
+    capture_cassette_warnings();
+    for recording in [true, false] {
+        for action in ["close-tab", "stop", "shutdown"] {
+            let harness = Harness::new(|method, params| {
+                if method == "Network.setRequestInterception" && params["enabled"] == false {
+                    Err("disable failed".into())
+                } else {
+                    Ok(json!({}))
+                }
+            });
+            let parent = tempfile::tempdir().unwrap();
+            let page_id = parent.path().file_name().unwrap().to_str().unwrap();
+            rename_page(&harness, page_id);
+            let dir = parent.path().join("cassette");
+            let error = if recording {
+                harness
+                    .manager
+                    .record_start("mock", page_id, &dir, &[])
+                    .unwrap();
+                std::fs::create_dir(dir.join("index.json")).unwrap();
+                harness.manager.record_stop("mock", page_id).unwrap_err()
+            } else {
+                let cassette = empty_cassette();
+                harness
+                    .manager
+                    .replay_start("mock", page_id, cassette.path(), false)
+                    .unwrap();
+                harness.manager.replay_stop("mock", page_id).unwrap_err()
+            };
+            match action {
+                "close-tab" => {
+                    let data = harness
+                        .manager
+                        .close_tab_with_result("mock", page_id)
+                        .unwrap();
+                    assert!(data.get("cassette_errors").is_none(), "{data}");
+                    let retained = if recording {
+                        harness.manager.record_stop("mock", page_id)
+                    } else {
+                        harness.manager.replay_stop("mock", page_id)
+                    };
+                    assert_eq!(retained.unwrap_err(), error);
+                }
+                "stop" => {
+                    let data = harness.manager.stop_with_result("mock").unwrap();
+                    assert!(data.get("cassette_errors").is_none(), "{data}");
+                }
+                _ => harness.manager.shutdown_all(),
+            }
+            assert_eq!(cassette_warning_count(page_id), 0, "{action}");
+        }
+    }
+}
+
+#[test]
+fn cassette_failures_are_reported_once_during_instance_cleanup() {
+    capture_cassette_warnings();
+    for action in ["stop", "shutdown", "direct-stop"] {
+        let harness = Harness::new(|_, _| Ok(json!({})));
+        let parent = tempfile::tempdir().unwrap();
+        let page_id = parent.path().file_name().unwrap().to_str().unwrap();
+        rename_page(&harness, page_id);
+        let dir = parent.path().join("cassette");
+        harness
+            .manager
+            .record_start("mock", page_id, &dir, &[])
+            .unwrap();
+        std::fs::create_dir(dir.join("index.json")).unwrap();
+        match action {
+            "stop" => {
+                let data = harness.manager.stop_with_result("mock").unwrap();
+                assert_eq!(data["cassette_errors"].as_array().unwrap().len(), 1);
+            }
+            "shutdown" => harness.manager.shutdown_all(),
+            _ => {
+                let entry = harness
+                    .manager
+                    .instances
+                    .lock()
+                    .unwrap()
+                    .remove("mock")
+                    .unwrap();
+                let instance = entry.managed.lock().unwrap().instance.take().unwrap();
+                instance.stop().unwrap();
+            }
+        }
+        assert_eq!(
+            cassette_warning_count(page_id),
+            usize::from(action != "stop"),
+            "{action}"
+        );
+    }
+}
+
+#[test]
+fn close_tab_failure_logs_cassette_errors() {
+    capture_cassette_warnings();
+    let harness = Harness::new(|method, _| {
+        if method == "Page.close" {
+            Err("close rejected".into())
+        } else {
+            Ok(json!({}))
+        }
+    });
+    let parent = tempfile::tempdir().unwrap();
+    let page_id = parent.path().file_name().unwrap().to_str().unwrap();
+    rename_page(&harness, page_id);
+    let dir = parent.path().join("cassette");
+    harness
+        .manager
+        .record_start("mock", page_id, &dir, &[])
+        .unwrap();
+    std::fs::create_dir(dir.join("index.json")).unwrap();
+    assert_eq!(
+        harness
+            .manager
+            .close_tab_with_result("mock", page_id)
+            .unwrap_err(),
+        "close tab failed: close rejected"
+    );
+    assert_eq!(cassette_warning_count(page_id), 1);
+    assert!(harness
+        .manager
+        .record_stop("mock", page_id)
+        .unwrap_err()
+        .starts_with("io error:"));
 }
 
 #[test]

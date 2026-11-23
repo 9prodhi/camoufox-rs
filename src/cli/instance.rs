@@ -1972,6 +1972,10 @@ impl Instance {
         let errors =
             super::network::NetworkSessions::close_all(&networks, self.browser.connection());
         super::network::log_cassette_errors(&errors);
+        self.stop_after_network_cleanup()
+    }
+
+    fn stop_after_network_cleanup(self) -> Result<(), String> {
         let Instance {
             browser,
             mut child,
@@ -2341,7 +2345,7 @@ impl InstanceManager {
             .instance
             .take()
             .ok_or_else(|| Self::missing(instance_id))?;
-        inst.stop()?;
+        inst.stop_after_network_cleanup()?;
         Ok(if errors.is_empty() {
             serde_json::Value::Null
         } else {
@@ -3057,7 +3061,8 @@ impl InstanceManager {
         let errors = state.map_or_else(Vec::new, |state| {
             super::network::NetworkSessions::close_page(&networks, page_id, &state)
         });
-        self.with_instance(instance_id, |inst, _| inst.close_tab(page_id))?;
+        self.with_instance(instance_id, |inst, _| inst.close_tab(page_id))
+            .inspect_err(|_| super::network::log_cassette_errors(&errors))?;
         let mut data = json!({"closed_page":page_id});
         if !errors.is_empty() {
             data["cassette_errors"] = json!(errors);
@@ -3156,7 +3161,7 @@ impl InstanceManager {
                             .instance
                             .take();
                         if let Some(instance) = instance {
-                            let _ = instance.stop();
+                            let _ = instance.stop_after_network_cleanup();
                         }
                     })
                 },

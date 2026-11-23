@@ -8,6 +8,7 @@ This crate implements the full stack needed to automate a Camoufox browser proce
 
 - Library crate with a synchronous API for Juggler domains (`Browser`, `MainFrame`, `Network`, `Runtime`, `Heap`)
 - Optional CLI (`--features cli`) with a Unix socket daemon for multi-instance management
+- Page HTTP cassette recording and deterministic offline replay with `record start/stop` and `replay start/stop`
 - Unix implementation (process + fd pipe model): Linux and macOS. Windows is not supported.
 ## Documentation
 
@@ -20,7 +21,7 @@ The project's documentation follows the [Diataxis](https://diataxis.fr/) framewo
 | **How-To** | [Iframes and Shadow DOM](docs/howto-iframes-and-shadow-dom.md) | Navigating nested frames and piercing shadow DOM with `>>>` |
 | **How-To** | [Downloads and Dialogs](docs/howto-downloads-and-dialogs.md) | Safe file downloads, the click-then-poll download pattern, and handling JS dialogs |
 | **How-To** | [Library Usage Guide](docs/howto-library-usage.md) | Using `camoufox-rs` as a Rust library crate in your application |
-| **Reference** | [CLI Reference](docs/reference-cli.md) | Exhaustive command reference for all 33 CLI subcommands |
+| **Reference** | [CLI Reference](docs/reference-cli.md) | Exhaustive command reference for CLI subcommands |
 | **Reference** | [Library API Reference](docs/reference-library-api.md) | Complete crate and module API reference |
 | **Reference** | [Juggler Protocol Reference](docs/PROTOCOL.md) | Wire-level Juggler protocol specification |
 | **Explanation** | [Architecture & Design](docs/explanation-architecture.md) | Pipe transport, security model, coordinate spaces, and process lifecycle |

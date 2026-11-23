@@ -244,7 +244,8 @@ impl Harness {
             pages: HashMap::from([(
                 "p".into(),
                 ManagedMainFrame {
-                    main_frame,
+                    main_frame: Arc::new(main_frame),
+                    network: None,
                     headers: Vec::new(),
                 },
             )]),

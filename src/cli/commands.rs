@@ -49,6 +49,18 @@ pub enum Command {
     /// Start the daemon process.
     Serve,
 
+    /// Record a page's HTTP exchanges into a cassette.
+    Record {
+        #[command(subcommand)]
+        action: RecordAction,
+    },
+
+    /// Serve a page's HTTP requests from a cassette, aborting misses.
+    Replay {
+        #[command(subcommand)]
+        action: ReplayAction,
+    },
+
     /// Launch a new browser instance.
     Launch {
         /// Run in headed mode (show browser window).
@@ -494,5 +506,96 @@ pub enum Command {
         /// Optional timeout in seconds to wait for download events.
         #[arg(long)]
         wait: Option<u64>,
+    },
+}
+
+#[cfg(test)]
+mod cassette_command_tests {
+    use super::*;
+
+    #[test]
+    fn record_replay_contract_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "camoufox",
+            "record",
+            "start",
+            "i",
+            "p1",
+            "--dir",
+            "/tmp/cassette",
+            "--url",
+            "example",
+            "--url",
+            "data",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Record { action: RecordAction::Start { urls, .. } } if urls == ["example", "data"])
+        );
+        let cli = Cli::try_parse_from([
+            "camoufox",
+            "replay",
+            "start",
+            "i",
+            "p1",
+            "--dir",
+            "/tmp/cassette",
+            "--match-body",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Replay {
+                action: ReplayAction::Start {
+                    match_body: true,
+                    ..
+                }
+            }
+        ));
+        assert!(Cli::try_parse_from(["camoufox", "record", "stop", "i", "p1"]).is_ok());
+        assert!(Cli::try_parse_from(["camoufox", "replay", "stop", "i", "p1"]).is_ok());
+        assert!(Cli::try_parse_from(["camoufox", "record", "start", "i", "p1"]).is_err());
+    }
+}
+
+/// Start or stop recording a page's HTTP exchanges.
+#[derive(Subcommand)]
+pub enum RecordAction {
+    /// Begin passive recording into an empty absolute directory.
+    Start {
+        instance_id: String,
+        page_id: String,
+        /// Absolute cassette directory; must be empty or absent.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Include URLs matching any of these regexes (all URLs by default).
+        #[arg(long = "url", action = clap::ArgAction::Append)]
+        urls: Vec<String>,
+    },
+    /// Finalize the cassette and return exchange and body counts.
+    Stop {
+        instance_id: String,
+        page_id: String,
+    },
+}
+
+/// Start or stop offline replay of a page's HTTP requests.
+#[derive(Subcommand)]
+pub enum ReplayAction {
+    /// Validate a cassette and enable interception for this page.
+    Start {
+        instance_id: String,
+        page_id: String,
+        /// Absolute cassette directory containing index.json and bodies/.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Include the raw request body hash in matching.
+        #[arg(long)]
+        match_body: bool,
+    },
+    /// Disable interception and return served count and missed requests.
+    Stop {
+        instance_id: String,
+        page_id: String,
     },
 }

@@ -329,7 +329,8 @@ fn punctuation_descriptor(c: char) -> Option<(&'static str, u32)> {
 /// A `MainFrame` plus its CLI-facing page label tracking. The label lives
 /// in the parent `HashMap` key; this struct just owns the frame.
 pub struct ManagedMainFrame {
-    pub main_frame: MainFrame,
+    pub main_frame: Arc<MainFrame>,
+    pub(crate) network: Option<super::network::NetworkSession>,
     /// Extra HTTP headers set on this page so far. `Network.setExtraHTTPHeaders`
     /// replaces the whole set on every call, so the CLI keeps the accumulated
     /// list here and re-sends all of them.
@@ -518,7 +519,8 @@ impl Instance {
             self.pages.insert(
                 page_id,
                 ManagedMainFrame {
-                    main_frame,
+                    main_frame: Arc::new(main_frame),
+                    network: None,
                     headers: Vec::new(),
                 },
             );
@@ -558,7 +560,8 @@ impl Instance {
         self.pages.insert(
             page_id.clone(),
             ManagedMainFrame {
-                main_frame,
+                main_frame: Arc::new(main_frame),
+                network: None,
                 headers: Vec::new(),
             },
         );
@@ -2086,6 +2089,94 @@ impl InstanceManager {
         f(inst, context)
     }
 
+    /// Begin passive HTTP recording for a page into an empty absolute directory.
+    pub fn record_start(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        dir: &Path,
+        urls: &[String],
+    ) -> Result<serde_json::Value, String> {
+        self.with_instance(instance_id, |inst, _| {
+            let connection = Arc::clone(inst.browser.connection());
+            let page = inst.page_mut(page_id)?;
+            if page.network.is_some() {
+                return Err(
+                    "invalid argument: record or replay is already active for this page".into(),
+                );
+            }
+            page.network = Some(super::network::NetworkSession::record(
+                Arc::clone(&page.main_frame),
+                connection,
+                dir,
+                urls,
+            )?);
+            Ok(json!({"recording": true, "dir": dir}))
+        })
+    }
+
+    /// Finalize a page's recording and atomically publish its cassette index.
+    pub fn record_stop(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        self.with_instance(instance_id, |inst, _| {
+            let page = inst.page_mut(page_id)?;
+            if !page.network.as_ref().is_some_and(|s| s.is_recording()) {
+                return Err("invalid argument: recording is not active for this page".into());
+            }
+            page.network.take().unwrap().stop()
+        })
+    }
+
+    /// Validate a cassette and enable offline replay for a page.
+    pub fn replay_start(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        dir: &Path,
+        match_body: bool,
+    ) -> Result<serde_json::Value, String> {
+        self.with_instance(instance_id, |inst, _| {
+            let connection = Arc::clone(inst.browser.connection());
+            let page = inst.page_mut(page_id)?;
+            if page.network.is_some() {
+                return Err(
+                    "invalid argument: record or replay is already active for this page".into(),
+                );
+            }
+            page.network = Some(super::network::NetworkSession::replay(
+                Arc::clone(&page.main_frame),
+                connection,
+                dir,
+                match_body,
+            )?);
+            Ok(json!({"replaying": true, "dir": dir}))
+        })
+    }
+
+    /// Disable interception and return the page's replay counts and misses.
+    pub fn replay_stop(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        self.with_instance(instance_id, |inst, _| {
+            let page = inst.page_mut(page_id)?;
+            if page.network.as_ref().is_none_or(|s| s.is_recording()) {
+                return Err("invalid argument: replay is not active for this page".into());
+            }
+            // Stop accepting events and resolve every request already queued
+            // before disabling: Juggler resumes pending requests on disable.
+            let result = page.network.take().unwrap().stop();
+            page.main_frame
+                .set_request_interception(false)
+                .map_err(|e| e.message)?;
+            result
+        })
+    }
+
     /// Access the download log for an instance without locking the instance.
     pub fn download_log(
         &self,
@@ -3027,7 +3118,8 @@ mod tests {
             pages: HashMap::from([(
                 "p1".into(),
                 ManagedMainFrame {
-                    main_frame,
+                    main_frame: Arc::new(main_frame),
+                    network: None,
                     headers: Vec::new(),
                 },
             )]),

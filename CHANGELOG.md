@@ -2,15 +2,51 @@
 
 All notable changes to camoufox-rs are documented here.
 
-## [Unreleased]
+## [0.2.1] - 2026-11-23
+
+Upload files to file inputs, record and replay network traffic, and keep browsing data across launches with persistent profiles.
+
+### Breaking changes
+
+This crate is pre-1.0. Although this is a patch release, the following public Rust API changes break code that constructs or exhaustively matches these types:
+
+- `cli::error_kind::ErrorKind`, `cli::ipc::DaemonRequest`, `cli::ipc::DaemonResponse`, and `cli::instance::LaunchOptions` are `#[non_exhaustive]`. Enum matches need a wildcard; create responses with their constructors and launch options with `Default` followed by field assignment.
+- `DaemonResponse` adds the public `kind: Option<String>` field. `DaemonRequest::Launch` and `LaunchOptions` add `profile_dir: Option<String>`.
+- `DaemonRequest` adds `Upload`, `RecordStart`, `RecordStop`, `ReplayStart`, and `ReplayStop` variants.
+- `cli::commands::Command` adds `Upload`, `Record`, `Replay`, and `External` variants, and its `Launch` variant adds `profile_dir: Option<PathBuf>`.
+- `cli::instance::ManagedMainFrame.main_frame` is now `Arc<MainFrame>`. A new private field also prevents downstream struct-literal construction and requires `..` when destructuring.
+
+### Behaviour changes
+
+- Errors in `--json` output now include a machine-readable `kind`; successful responses omit it. Daemon error messages remain intact. Client-side argument validation reports `invalid_argument` with exit code 2; local path-resolution failures report `io` with exit code 1.
+- Clients backfill missing error kinds from older daemons' messages and preserve daemon-provided kinds, including unknown values. Consumers should treat unknown kinds as `other`.
+- Persistent `launch` success data confirms the canonical `profile_dir`; `list` includes it in JSON and plain output. If an older daemon cannot confirm profile support, the client stops the returned instance and reports a `daemon` error with restart instructions. Failed cleanup includes the instance ID for manual cleanup.
+- `close-tab`, instance `stop`, popup closure, and daemon shutdown finalize active cassettes. Tab and popup cleanup get a 15-second budget after acquiring that page's network-operation lock and preserve other tabs' connections. Stop and shutdown share a 15-second budget across an instance's pages and may disconnect the browser at expiry. Unfinished recording exchanges report `finalize deadline exceeded`; the remaining index is published if writes succeed.
+- `close-tab` and `stop` include finalization failures in success data as `cassette_errors` entries with `page_id`, `mode`, and `error`. Plain output warns on stderr and still exits 0. Popup cleanup and shutdown log failures.
+- Repeated `record stop` and `replay stop` return the last result with `repeated: true`, including while a dialog is open. Results for up to 64 closed pages per instance also carry `page_closed: true`; retained failures remain errors. A failed start clears that mode's previous stop result.
+- Protocol response waits use the timeout remaining after request setup and sending.
+- External subcommands retry Unix `ETXTBSY` spawn failures up to five total attempts, waiting 10, 20, 30, and 40 ms. Other spawn failures return immediately. Missing commands retain clap's native errors, suggestions, and exit code 2.
+
+### Added
+
+- `upload` sets one or more regular files on file inputs, including hidden inputs, nested `--frame` scopes, and open shadow roots through ` >>> `. Relative paths resolve against the client's working directory; paths are validated before page access. Selection replaces existing files and dispatches `input` and `change`; multiple files require `multiple`. Plain output lists basenames; JSON returns `uploaded`, `selector`, and `files`, with optional `dialog` data if an upload handler opens a JavaScript dialog. Directory-picker (`webkitdirectory`) inputs are rejected with `invalid_argument`.
+- `record start/stop` passively captures a page's HTTP(S) traffic, including subframes, with optional repeated `--url` regex filters. Format v1 (`camoufox-cassette`) stores `index.json` and deduplicated decoded bodies under `bodies/<sha256>`, publishing the index atomically at stop. Recording requires an absent or empty absolute directory, uses owner-only directories (0700) and files (0600), and refuses insecure existing directories.
+- Recording respects Camoufox's body-buffer limits of 10 MB per response and 100 MB total. Failed and still-in-flight requests are excluded; unreadable or evicted bodies appear in `skipped` with method, URL, and reason. Write failures prevent index publication; abruptly killing the daemon leaves the cassette unpublished. Redirects can be recorded with empty bodies.
+- `replay start/stop` serves recorded responses offline, matches method and exact URL, and optionally matches request-body SHA-256 with `--match-body`. Multipart boundaries are normalized for matching; absent and empty bodies remain distinct. Repeated requests consume responses in recorded order, then reuse the last response. Misses are aborted and reported by method/URL with counts, at most 1000 distinct entries, and an uncapped `missed_total`.
+- Replay validates format v1, metadata, body hashes, and lengths before interception. Index files must be regular, non-symlink files of at most 64 MiB; bodies are streamed for validation and rechecked on demand. Missing or modified bodies abort requests and make stop return an I/O error. Validation, disk I/O, and draining run outside the instance lock so other page commands can continue; failed interception setup rolls back cleanly. Redirect cassettes are refused because redirected requests bypass interception. One recording or replay may run per page; popups and requests handled by service workers are outside its scope. Explicit stop commands allow 300 seconds to drain responses; replay stop drains accepted requests before restoring normal networking and caching.
+- Cassettes scrub credential response headers and store no request headers or raw request bodies, only request-body hashes. URLs, query strings, redirect targets, and decoded response bodies remain verbatim and can contain secrets. Replay strips persistent-state and encoding/framing headers, sets the decoded content length and `Cache-Control: no-store`, and disables page caching while active. Cassette HTML and scripts still run with the origin's real storage; use trusted cassettes.
+- `launch --profile-dir` keeps cookies, localStorage, IndexedDB, and other profile data across launches through the browser's default context, where pages and downloads are tracked. It accepts an absolute empty directory or a profile containing `prefs.js` or `times.json`, creates missing directories with mode 0700, rejects unrelated non-empty directories before changing permissions, removes group/other permissions while preserving special permission bits, and canonicalizes paths. The daemon reserves each canonical profile through launch and process exit, refusing concurrent launches through path aliases. Failed launches release reservations; stop and shutdown flush storage and keep the directory.
+- External subcommands run `camoufox-<name>` executables from absolute `PATH` entries, forwarding arguments, environment, standard streams, and exit status. Built-ins take precedence. `CAMOUFOX_SOCKET` receives the absolute socket path; global `--json` sets `CAMOUFOX_JSON=1`, otherwise that variable is cleared. Global `--socket` also reads `CAMOUFOX_SOCKET`, with an explicit flag taking precedence.
+- `cli::error_kind::ErrorKind` classifies errors as `selector_not_found`, `timeout`, `dialog_open`, `frame_detached`, `frame_not_found`, `not_iframe`, `shadow_root`, `navigation`, `instance_not_found`, `page_not_found`, `page_closed`, `invalid_argument`, `io`, `daemon`, or `other`.
+- `Browser::default_context` exposes the persistent browser context; connect with `BrowserOptions::attach_to_default_context: true` for page events. Its context ID is empty and `BrowserContext::close` only drops the handle; use `Browser::close` to flush storage and close pages. `MainFrame::set_file_input_files_with_timeout` adds an explicit timeout alongside `set_file_input_files`.
+- `InstanceManager::{upload, record_start, record_stop, replay_start, replay_stop}`, `Instance::persistent_profile_dir`, `cli::instance::prepare_profile_dir`, and `cli::commands::{RecordAction, ReplayAction, find_external_subcommand}` expose the new features to Rust callers.
+- `camoufox::config::default_executable()`, the shared browser lookup.
 
 ### Fixed
 
 - The browser is now found where current Camoufox installs it. Without `--executable` or `CAMOUFOX_BIN`, the CLI daemon, integration tests and `web_browse` example now use the install marked active in `~/.cache/camoufox/config.json`, then the newest `~/.cache/camoufox/browsers/<repo>/<version>/camoufox`, before falling back to the legacy `~/.cache/camoufox/camoufox`. `XDG_CACHE_HOME` is honoured. An empty `CAMOUFOX_BIN` is now treated as unset.
 
-### Added
-
-- `camoufox::config::default_executable()`, the shared browser lookup.
+After upgrading, restart running daemons: `camoufox shutdown`, then `camoufox serve`.
 
 ## [0.2.0] - 2026-11-21
 

@@ -111,6 +111,9 @@ Commands that return a void result (such as `stop` and `shutdown`) return `{"ok"
 | [`tabs`](#tabs) | List the open pages (tabs) of an instance with their URLs and titles |
 | [`close-tab`](#close-tab) | Close a page (tab) |
 | [`downloads`](#downloads) | View or wait for downloads on an instance |
+| [`record`](#record) | Record a page's HTTP exchanges into a cassette |
+| [`replay`](#replay) | Serve a page's requests from a cassette offline |
+| [External subcommands](#external-subcommands) | Run `camoufox-<name>` executables from `PATH` |
 
 ---
 
@@ -966,6 +969,106 @@ JSON output shape:
 }
 ```
 Each entry in the `downloads` array is a `DownloadEntry` object.
+
+### `record`
+
+Capture HTTP exchanges for a page, including its subframes, scripts, images,
+and XHR/fetch requests.
+
+```text
+camoufox record start <INSTANCE_ID> <PAGE_ID> --dir <ABS_DIR> [--url <REGEX>]...
+camoufox record stop <INSTANCE_ID> <PAGE_ID>
+```
+
+`--dir` must be absolute and either absent or empty. Recording refuses every
+non-empty directory, including existing cassettes. Repeat `--url` to include a
+request when its URL matches any regex; omit it to include all HTTP(S) URLs.
+Invalid regexes are rejected before creating the cassette directory.
+
+Recording uses passive page-session network events. It does not enable
+interception, rewrite requests, or change caching. Completed responses are read
+using `get_response_body` on a worker thread, keeping the protocol reader free.
+Failed requests and requests still in flight when recording stops are excluded.
+A body read/write failure or an evicted body makes `record stop` fail instead of
+publishing an incomplete index. Juggler does not expose redirect response bodies;
+redirects with a `Location` header are stored with an empty body.
+
+Start returns `{"recording":true,"dir":"/absolute/cassette"}`. Stop atomically
+publishes `index.json` using a temporary file and rename, and returns:
+
+```json
+{"dir":"/absolute/cassette","exchanges":8,"bodies":6}
+```
+
+### `replay`
+
+Serve a page's HTTP requests entirely from a cassette. The original server can
+be stopped before replay begins.
+
+```text
+camoufox replay start <INSTANCE_ID> <PAGE_ID> --dir <ABS_DIR> [--match-body]
+camoufox replay stop <INSTANCE_ID> <PAGE_ID>
+```
+
+Juggler bypasses interception for requests following redirects. To preserve
+offline behavior, replay rejects cassettes containing redirect responses
+(301/302/303/307/308 with `Location`) before enabling interception. Recording
+these exchanges remains supported.
+
+Replay validates the format, version, metadata, and every referenced body's
+SHA-256 and length before enabling interception. Invalid cassettes return
+`invalid argument: ...`. Bodies are loaded into memory so changes to cassette
+files during replay cannot change the responses.
+
+Matching uses the HTTP method and exact URL, including the query string.
+`--match-body` also compares the SHA-256 of the raw request body, distinguishing
+no body (`null`) from an empty body. Repeated requests consume responses in
+recorded request order; after the final occurrence, that response is reused.
+Matched requests receive the recorded status, headers, and decoded body.
+`Content-Encoding`, `Transfer-Encoding`, and the original `Content-Length` are
+removed; `Content-Length` is set to the decoded byte length. Unmatched requests
+are aborted and included in the stop result. Replay disables the page's cache
+while interception is active. Stop first resolves requests accepted before its
+stop boundary, then disables interception and restores caching; later requests
+resume normal network behavior.
+
+Start returns `{"replaying":true,"dir":"/absolute/cassette"}`. Stop returns:
+
+```json
+{"served":8,"missed":[{"method":"GET","url":"https://example.com/missing"}]}
+```
+
+Only one recording or replay may be active per page. Starting another, or
+stopping the wrong/inactive mode, returns `invalid argument: ...`. Closing a page
+or stopping its instance removes subscriptions and joins the worker. An active
+recording is finalized on cleanup when body reads and writes succeed.
+
+Both commands support the global `--socket` and `--json` options. JSON output
+wraps the documented payload in the usual `{"ok":true,"data":...}` response.
+
+#### Cassette format (v1)
+
+```json
+{
+  "format": "camoufox-cassette",
+  "version": 1,
+  "exchanges": [{
+    "seq": 0,
+    "method": "GET",
+    "url": "https://example.com/data",
+    "request_body_sha256": null,
+    "status": 200,
+    "headers": [["Content-Type", "application/json"]],
+    "body_sha256": "<64 lowercase hex characters>",
+    "body_len": 42
+  }]
+}
+```
+
+Bodies are decoded bytes, stored once per SHA-256 at `bodies/<sha256-hex>`.
+`Set-Cookie`, `Cookie`, and `Authorization` response headers are removed,
+case-insensitively, during recording. Request headers and raw request bodies
+are not persisted. URLs and response bodies are preserved as received.
 
 ### External Subcommands
 

@@ -3,7 +3,7 @@
 use clap::{CommandFactory, Parser};
 
 use camoufox::cli::client::send_request;
-use camoufox::cli::commands::{Cli, Command};
+use camoufox::cli::commands::{Cli, Command, RecordAction, ReplayAction};
 use camoufox::cli::ipc::DaemonRequest;
 use camoufox::cli::output::print_response;
 use camoufox::cli::socket::socket_path;
@@ -19,6 +19,53 @@ fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
+        }
+
+        Command::Record { action } => {
+            let request = match action {
+                RecordAction::Start {
+                    instance_id,
+                    page_id,
+                    dir,
+                    urls,
+                } => DaemonRequest::RecordStart {
+                    instance_id,
+                    page_id,
+                    dir,
+                    urls,
+                },
+                RecordAction::Stop {
+                    instance_id,
+                    page_id,
+                } => DaemonRequest::RecordStop {
+                    instance_id,
+                    page_id,
+                },
+            };
+            run_client(&sock, &request, cli.json);
+        }
+        Command::Replay { action } => {
+            let request = match action {
+                ReplayAction::Start {
+                    instance_id,
+                    page_id,
+                    dir,
+                    match_body,
+                } => DaemonRequest::ReplayStart {
+                    instance_id,
+                    page_id,
+                    dir,
+                    match_body,
+                },
+                ReplayAction::Stop {
+                    instance_id,
+                    page_id,
+                } => DaemonRequest::ReplayStop {
+                    instance_id,
+                    page_id,
+                },
+            };
+            run_client(&sock, &request, cli.json);
         }
 
         Command::Launch {

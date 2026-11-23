@@ -63,6 +63,36 @@ pub fn render(data: Option<&Value>) -> Rendered {
         return Rendered::out("ok");
     };
 
+    if data.get("recording").and_then(Value::as_bool) == Some(true) {
+        return Rendered::out(format!("recording: {}", data["dir"].as_str().unwrap_or("")));
+    }
+    if data.get("replaying").and_then(Value::as_bool) == Some(true) {
+        return Rendered::out(format!("replaying: {}", data["dir"].as_str().unwrap_or("")));
+    }
+    if let (Some(exchanges), Some(bodies)) = (data.get("exchanges"), data.get("bodies")) {
+        return Rendered::out(format!(
+            "recorded {exchanges} exchanges, {bodies} bodies: {}",
+            data["dir"].as_str().unwrap_or("")
+        ));
+    }
+    if let (Some(served), Some(missed)) = (
+        data.get("served"),
+        data.get("missed").and_then(Value::as_array),
+    ) {
+        let mut rendered = Rendered::out(format!(
+            "replayed {served} requests, {} misses",
+            missed.len()
+        ));
+        for miss in missed {
+            rendered.stderr.push(format!(
+                "missed: {} {}",
+                miss["method"].as_str().unwrap_or(""),
+                miss["url"].as_str().unwrap_or("")
+            ));
+        }
+        return rendered;
+    }
+
     // -----------------------------------------------------------------------
     // Reading / interaction commands.
     //
@@ -577,5 +607,35 @@ mod tests {
             "00000001  pid=100  version=Firefox/150  pages=[p1]  profile_dir=/abs/profile"
         );
         assert_eq!(lines[1], "00000002  pid=200  version=Firefox/150  pages=[]");
+    }
+}
+
+#[cfg(test)]
+mod cassette_output_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cassette_responses_render_counts_and_miss_details() {
+        assert_eq!(
+            render(Some(&json!({"recording":true, "dir":"/tmp/cassette"}))).stdout,
+            "recording: /tmp/cassette"
+        );
+        assert_eq!(
+            render(Some(&json!({"replaying":true, "dir":"/tmp/cassette"}))).stdout,
+            "replaying: /tmp/cassette"
+        );
+        assert_eq!(
+            render(Some(
+                &json!({"dir":"/tmp/cassette", "exchanges":2, "bodies":1})
+            ))
+            .stdout,
+            "recorded 2 exchanges, 1 bodies: /tmp/cassette"
+        );
+        let rendered = render(Some(
+            &json!({"served":3, "missed":[{"method":"GET", "url":"https://example.com/miss"}]}),
+        ));
+        assert_eq!(rendered.stdout, "replayed 3 requests, 1 misses");
+        assert_eq!(rendered.stderr, ["missed: GET https://example.com/miss"]);
     }
 }

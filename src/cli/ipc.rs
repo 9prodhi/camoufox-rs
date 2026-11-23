@@ -20,6 +20,33 @@ pub enum DaemonRequest {
     /// Ping the daemon. Returns instance count.
     Ping,
 
+    /// Begin recording a page's HTTP exchanges into an empty absolute directory.
+    RecordStart {
+        instance_id: String,
+        page_id: String,
+        dir: std::path::PathBuf,
+        #[serde(default)]
+        urls: Vec<String>,
+    },
+    /// Finalize a page's cassette and return directory and counts.
+    RecordStop {
+        instance_id: String,
+        page_id: String,
+    },
+    /// Validate a cassette and enable offline request interception.
+    ReplayStart {
+        instance_id: String,
+        page_id: String,
+        dir: std::path::PathBuf,
+        #[serde(default)]
+        match_body: bool,
+    },
+    /// Disable interception and report replay counts and misses.
+    ReplayStop {
+        instance_id: String,
+        page_id: String,
+    },
+
     /// Launch a new browser instance.
     Launch {
         #[serde(default)]
@@ -1052,5 +1079,28 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cassette_ipc_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cassette_requests_roundtrip_and_defaults() {
+        for value in [
+            json!({"method":"RecordStart", "params":{"instance_id":"i", "page_id":"p", "dir":"/tmp/cassette", "urls":["data"]}}),
+            json!({"method":"ReplayStart", "params":{"instance_id":"i", "page_id":"p", "dir":"/tmp/cassette", "match_body":true}}),
+            json!({"method":"RecordStop", "params":{"instance_id":"i", "page_id":"p"}}),
+            json!({"method":"ReplayStop", "params":{"instance_id":"i", "page_id":"p"}}),
+        ] {
+            let request: DaemonRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+        assert!(
+            matches!(serde_json::from_value::<DaemonRequest>(json!({"method":"RecordStart", "params":{"instance_id":"i", "page_id":"p", "dir":"/tmp/cassette"}})).unwrap(), DaemonRequest::RecordStart { urls, .. } if urls.is_empty())
+        );
+        assert!(matches!(serde_json::from_value::<DaemonRequest>(json!({"method":"ReplayStart", "params":{"instance_id":"i", "page_id":"p", "dir":"/tmp/cassette"}})).unwrap(), DaemonRequest::ReplayStart { match_body:false, .. }));
     }
 }

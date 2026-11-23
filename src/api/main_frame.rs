@@ -486,7 +486,7 @@ impl MainFrame {
         Arc::clone(&self.execution_context_id)
     }
 
-    fn session(&self) -> &Session {
+    pub(crate) fn session(&self) -> &Session {
         &self.session
     }
 

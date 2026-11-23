@@ -318,6 +318,10 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
         DaemonRequest::Ping => DaemonResponse::ok(json!({"instance_count": mgr.instance_count()})),
         DaemonRequest::List => DaemonResponse::ok(json!({"instances": mgr.list()})),
         DaemonRequest::Shutdown => DaemonResponse::ok_empty(),
+        DaemonRequest::RecordStart { instance_id, page_id, dir, urls } => respond(mgr.record_start(&instance_id, &page_id, &dir, &urls)),
+        DaemonRequest::RecordStop { instance_id, page_id } => respond(mgr.record_stop(&instance_id, &page_id)),
+        DaemonRequest::ReplayStart { instance_id, page_id, dir, match_body } => respond(mgr.replay_start(&instance_id, &page_id, &dir, match_body)),
+        DaemonRequest::ReplayStop { instance_id, page_id } => respond(mgr.replay_stop(&instance_id, &page_id)),
         DaemonRequest::Launch {
             headless,
             executable,

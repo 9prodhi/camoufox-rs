@@ -106,7 +106,7 @@ Usage: camoufox launch [OPTIONS]
 ```
 
 - `--headed`: Run in headed mode (show browser window). Default is headless.
-- `--executable <EXECUTABLE>`: Path to the Camoufox executable. If omitted, resolves via `CAMOUFOX_BIN` or `$HOME/.cache/camoufox/camoufox`.
+- `--executable <EXECUTABLE>`: Path to the Camoufox executable. If omitted, resolves via `CAMOUFOX_BIN`, then the active or newest install under `~/.cache/camoufox/browsers/` (from `camoufox fetch`), then `~/.cache/camoufox/camoufox`.
 - `--downloads-dir <DOWNLOADS_DIR>`: Directory to save downloads to (must be absolute; defaults to cancel).
 - `--bypass-csp`: Disable page Content-Security-Policy (needed for `--main-world` on strict-CSP sites; detectable by pages).
 - `--dialogs <DIALOGS>`: JavaScript dialog handling policy (`manual`, `accept`, `dismiss`) [default: `manual`].

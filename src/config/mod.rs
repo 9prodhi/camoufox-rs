@@ -4,8 +4,9 @@
 //! specification (PROTOCOL.md section 2 & 12).
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Default launch timeout (3 minutes), matching Playwright.
@@ -230,6 +231,248 @@ impl LaunchConfig {
         }
 
         map
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Executable discovery
+// ---------------------------------------------------------------------------
+
+/// Locate the Camoufox browser executable.
+///
+/// Resolution order, first match wins:
+///
+/// 1. `$CAMOUFOX_BIN`, if set and non-empty (returned as-is, not checked).
+/// 2. The install marked active in `<cache>/config.json` (`active_version`),
+///    as written by the Python `camoufox fetch` / `camoufox set` commands.
+/// 3. The newest `<cache>/browsers/<repo>/<version>/camoufox` on disk.
+/// 4. `<cache>/camoufox` — the legacy flat layout. Returned even when it does
+///    not exist, so a missing browser fails at spawn with that path.
+///
+/// `<cache>` is `$XDG_CACHE_HOME/camoufox` when `XDG_CACHE_HOME` is an
+/// absolute path, else `$HOME/.cache/camoufox` (`/root/.cache/camoufox` when
+/// `HOME` is unset). This is the Linux layout; macOS installs from the Python
+/// package live elsewhere and need `$CAMOUFOX_BIN`.
+pub fn default_executable() -> PathBuf {
+    resolve_executable(
+        std::env::var_os("CAMOUFOX_BIN"),
+        &cache_root(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")),
+    )
+}
+
+fn cache_root(xdg_cache_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    // The XDG spec says relative values are invalid and must be ignored.
+    if let Some(xdg) = xdg_cache_home
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return xdg.join("camoufox");
+    }
+    let home = home
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"));
+    home.join(".cache").join("camoufox")
+}
+
+fn resolve_executable(camoufox_bin: Option<OsString>, root: &Path) -> PathBuf {
+    if let Some(bin) = camoufox_bin.filter(|b| !b.is_empty()) {
+        return PathBuf::from(bin);
+    }
+    active_install(root)
+        .or_else(|| newest_install(root))
+        .unwrap_or_else(|| root.join("camoufox"))
+}
+
+/// `<root>/<active_version>/camoufox` from `<root>/config.json`, if it exists.
+fn active_install(root: &Path) -> Option<PathBuf> {
+    let config = std::fs::read(root.join("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_slice(&config).ok()?;
+    let active = config.get("active_version")?.as_str()?;
+    let exe = root.join(active).join("camoufox");
+    exe.is_file().then_some(exe)
+}
+
+/// The highest-versioned `<root>/browsers/<repo>/<version>/camoufox`.
+fn newest_install(root: &Path) -> Option<PathBuf> {
+    let mut best: Option<(String, PathBuf)> = None;
+    for repo in std::fs::read_dir(root.join("browsers")).ok()?.flatten() {
+        let Ok(versions) = std::fs::read_dir(repo.path()) else {
+            continue;
+        };
+        for version in versions.flatten() {
+            let exe = version.path().join("camoufox");
+            if !exe.is_file() {
+                continue;
+            }
+            let name = version.file_name().to_string_lossy().into_owned();
+            if best
+                .as_ref()
+                .is_none_or(|(b, _)| natural_cmp(&name, b).is_gt())
+            {
+                best = Some((name, exe));
+            }
+        }
+    }
+    best.map(|(_, exe)| exe)
+}
+
+/// Compare strings with runs of ASCII digits ordered numerically, so
+/// `158.0.1-beta.41` sorts after `158.0.1-beta.9`.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a.first(), b.first()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let an = a.iter().take_while(|c| c.is_ascii_digit()).count();
+                let bn = b.iter().take_while(|c| c.is_ascii_digit()).count();
+                let (ad, bd) = (trim_zeros(&a[..an]), trim_zeros(&b[..bn]));
+                let ord = ad.len().cmp(&bd.len()).then_with(|| ad.cmp(bd));
+                if ord.is_ne() {
+                    return ord;
+                }
+                (a, b) = (&a[an..], &b[bn..]);
+            }
+            (Some(x), Some(y)) => {
+                if x != y {
+                    return x.cmp(y);
+                }
+                (a, b) = (&a[1..], &b[1..]);
+            }
+        }
+    }
+}
+
+fn trim_zeros(digits: &[u8]) -> &[u8] {
+    let zeros = digits.iter().take_while(|&&c| c == b'0').count();
+    &digits[zeros..]
+}
+
+#[cfg(test)]
+mod executable_tests {
+    use super::*;
+    use std::fs;
+
+    /// Create `<root>/<rel>/camoufox` as an empty file and return its path.
+    fn install(root: &Path, rel: &str) -> PathBuf {
+        let dir = root.join(rel);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("camoufox");
+        fs::write(&exe, b"").unwrap();
+        exe
+    }
+
+    fn set_active(root: &Path, rel: &str) {
+        fs::write(
+            root.join("config.json"),
+            format!(r#"{{"active_version": "{rel}"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn camoufox_bin_env_wins_over_installs() {
+        let root = tempfile::tempdir().unwrap();
+        install(root.path(), "browsers/official/158.0.1-beta.41-aaaa");
+        let got = resolve_executable(Some("/opt/cf/camoufox".into()), root.path());
+        assert_eq!(got, PathBuf::from("/opt/cf/camoufox"));
+    }
+
+    #[test]
+    fn empty_camoufox_bin_is_ignored() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = install(root.path(), "");
+        assert_eq!(resolve_executable(Some("".into()), root.path()), legacy);
+    }
+
+    #[test]
+    fn active_version_from_config_json_is_used() {
+        let root = tempfile::tempdir().unwrap();
+        install(root.path(), "browsers/official/158.0.1-beta.41-aaaa");
+        let active = install(root.path(), "browsers/official/150.0.2-beta.25-bbbb");
+        set_active(root.path(), "browsers/official/150.0.2-beta.25-bbbb");
+        assert_eq!(resolve_executable(None, root.path()), active);
+    }
+
+    #[test]
+    fn active_version_missing_on_disk_falls_back_to_newest_install() {
+        let root = tempfile::tempdir().unwrap();
+        let newest = install(root.path(), "browsers/official/158.0.1-beta.41-aaaa");
+        set_active(root.path(), "browsers/official/999.0-gone");
+        assert_eq!(resolve_executable(None, root.path()), newest);
+    }
+
+    #[test]
+    fn newest_versioned_install_wins_without_config() {
+        let root = tempfile::tempdir().unwrap();
+        install(root.path(), "browsers/official/158.0.1-beta.9-cccc");
+        install(root.path(), "browsers/official/150.0.2-beta.25-bbbb");
+        let newest = install(root.path(), "browsers/jwriter20/158.0.1-beta.41-aaaa");
+        assert_eq!(resolve_executable(None, root.path()), newest);
+    }
+
+    #[test]
+    fn versioned_install_preferred_over_legacy_flat_install() {
+        let root = tempfile::tempdir().unwrap();
+        install(root.path(), "");
+        let versioned = install(root.path(), "browsers/official/158.0.1-beta.41-aaaa");
+        assert_eq!(resolve_executable(None, root.path()), versioned);
+    }
+
+    #[test]
+    fn malformed_config_json_is_ignored() {
+        let root = tempfile::tempdir().unwrap();
+        let newest = install(root.path(), "browsers/official/158.0.1-beta.41-aaaa");
+        fs::write(root.path().join("config.json"), b"{not json").unwrap();
+        assert_eq!(resolve_executable(None, root.path()), newest);
+    }
+
+    #[test]
+    fn nothing_installed_falls_back_to_legacy_path() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_executable(None, root.path()),
+            root.path().join("camoufox")
+        );
+    }
+
+    #[test]
+    fn natural_cmp_orders_digit_runs_numerically() {
+        use std::cmp::Ordering::*;
+        assert_eq!(natural_cmp("158.0.1-beta.41", "158.0.1-beta.9"), Greater);
+        assert_eq!(natural_cmp("150.0.2-beta.25", "158.0.1-beta.9"), Less);
+        assert_eq!(natural_cmp("158.0", "158.0.1"), Less);
+        assert_eq!(natural_cmp("v010", "v10"), Equal);
+        assert_eq!(natural_cmp("1.2-a", "1.2-b"), Less);
+    }
+
+    #[test]
+    fn cache_root_honours_absolute_xdg_cache_home() {
+        assert_eq!(
+            cache_root(Some("/xdg/cache".into()), Some("/home/u".into())),
+            PathBuf::from("/xdg/cache/camoufox")
+        );
+    }
+
+    #[test]
+    fn cache_root_ignores_empty_or_relative_xdg_cache_home() {
+        for xdg in ["", "rel/cache"] {
+            assert_eq!(
+                cache_root(Some(xdg.into()), Some("/home/u".into())),
+                PathBuf::from("/home/u/.cache/camoufox"),
+                "XDG_CACHE_HOME={xdg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_root_without_home_uses_root() {
+        assert_eq!(
+            cache_root(None, None),
+            PathBuf::from("/root/.cache/camoufox")
+        );
     }
 }
 

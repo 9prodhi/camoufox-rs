@@ -178,6 +178,21 @@ let config = LaunchConfig {
 
 *Note:* `profile_dir` must be `Some(...)`. `LaunchConfig::validate()` returns `Err(ConfigError::MissingProfile)` when it is `None`; `process::unix::spawn` runs that validation and surfaces it as a `ProcessError` wrapping an `io::Error` with the message "profile_dir must be set before launch".
 
+### `default_executable()`
+
+```rust,no_run
+let exe: std::path::PathBuf = camoufox::config::default_executable();
+```
+
+Where the CLI and the integration tests find the browser when no path is given:
+
+1. `$CAMOUFOX_BIN`, if set and non-empty.
+2. The install marked active in `<cache>/config.json` (`active_version`).
+3. The newest `<cache>/browsers/<repo>/<version>/camoufox`.
+4. `<cache>/camoufox` (legacy layout), returned even if missing.
+
+`<cache>` is `$XDG_CACHE_HOME/camoufox` when that is an absolute path, else `$HOME/.cache/camoufox`. This matches where the Python `camoufox fetch` installs on Linux; on macOS, set `CAMOUFOX_BIN`.
+
 ---
 
 ## 3. `camoufox::process` (Unix Only)

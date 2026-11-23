@@ -19,12 +19,15 @@ Time to first working result: 3 steps.
 - **Rust 1.85 or later** (`rustc --version`).
 - **Linux or macOS** (Windows pipe transport is not supported).
 - **Camoufox browser binary**:
-  Placed at `$HOME/.cache/camoufox/camoufox` or pointed to by the `CAMOUFOX_BIN` environment variable.
+  Installed with the Python package (`pip install camoufox && python -m camoufox fetch`),
+  which puts it under `~/.cache/camoufox/browsers/`, or pointed to by the `CAMOUFOX_BIN`
+  environment variable.
 
 Verify your Camoufox binary before starting:
 
 ```bash
-${CAMOUFOX_BIN:-$HOME/.cache/camoufox/camoufox} --version
+CF=${CAMOUFOX_BIN:-$(ls -d ~/.cache/camoufox/browsers/*/*/camoufox 2>/dev/null | sort -V | tail -1)}
+"${CF:-$HOME/.cache/camoufox/camoufox}" --version
 ```
 
 ---
@@ -70,11 +73,8 @@ use camoufox::protocol::client::Connection;
 use camoufox::transport::pipe::PipeTransport;
 
 fn resolve_binary() -> PathBuf {
-    if let Ok(path) = std::env::var("CAMOUFOX_BIN") {
-        return PathBuf::from(path);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(format!("{home}/.cache/camoufox/camoufox"))
+    // $CAMOUFOX_BIN, else the active/newest `camoufox fetch` install.
+    camoufox::config::default_executable()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -155,11 +155,8 @@ use camoufox::protocol::client::Connection;
 use camoufox::transport::pipe::PipeTransport;
 
 fn resolve_binary() -> PathBuf {
-    if let Ok(path) = std::env::var("CAMOUFOX_BIN") {
-        return PathBuf::from(path);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(format!("{home}/.cache/camoufox/camoufox"))
+    // $CAMOUFOX_BIN, else the active/newest `camoufox fetch` install.
+    camoufox::config::default_executable()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

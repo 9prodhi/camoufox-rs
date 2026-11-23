@@ -75,13 +75,6 @@ fn write_screenshot(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("failed to write screenshot: {e}"))
 }
 
-fn default_executable() -> String {
-    std::env::var("CAMOUFOX_BIN").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        format!("{home}/.cache/camoufox/camoufox")
-    })
-}
-
 /// `CAMOU_CONFIG_*` variables that pin a plain Firefox User-Agent for the
 /// browser at `executable`.
 ///
@@ -1837,12 +1830,11 @@ impl InstanceManager {
             tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
         let headless = options.headless;
 
-        let executable = PathBuf::from(
-            options
-                .executable
-                .clone()
-                .unwrap_or_else(default_executable),
-        );
+        let executable = options
+            .executable
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::config::default_executable);
         let inherited_env_keys: Vec<String> = std::env::vars_os()
             .map(|(key, _)| key.to_string_lossy().into_owned())
             .collect();

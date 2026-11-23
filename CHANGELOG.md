@@ -4,6 +4,14 @@ All notable changes to camoufox-rs are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- The browser is now found where current Camoufox installs it. Without `--executable` or `CAMOUFOX_BIN`, the CLI daemon, integration tests and `web_browse` example now use the install marked active in `~/.cache/camoufox/config.json`, then the newest `~/.cache/camoufox/browsers/<repo>/<version>/camoufox`, before falling back to the legacy `~/.cache/camoufox/camoufox`. `XDG_CACHE_HOME` is honoured. An empty `CAMOUFOX_BIN` is now treated as unset.
+
+### Added
+
+- `camoufox::config::default_executable()`, the shared browser lookup.
+
 ## [0.2.0] - 2026-11-21
 
 ### Breaking changes

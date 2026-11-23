@@ -1,10 +1,11 @@
 //! Integration tests against a real Camoufox browser.
 //!
-//! These tests are `#[ignore]`d by default because they require a Camoufox
-//! binary at `/root/.cache/camoufox/camoufox`. Run with:
+//! These tests are `#[ignore]`d by default because they require a real
+//! Camoufox binary, found by `camoufox::config::default_executable` (`$CAMOUFOX_BIN`,
+//! else the active or newest install under `~/.cache/camoufox`). Run with:
 //!
 //! ```sh
-//! cargo test --test integration -- --ignored --test-threads=1
+//! cargo test --all-features --test integration -- --ignored --test-threads=1
 //! ```
 
 use std::path::PathBuf;
@@ -21,11 +22,11 @@ use camoufox::transport::pipe::PipeTransport;
 
 mod fixtures;
 
+/// Resolved the same way as the daemon: see [`camoufox::config::default_executable`].
 fn camoufox_bin() -> String {
-    std::env::var("CAMOUFOX_BIN").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        format!("{home}/.cache/camoufox/camoufox")
-    })
+    camoufox::config::default_executable()
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ---------------------------------------------------------------------------

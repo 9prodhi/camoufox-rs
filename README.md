@@ -36,7 +36,14 @@ The CLI daemon resolves the Camoufox binary in this order:
 
 1. `--executable <path>` passed to `launch`
 2. the `CAMOUFOX_BIN` environment variable
-3. `$HOME/.cache/camoufox/camoufox` (falling back to `/root/.cache/camoufox/camoufox` when `HOME` is unset)
+3. the install marked active in `~/.cache/camoufox/config.json` (`active_version`), as set by the Python `camoufox fetch` / `camoufox set` commands
+4. the newest `~/.cache/camoufox/browsers/<repo>/<version>/camoufox`
+5. `~/.cache/camoufox/camoufox`, the legacy flat layout
+
+`~/.cache` means `$XDG_CACHE_HOME` when it is set to an absolute path, else
+`$HOME/.cache` (`/root/.cache` when `HOME` is unset). Library users get the
+same lookup from `camoufox::config::default_executable()`. On macOS, set
+`CAMOUFOX_BIN` or pass `--executable`.
 
 ## Build
 
@@ -475,8 +482,9 @@ Integration tests against a real Camoufox binary are ignored by default:
 cargo test --all-features --test integration -- --ignored --test-threads=1
 ```
 
-Integration tests resolve the binary the same way as the daemon: `CAMOUFOX_BIN`,
-else `$HOME/.cache/camoufox/camoufox`. Override per run with:
+Integration tests resolve the binary the same way as the daemon (see
+[Requirements](#requirements)), so a `camoufox fetch` install is found
+automatically. Override per run with:
 
 ```bash
 CAMOUFOX_BIN="/path/to/camoufox" cargo test --all-features --test integration -- --ignored --test-threads=1

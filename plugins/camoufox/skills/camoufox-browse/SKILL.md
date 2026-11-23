@@ -21,11 +21,12 @@ Two binaries are involved:
 
 - **The CLI** (`camoufox`). On `PATH` after `cargo install --path . --features
   cli`, or `target/release/camoufox` in the repo. Override with `$CAMOUFOX_CLI`.
-- **The Camoufox browser** it drives. Looked up from `$CAMOUFOX_BIN`, else
-  `~/.cache/camoufox/camoufox`. Current Camoufox releases (`pip install
-  camoufox && python -m camoufox fetch`) install to
-  `~/.cache/camoufox/browsers/official/<version>/camoufox` instead, which the
-  default lookup does **not** find — so resolve it explicitly:
+- **The Camoufox browser** it drives (`pip install camoufox && python -m
+  camoufox fetch`). The daemon looks up `$CAMOUFOX_BIN`, then the active or
+  newest install under `~/.cache/camoufox/browsers/`, then
+  `~/.cache/camoufox/camoufox`. Older CLI builds only check the first and
+  last of those, so resolving the path explicitly and passing
+  `launch --executable` keeps working with any daemon version:
 
 ```bash
 # CLI: prefer $CAMOUFOX_CLI, then `camoufox` on PATH, then a local release build.

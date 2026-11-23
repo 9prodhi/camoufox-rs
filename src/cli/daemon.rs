@@ -393,7 +393,7 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
             }))
         },
         DaemonRequest::Screenshot { instance_id, page_id, format, quality, path, selector, clip, .. } => respond(mgr.screenshot(&instance_id, &page_id, format.as_deref(), quality, path.as_deref(), selector.as_deref(), clip, timeout).map(|(bytes, path, rect)| json!({"bytes": bytes.len(), "path": path, "clip": {"x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height}}))),
-        DaemonRequest::Upload { instance_id, page_id, selector, paths, frames, .. } => respond(mgr.upload(&instance_id, &page_id, &selector, &paths, &frames, timeout).map(|files| json!({"uploaded": true, "selector": selector, "files": files}))),
+        DaemonRequest::Upload { instance_id, page_id, selector, paths, frames, .. } => respond(mgr.upload(&instance_id, &page_id, &selector, &paths, &frames, timeout).map(|(files, outcome)| with_dialog(json!({"uploaded": true, "selector": selector, "files": files}), outcome))),
         DaemonRequest::Cookies { instance_id } => respond(mgr.cookies(&instance_id).map(|cookies| json!({"cookies": cookies}))),
         DaemonRequest::Text { instance_id, page_id, selector, frames, .. } => respond(mgr.text(&instance_id, &page_id, selector.as_deref(), &frames, timeout).map(|text| json!({"text": text}))),
         DaemonRequest::Html { instance_id, page_id, selector, frames, .. } => respond(mgr.html(&instance_id, &page_id, selector.as_deref(), &frames, timeout).map(|html| json!({"html": html}))),

@@ -13,7 +13,6 @@
 //!
 //! Browser-integration tests (require a Camoufox installation):
 //! ```sh
-//! export XDG_RUNTIME_DIR="$PWD/.rt" && mkdir -p -m 700 .rt
 //! cargo test --all-features --test cli_regression -- --ignored --test-threads=1
 //! ```
 
@@ -43,7 +42,8 @@ fn bin() -> &'static str {
 ///  - `ok == false`
 ///  - `error` is exactly `expected_error`
 ///  - `data` is absent
-///  - at most one extra key `kind` (string) is present — additive by contract
+///  - `kind` is present, required, and a string
+///  - only `ok`, `error`, and `kind` keys are present
 fn assert_error_shape(v: &Value, expected_error: &str) {
     assert_eq!(v["ok"], false, "ok must be false in error response");
     assert_eq!(
@@ -56,23 +56,18 @@ fn assert_error_shape(v: &Value, expected_error: &str) {
         "data must be absent in error response; got: {:?}",
         v.get("data")
     );
-    // Allow exactly one extra key "kind" (string) — additive per shared contract rule 3.
     for key in v.as_object().unwrap().keys() {
         assert!(
             matches!(key.as_str(), "ok" | "error" | "kind"),
             "unexpected key {key:?} in error response (only ok/error/kind are allowed)"
         );
     }
-    if let Some(kind) = v.get("kind") {
-        assert!(
-            kind.is_string(),
-            "kind must be a string when present; got: {kind:?}"
-        );
-    }
+    let kind = v.get("kind").expect("kind is required in error response");
+    assert!(kind.is_string(), "kind must be a string; got: {kind:?}");
 }
 
 // ---------------------------------------------------------------------------
-// Requirement 1 — Plain-mode golden tests via `render`
+// Plain-mode golden tests via `render`
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -455,7 +450,7 @@ fn render_no_data() {
 }
 
 // ---------------------------------------------------------------------------
-// Requirement 2 — JSON golden tests for DaemonResponse shapes
+// JSON golden tests for DaemonResponse shapes
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -483,51 +478,56 @@ fn json_ok_empty_shape() {
 
 #[test]
 fn json_err_shape_instance_not_found() {
-    let resp = DaemonResponse::err("instance not found: 00000001");
+    let msg = "instance 00000001 not found";
+    let resp = DaemonResponse::err(msg);
     let v: Value = serde_json::to_value(&resp).expect("serialize error response");
-    assert_error_shape(&v, "instance not found: 00000001");
+    assert_error_shape(&v, msg);
+    assert_eq!(v["kind"], "instance_not_found");
 }
 
 #[test]
 fn json_err_shape_page_not_found() {
-    let resp = DaemonResponse::err("page p99 not found");
+    let msg = "page p99 not found";
+    let resp = DaemonResponse::err(msg);
     let v: Value = serde_json::to_value(&resp).expect("serialize error response");
-    assert_error_shape(&v, "page p99 not found");
+    assert_error_shape(&v, msg);
+    assert_eq!(v["kind"], "page_not_found");
 }
 
 #[test]
 fn json_err_shape_selector_not_found() {
-    let resp = DaemonResponse::err("selector not found: #nope");
+    let msg = "selector not found: #x";
+    let resp = DaemonResponse::err(msg);
     let v: Value = serde_json::to_value(&resp).expect("serialize error response");
-    assert_error_shape(&v, "selector not found: #nope");
+    assert_error_shape(&v, msg);
+    assert_eq!(v["kind"], "selector_not_found");
 }
 
 #[test]
 fn json_err_shape_timeout() {
-    let resp = DaemonResponse::err("timed out waiting for selector after 10s");
+    let msg = "timed out after 2s waiting for selector: #x";
+    let resp = DaemonResponse::err(msg);
     let v: Value = serde_json::to_value(&resp).expect("serialize error response");
-    assert_error_shape(&v, "timed out waiting for selector after 10s");
+    assert_error_shape(&v, msg);
+    assert_eq!(v["kind"], "timeout");
 }
 
 #[test]
 fn json_err_shape_io() {
-    let resp = DaemonResponse::err("io error: connection refused");
+    let msg = "io error: connection refused";
+    let resp = DaemonResponse::err(msg);
     let v: Value = serde_json::to_value(&resp).expect("serialize error response");
-    assert_error_shape(&v, "io error: connection refused");
+    assert_error_shape(&v, msg);
+    assert_eq!(v["kind"], "io");
 }
 
 #[test]
-fn json_err_shape_allows_additive_kind() {
-    // Error responses allow the additive string `kind` field.
+fn json_err_shape_kind_is_required_string() {
+    // Error responses require a string `kind` field.
     let resp = DaemonResponse::err("some error");
     let v: Value = serde_json::to_value(&resp).expect("serialize");
-    // Keep the shape compatible with responses that omit the optional field.
-    if let Some(kind) = v.get("kind") {
-        assert!(
-            kind.is_string(),
-            "if kind is present it must be a string; got {kind:?}"
-        );
-    }
+    assert_error_shape(&v, "some error");
+    assert_eq!(v["kind"], "other");
 }
 
 #[test]
@@ -552,7 +552,7 @@ fn json_ok_error_is_absent_not_null() {
 }
 
 // ---------------------------------------------------------------------------
-// Requirement 3 — Binary golden tests (no browser needed)
+// Binary CLI golden tests (no browser needed)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -566,8 +566,27 @@ fn help_contains_all_builtin_subcommands() {
     assert_eq!(out.status.code(), Some(0), "--help must exit 0");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let all_subcommands = [
+    let commands_section = stdout
+        .split("Commands:\n")
+        .nth(1)
+        .expect("help text must contain Commands: section");
+    let commands_text = commands_section
+        .split("\n\n")
+        .next()
+        .unwrap_or(commands_section);
+
+    let found_subcommands: std::collections::BTreeSet<String> = commands_text
+        .lines()
+        .filter_map(|line| {
+            let token = line.split_whitespace().next()?;
+            Some(token.to_string())
+        })
+        .collect();
+
+    let expected_subcommands: std::collections::BTreeSet<String> = [
         "serve",
+        "record",
+        "replay",
         "launch",
         "dialog",
         "list",
@@ -592,6 +611,7 @@ fn help_contains_all_builtin_subcommands() {
         "cookie",
         "header",
         "fill",
+        "upload",
         "type",
         "press",
         "hover",
@@ -600,13 +620,13 @@ fn help_contains_all_builtin_subcommands() {
         "tabs",
         "close-tab",
         "downloads",
-    ];
-    for cmd in all_subcommands {
-        assert!(
-            stdout.contains(cmd),
-            "--help output must list subcommand {cmd:?}; output was:\n{stdout}"
-        );
-    }
+        "help",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    assert_eq!(found_subcommands, expected_subcommands);
 }
 
 #[test]
@@ -800,7 +820,7 @@ fn upload_relative_path_with_removed_cwd_is_io_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Requirement 4 — Browser integration goldens (ignored; require Camoufox)
+// Browser integration goldens (ignored; require Camoufox)
 // ---------------------------------------------------------------------------
 
 /// A minimal HTTP server for browser tests that serves a small fixture page.
@@ -964,14 +984,8 @@ impl Drop for DaemonGuard {
 #[test]
 #[ignore]
 fn browser_integration_full_session() {
-    // Requirement 4: start `camoufox serve`, drive commands via the CLI binary,
+    // End-to-end browser session: start `camoufox serve`, drive commands via the CLI binary,
     // assert exact plain-text stdout/stderr and JSON shapes.
-    //
-    // Run with:
-    //   export XDG_RUNTIME_DIR="$PWD/.rt" && mkdir -p -m 700 .rt
-    //   cargo test --all-features --test cli_regression -- \
-    //       --ignored browser_integration_full_session --test-threads=1
-
     let rt_dir = tempfile::Builder::new()
         .prefix("camoufox-rt-")
         .tempdir()
@@ -1025,7 +1039,18 @@ fn browser_integration_full_session() {
         .lines()
         .find_map(|line| line.strip_prefix("pid: ")?.trim().parse().ok())
         .expect("launch stderr must report numeric pid");
+    #[cfg(target_os = "linux")]
+    let first_profile_dir = extract_profile_dir_from_cmdline(first_pid)
+        .expect("temporary profile directory must be extractable from cmdline on linux");
+    #[cfg(not(target_os = "linux"))]
     let first_profile_dir = extract_profile_dir_from_cmdline(first_pid);
+
+    #[cfg(target_os = "linux")]
+    assert!(
+        first_profile_dir.exists(),
+        "temporary profile directory {first_profile_dir:?} must exist while instance is running"
+    );
+    #[cfg(not(target_os = "linux"))]
     if let Some(ref pdir) = first_profile_dir {
         assert!(
             pdir.exists(),
@@ -1047,7 +1072,18 @@ fn browser_integration_full_session() {
         .unwrap()
         .to_string();
     let second_pid = launch_json["data"]["pid"].as_u64().unwrap();
+    #[cfg(target_os = "linux")]
+    let second_profile_dir = extract_profile_dir_from_cmdline(second_pid)
+        .expect("second temporary profile directory must be extractable from cmdline on linux");
+    #[cfg(not(target_os = "linux"))]
     let second_profile_dir = extract_profile_dir_from_cmdline(second_pid);
+
+    #[cfg(target_os = "linux")]
+    assert!(
+        second_profile_dir.exists(),
+        "second instance profile directory {second_profile_dir:?} must exist while running"
+    );
+    #[cfg(not(target_os = "linux"))]
     if let Some(ref pdir) = second_profile_dir {
         assert!(
             pdir.exists(),
@@ -1064,6 +1100,12 @@ fn browser_integration_full_session() {
     assert_eq!(String::from_utf8_lossy(&stop_second.stdout).trim(), "ok");
     assert!(stop_second.stderr.is_empty());
 
+    #[cfg(target_os = "linux")]
+    assert!(
+        !second_profile_dir.exists(),
+        "second instance temporary profile dir {second_profile_dir:?} must no longer exist after stop"
+    );
+    #[cfg(not(target_os = "linux"))]
     if let Some(ref pdir) = second_profile_dir {
         assert!(
             !pdir.exists(),
@@ -1260,6 +1302,12 @@ fn browser_integration_full_session() {
         "stopped instance must no longer appear in list"
     );
 
+    #[cfg(target_os = "linux")]
+    assert!(
+        !first_profile_dir.exists(),
+        "first instance temporary profile dir {first_profile_dir:?} must no longer exist after stop"
+    );
+    #[cfg(not(target_os = "linux"))]
     if let Some(ref pdir) = first_profile_dir {
         assert!(
             !pdir.exists(),
@@ -1268,7 +1316,7 @@ fn browser_integration_full_session() {
     }
 
     // -----------------------------------------------------------------------
-    // 11. Requirement 5 — Interception-off-by-default in active session
+    // 11. Interception-off-by-default in active session
     // -----------------------------------------------------------------------
     let log = daemon.log_content();
     assert!(
@@ -1286,7 +1334,7 @@ fn browser_integration_full_session() {
 fn browser_integration_evaluate_error_json_superset_rule() {
     // Verifies that a thrown Error from `evaluate` produces an error response
     // satisfying the superset rule: ok=false, error=<text>, data absent,
-    // kind optionally present (string).
+    // kind required string.
     let rt_dir = tempfile::Builder::new()
         .prefix("camoufox-rt2-")
         .tempdir()
@@ -1320,26 +1368,34 @@ fn browser_integration_evaluate_error_json_superset_rule() {
         &page_id,
         "(() => { throw new Error('type-test'); })()",
     ]);
-    let error_text = err_json["error"].as_str().unwrap_or("").to_string();
-    assert_error_shape(&err_json, &error_text);
+    assert_eq!(err_json["ok"], false);
+    assert!(err_json.get("data").is_none());
+    let error_text = err_json["error"]
+        .as_str()
+        .expect("error text must be string");
     assert!(
-        error_text.contains("type-test") || error_text.contains("page script error"),
+        error_text.contains("type-test"),
         "error text must reference the thrown error; got: {error_text}"
     );
+    assert_eq!(err_json["kind"], "other");
+    assert_error_shape(&err_json, error_text);
 
     let _ = daemon.run(&["stop", &instance_id]);
 }
 
 // ---------------------------------------------------------------------------
-// Requirement 5 — Interception-off-by-default
+// Interception-off-by-default
 // ---------------------------------------------------------------------------
+
+/// Interception-off-by-default verification:
+/// Protocol messages are logged via `src/obs/protocol_log.rs` at TRACE level
+/// under target `camoufox::protocol`. In integration tests, starting `camoufox serve`
+/// with RUST_LOG=camoufox::protocol=trace routes protocol SEND/RECV logs to stderr.
+/// `browser_integration_interception_off_by_default` and `browser_integration_full_session`
+/// assert that no `setRequestInterception` command is sent during launch and navigation.
 #[test]
 #[ignore]
 fn browser_integration_interception_off_by_default() {
-    // Starts the daemon with RUST_LOG=camoufox::protocol=trace, launches an
-    // instance, creates a page, and navigates to a local fixture. Asserts that
-    // the protocol log captured outgoing SEND messages and that NO message
-    // enabling request interception was sent.
     let rt_dir = tempfile::Builder::new()
         .prefix("camoufox-rt-obs-")
         .tempdir()
@@ -1384,16 +1440,6 @@ fn browser_integration_interception_off_by_default() {
     );
 
     let _ = daemon.run(&["stop", &instance_id]);
-}
-
-#[test]
-fn interception_off_by_default_note() {
-    // Documents requirement 5 verification:
-    // Protocol messages are logged via `src/obs/protocol_log.rs` at TRACE level
-    // under target `camoufox::protocol`. In integration tests, starting `camoufox serve`
-    // with RUST_LOG=camoufox::protocol=trace routes protocol SEND/RECV logs to stderr.
-    // `browser_integration_interception_off_by_default` and `browser_integration_full_session`
-    // assert that no `setRequestInterception` command is sent during launch and navigation.
 }
 
 /// `camoufox launch --profile-dir` through the real binary and daemon: the

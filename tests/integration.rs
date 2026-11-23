@@ -4413,14 +4413,23 @@ impl UploadFixture {
                 Some("load"),
             )
             .unwrap();
-        fixture.files = ["fixture one.txt", "fixture-two.pdf"]
-            .into_iter()
-            .map(|name| {
-                let path = fixture._dir.path().join(name);
-                std::fs::write(&path, b"fixture contents").unwrap();
-                path.to_string_lossy().into_owned()
-            })
-            .collect();
+        fixture.files = [
+            (
+                "fixture one.txt",
+                b"fixture one distinct payload: 12345" as &[u8],
+            ),
+            (
+                "fixture-two.pdf",
+                b"fixture-two pdf binary payload: 678901234567890" as &[u8],
+            ),
+        ]
+        .into_iter()
+        .map(|(name, data)| {
+            let path = fixture._dir.path().join(name);
+            std::fs::write(&path, data).unwrap();
+            path.to_string_lossy().into_owned()
+        })
+        .collect();
         fixture
     }
 
@@ -4430,25 +4439,43 @@ impl UploadFixture {
         paths: &[String],
         frames: &[String],
     ) -> Result<Vec<String>, String> {
-        self.manager.upload(
-            &self.instance,
-            &self.page,
-            selector,
-            paths,
-            frames,
-            Duration::from_secs(10),
-        )
+        self.manager
+            .upload(
+                &self.instance,
+                &self.page,
+                selector,
+                paths,
+                frames,
+                Duration::from_secs(10),
+            )
+            .map(|(files, _)| files)
     }
 
     fn assert_files(&self, element: &str, frames: &[String], names: &[&str], events: u64) {
+        let expected_sizes: Vec<u64> = names
+            .iter()
+            .map(|name| match *name {
+                "fixture one.txt" => 35,
+                "fixture-two.pdf" => 47,
+                other => panic!("unexpected fixture file: {other}"),
+            })
+            .collect();
         let state = self.manager.evaluate_scoped(
             &self.instance, &self.page,
-            &format!("(() => {{ const el = {element}; return {{length: el.files?.length || 0, names: Array.from(el.files || [], f => f.name), input: Number(el.dataset.input || 0), change: Number(el.dataset.change || 0), inputNames: JSON.parse(el.dataset.inputNames || '[]'), changeNames: JSON.parse(el.dataset.changeNames || '[]')}}; }})()"),
+            &format!("(() => {{ const el = {element}; return {{length: el.files?.length || 0, names: Array.from(el.files || [], f => f.name), sizes: Array.from(el.files || [], f => f.size), input: Number(el.dataset.input || 0), change: Number(el.dataset.change || 0), inputNames: JSON.parse(el.dataset.inputNames || '[]'), changeNames: JSON.parse(el.dataset.changeNames || '[]')}}; }})()"),
             false, frames, Duration::from_secs(10),
         ).unwrap();
         assert_eq!(
             state,
-            serde_json::json!({"length":names.len(), "names":names, "input":events, "change":events, "inputNames":names, "changeNames":names})
+            serde_json::json!({
+                "length": names.len(),
+                "names": names,
+                "sizes": expected_sizes,
+                "input": events,
+                "change": events,
+                "inputNames": names,
+                "changeNames": names,
+            })
         );
     }
 }
@@ -4718,6 +4745,54 @@ fn upload_unknown_page_and_instance_after_path_validation() {
 #[test]
 #[ignore]
 #[cfg(feature = "cli")]
+fn upload_rejects_directory_picker_inputs() {
+    let fixture = UploadFixture::new();
+    let err = fixture
+        .upload("#directory", &fixture.files[..1], &[])
+        .unwrap_err();
+    assert_eq!(
+        err,
+        "invalid argument: directory-picker inputs (webkitdirectory) are not supported"
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn upload_onchange_alert_returns_success_with_dialog_info() {
+    let fixture = UploadFixture::new();
+    let (files, outcome) = fixture
+        .manager
+        .upload(
+            &fixture.instance,
+            &fixture.page,
+            "#alert-on-change",
+            &fixture.files[..1],
+            &[],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    assert_eq!(files, ["fixture one.txt"]);
+    let dialog = outcome.dialog.expect("dialog info must be returned");
+    assert_eq!(dialog.kind, "alert");
+    assert_eq!(dialog.message, "file selected");
+    // Accept the dialog so subsequent page evaluations can proceed.
+    fixture
+        .manager
+        .dialog(&fixture.instance, &fixture.page, true, None)
+        .unwrap();
+    // Verify the file was indeed set on the input.
+    fixture.assert_files(
+        "document.querySelector('#alert-on-change')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
 fn upload_cli_resolves_client_paths_and_renders_response() {
     use camoufox::cli::client::send_request;
     use camoufox::cli::ipc::DaemonRequest;
@@ -4747,8 +4822,15 @@ fn upload_cli_resolves_client_paths_and_renders_response() {
     let daemon_dir = dir.path().join("daemon");
     std::fs::create_dir(&client_dir).unwrap();
     std::fs::create_dir(&daemon_dir).unwrap();
-    for name in ["fixture one.txt", "fixture-two.pdf"] {
-        std::fs::write(client_dir.join(name), b"fixture contents").unwrap();
+    let cli_files = [
+        ("fixture one.txt", b"client fixture one text data" as &[u8]),
+        (
+            "fixture-two.pdf",
+            b"client fixture-two pdf distinct payload" as &[u8],
+        ),
+    ];
+    for (name, content) in cli_files {
+        std::fs::write(client_dir.join(name), content).unwrap();
     }
     let socket = dir.path().join("daemon.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_camoufox"))
@@ -4821,13 +4903,13 @@ fn upload_cli_resolves_client_paths_and_renders_response() {
         uploaded["data"],
         serde_json::json!({"uploaded":true, "selector":"#multiple", "files":["fixture one.txt", "fixture-two.pdf"]})
     );
-    let expression = "(() => { const el = document.querySelector('#multiple'); return {length:el.files.length, names:Array.from(el.files, f=>f.name), input:Number(el.dataset.input), change:Number(el.dataset.change)}; })()";
+    let expression = "(() => { const el = document.querySelector('#multiple'); return {length:el.files.length, names:Array.from(el.files, f=>f.name), sizes:Array.from(el.files, f=>f.size), input:Number(el.dataset.input), change:Number(el.dataset.change)}; })()";
     let state = json(&[
         "--json", "evaluate", instance, page, expression, "--frame", "#outer", "--frame", "#inner",
     ]);
     assert_eq!(
         state["data"]["result"],
-        serde_json::json!({"length":2, "names":["fixture one.txt", "fixture-two.pdf"], "input":1, "change":1})
+        serde_json::json!({"length":2, "names":["fixture one.txt", "fixture-two.pdf"], "sizes":[28, 39], "input":1, "change":1})
     );
     let output = run(&[
         "upload",

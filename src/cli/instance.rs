@@ -3506,6 +3506,109 @@ mod tests {
     }
 
     #[test]
+    fn prepare_profile_dir_canonicalizes_aliases_to_one_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("profile");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = temp.path().join("profile-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let dotted = format!("{}/./sub/../", real.display());
+        std::fs::create_dir(real.join("sub")).unwrap();
+
+        let canonical = prepare_profile_dir(real.to_str().unwrap()).unwrap();
+        assert_eq!(canonical, real.canonicalize().unwrap());
+        // Collision detection compares canonical paths, so every alias must
+        // resolve to the same value.
+        assert_eq!(
+            prepare_profile_dir(link.to_str().unwrap()).unwrap(),
+            canonical
+        );
+        assert_eq!(prepare_profile_dir(&dotted).unwrap(), canonical);
+        let mode = std::fs::metadata(&canonical).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a private directory is left unchanged");
+    }
+
+    #[test]
+    fn prepare_profile_dir_creates_missing_parents_and_tightens_group_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("a").join("b").join("profile");
+        let canonical = prepare_profile_dir(nested.to_str().unwrap()).unwrap();
+        assert!(canonical.is_dir());
+        let group = temp.path().join("group");
+        std::fs::create_dir(&group).unwrap();
+        std::fs::set_permissions(&group, std::fs::Permissions::from_mode(0o750)).unwrap();
+        prepare_profile_dir(group.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(&group).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn launch_profile_dir_errors_precede_browser_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("fixture.pdf");
+        std::fs::write(&file, b"contents").unwrap();
+        let manager = InstanceManager::new();
+        // A nonexistent executable proves the profile error is returned
+        // before any browser process is spawned.
+        let launch = |profile_dir: &str| {
+            manager
+                .launch_with(&LaunchOptions {
+                    executable: Some("/nonexistent/camoufox-test-binary".into()),
+                    profile_dir: Some(profile_dir.into()),
+                    ..Default::default()
+                })
+                .unwrap_err()
+        };
+        assert_eq!(
+            launch("relative/profile"),
+            "invalid argument: --profile-dir must be an absolute path"
+        );
+        let error = launch(file.to_str().unwrap());
+        assert!(error.ends_with("is not a directory"), "{error}");
+        assert_eq!(
+            crate::cli::ipc::DaemonResponse::err(error).kind.as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"contents");
+        // A valid directory gets past validation and fails at spawn instead.
+        let error = launch(temp.path().join("profile").to_str().unwrap());
+        assert!(error.starts_with("failed to spawn browser"), "{error}");
+        assert!(temp.path().join("profile").is_dir());
+        assert!(manager.list().is_empty());
+        // Shutdown takes precedence over profile validation.
+        manager.begin_shutdown();
+        assert_eq!(launch("relative/profile"), "daemon shutting down");
+    }
+
+    #[test]
+    fn cassette_commands_report_missing_instance_and_validate_nothing_else() {
+        let manager = InstanceManager::new();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("cassette");
+        let results = [
+            manager.record_start("absent", "p1", &dir, &[]),
+            manager.record_stop("absent", "p1"),
+            manager.replay_start("absent", "p1", &dir, false),
+            manager.replay_stop("absent", "p1"),
+        ];
+        for result in results {
+            let error = result.unwrap_err();
+            assert_eq!(error, "instance absent not found");
+            assert_eq!(
+                crate::cli::ipc::DaemonResponse::err(error).kind.as_deref(),
+                Some("instance_not_found")
+            );
+        }
+        assert!(
+            !dir.exists(),
+            "a missing instance must not create a cassette directory"
+        );
+    }
+
+    #[test]
     fn prepare_profile_dir_rejects_existing_non_directory() {
         let temp = tempfile::tempdir().unwrap();
         let file_path = temp.path().join("some_file");

@@ -691,3 +691,84 @@ fn cassette_stop_drains_requests_before_disabling_interception() {
     }
     manager.stop(&instance).unwrap();
 }
+
+#[test]
+#[ignore]
+fn cassette_skips_failed_and_non_http_requests_and_replay_restarts() {
+    let fixture = Fixture::start();
+    let dir = tempfile::tempdir().unwrap();
+    // A closed, non-restricted local port makes the request fail at connect.
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/unreachable", listener.local_addr().unwrap())
+    };
+    let (manager, instance, page) = launch();
+    manager
+        .navigate(
+            &instance,
+            &page,
+            &format!("{}/", fixture.origin),
+            TIMEOUT,
+            Some("load"),
+        )
+        .unwrap();
+    rendered(&manager, &instance, &page);
+    manager
+        .record_start(&instance, &page, dir.path(), &[])
+        .unwrap();
+    assert_eq!(
+        eval(
+            &manager,
+            &instance,
+            &page,
+            &format!(
+                "(async () => [
+                (await (await fetch('/data')).json()).value,
+                await fetch('{closed}').then(() => 'reached', () => 'failed'),
+                await (await fetch('data:text/plain,inline')).text(),
+            ])()"
+            )
+        ),
+        json!(["fetch result", "failed", "inline"])
+    );
+    let recorded = manager.record_stop(&instance, &page).unwrap();
+    assert_eq!(recorded["exchanges"], 1, "{recorded}");
+    let index: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("index.json")).unwrap()).unwrap();
+    assert_eq!(
+        index["exchanges"][0]["url"],
+        format!("{}/data", fixture.origin)
+    );
+
+    // Start/stop replay twice on one page: interception must toggle cleanly.
+    drop(fixture);
+    for _ in 0..2 {
+        manager
+            .replay_start(&instance, &page, dir.path(), false)
+            .unwrap();
+        assert_eq!(
+            eval(
+                &manager,
+                &instance,
+                &page,
+                "fetch('/data').then(r => r.json()).then(v => v.value)"
+            ),
+            "fetch result"
+        );
+        assert_eq!(
+            eval(
+                &manager,
+                &instance,
+                &page,
+                &format!("fetch('{closed}').then(() => 'reached', () => 'blocked')")
+            ),
+            "blocked"
+        );
+        let stopped = manager.replay_stop(&instance, &page).unwrap();
+        assert_eq!(
+            stopped,
+            json!({"served":1, "missed":[{"method":"GET", "url":closed}]})
+        );
+    }
+    manager.stop(&instance).unwrap();
+}

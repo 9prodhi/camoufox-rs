@@ -302,6 +302,110 @@ mod tests {
     }
 
     #[test]
+    fn remaining_prefixes_and_wrappers_classify() {
+        let cases = [
+            ("daemon is already running", ErrorKind::Daemon),
+            (
+                "request line too large or missing newline",
+                ErrorKind::Daemon,
+            ),
+            ("go back failed: NS_ERROR_FAILURE", ErrorKind::Navigation),
+            ("go forward failed: NS_ERROR_FAILURE", ErrorKind::Navigation),
+            (
+                "reload failed: frame was detached",
+                ErrorKind::FrameDetached,
+            ),
+            ("press (keydown) failed: timed out", ErrorKind::Timeout),
+            (
+                "click (up) failed: open confirm dialog: \"sure?\"",
+                ErrorKind::DialogOpen,
+            ),
+            ("open beforeunload dialog: \"\"", ErrorKind::DialogOpen),
+            (
+                "page p2 has an open alert dialog: \"hi\"",
+                ErrorKind::DialogOpen,
+            ),
+            ("evaluate failed: page script error: boom", ErrorKind::Other),
+            ("invalid selector \"[\": bad", ErrorKind::InvalidArgument),
+            ("invalid selector: empty", ErrorKind::InvalidArgument),
+            ("unknown key \"Nope\"", ErrorKind::InvalidArgument),
+            (
+                "dialog action must be accept or dismiss",
+                ErrorKind::InvalidArgument,
+            ),
+            ("failed to secure screenshot: denied", ErrorKind::Io),
+            ("failed to write screenshot: disk full", ErrorKind::Io),
+            ("failed to create temp dir: denied", ErrorKind::Io),
+            ("failed to create downloads dir /x: denied", ErrorKind::Io),
+            ("failed to create runtime directory: denied", ErrorKind::Io),
+            (
+                "cannot inspect runtime directory /run: denied",
+                ErrorKind::Io,
+            ),
+            ("insecure runtime directory /run: mode 777", ErrorKind::Io),
+            ("downloads dir /x is not writable: denied", ErrorKind::Io),
+            ("downloads dir /x", ErrorKind::Other),
+            // Messages introduced alongside upload, record and replay.
+            (
+                "invalid argument: upload path must be absolute: fixture.pdf",
+                ErrorKind::InvalidArgument,
+            ),
+            (
+                "invalid argument: record or replay is already active for this page",
+                ErrorKind::InvalidArgument,
+            ),
+            (
+                "invalid argument: invalid cassette: unsupported version",
+                ErrorKind::InvalidArgument,
+            ),
+            (
+                "io error: response body was evicted during recording",
+                ErrorKind::Io,
+            ),
+            (
+                "invalid argument: profile directory already in use by instance 00000001",
+                ErrorKind::InvalidArgument,
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(ErrorKind::classify(message), expected, "{message}");
+        }
+    }
+
+    #[test]
+    fn context_sensitive_causes_need_their_wrapper() {
+        // Frame-only causes are not classified without a `--frame` wrapper.
+        assert_eq!(
+            ErrorKind::classify("frame has no JavaScript context yet"),
+            ErrorKind::Other
+        );
+        assert_eq!(
+            ErrorKind::classify("element is not an iframe"),
+            ErrorKind::Other
+        );
+        // A protocol timeout needs a non-empty method name.
+        assert_eq!(
+            ErrorKind::classify("Request '' timed out after 30s"),
+            ErrorKind::Other
+        );
+        // An unterminated quoted frame selector never yields a cause.
+        assert_eq!(
+            ErrorKind::classify("--frame [title='a: selector not found: #x"),
+            ErrorKind::Other
+        );
+        // Nested functional selectors keep their inner `: ` text.
+        assert_eq!(
+            ErrorKind::classify("--frame :is(:not([title='a: b'])): no element matches"),
+            ErrorKind::FrameNotFound
+        );
+        // Unknown "<op> failed: " prefixes are not stripped.
+        assert_eq!(
+            ErrorKind::classify("upload failed: timed out"),
+            ErrorKind::Other
+        );
+    }
+
+    #[test]
     fn kinds_serialize_and_deserialize_as_stable_strings() {
         let cases = [
             (ErrorKind::SelectorNotFound, "selector_not_found"),

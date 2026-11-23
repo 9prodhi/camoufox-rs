@@ -4687,6 +4687,52 @@ fn upload_missing_selector_and_scoping_errors() {
 #[test]
 #[ignore]
 #[cfg(feature = "cli")]
+fn upload_unknown_page_and_instance_after_path_validation() {
+    use camoufox::cli::ipc::DaemonResponse;
+    let fixture = UploadFixture::new();
+    let kind = |error: String| DaemonResponse::err(error).kind.unwrap();
+    let missing = fixture
+        ._dir
+        .path()
+        .join("missing.txt")
+        .display()
+        .to_string();
+    let upload = |instance: &str, page: &str, paths: &[String]| {
+        fixture.manager.upload(
+            instance,
+            page,
+            "#single",
+            paths,
+            &[],
+            Duration::from_secs(10),
+        )
+    };
+    let error = upload(&fixture.instance, "p99", &fixture.files[..1]).unwrap_err();
+    assert_eq!(error, "page p99 not found");
+    assert_eq!(kind(error), "page_not_found");
+    let error = upload("ffffffff", &fixture.page, &fixture.files[..1]).unwrap_err();
+    assert_eq!(error, "instance ffffffff not found");
+    assert_eq!(kind(error), "instance_not_found");
+    // Path validation runs before any instance or page lookup.
+    let error = upload("ffffffff", "p99", &[missing]).unwrap_err();
+    assert!(
+        error.starts_with("invalid argument: upload file "),
+        "{error}"
+    );
+    assert_eq!(kind(error), "invalid_argument");
+    // The page stays usable after the rejected requests.
+    fixture.upload("#single", &fixture.files[..1], &[]).unwrap();
+    fixture.assert_files(
+        "document.querySelector('#single')",
+        &[],
+        &["fixture one.txt"],
+        1,
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
 fn upload_cli_resolves_client_paths_and_renders_response() {
     use camoufox::cli::client::send_request;
     use camoufox::cli::ipc::DaemonRequest;
@@ -4977,4 +5023,56 @@ fn launch_profile_dir_list_shows_only_for_persistent() {
 
     manager.stop(&inst1).expect("stop inst1");
     manager.stop(&inst2).expect("stop inst2");
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_aliases_collide_and_release_on_stop() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let profile = temp.path().join("profile");
+    let link = temp.path().join("profile-link");
+    let launch = |manager: &InstanceManager, dir: &std::path::Path| {
+        manager.launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            profile_dir: Some(dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+    };
+
+    let manager = InstanceManager::new();
+    // The directory does not exist yet: launch creates it.
+    let (first, _, _) = launch(&manager, &profile).expect("first launch");
+    std::os::unix::fs::symlink(&profile, &link).unwrap();
+
+    // Any alias of a profile in use is refused before a browser starts.
+    let error = launch(&manager, &link).unwrap_err();
+    assert_eq!(
+        error,
+        format!("invalid argument: profile directory already in use by instance {first}")
+    );
+    assert_eq!(manager.list().len(), 1);
+    manager.stop(&first).expect("stop first");
+
+    // After stop, the same directory (via another alias) is reusable.
+    let dotted = PathBuf::from(format!("{}/./", link.display()));
+    let (second, _, _) = launch(&manager, &dotted).expect("relaunch");
+    assert_ne!(first, second);
+    let listed = manager.list();
+    assert_eq!(
+        listed[0]["profile_dir"].as_str(),
+        Some(profile.canonicalize().unwrap().to_str().unwrap())
+    );
+    let page = manager.new_page(&second).unwrap();
+    assert_eq!(
+        manager
+            .evaluate(&second, &page, "1 + 1", Duration::from_secs(10))
+            .unwrap(),
+        2
+    );
+    manager.stop(&second).expect("stop second");
+    assert!(profile.is_dir(), "persistent profile must survive stop");
 }

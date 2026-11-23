@@ -638,4 +638,36 @@ mod cassette_output_tests {
         assert_eq!(rendered.stdout, "replayed 3 requests, 1 misses");
         assert_eq!(rendered.stderr, ["missed: GET https://example.com/miss"]);
     }
+
+    #[test]
+    fn cassette_and_upload_render_empty_and_partial_shapes() {
+        let rendered = render(Some(&json!({"served":0, "missed":[]})));
+        assert_eq!(rendered, Rendered::out("replayed 0 requests, 0 misses"));
+        let rendered = render(Some(
+            &json!({"served":1, "missed":[{"url":"https://example.com/"}]}),
+        ));
+        assert_eq!(rendered.stderr, ["missed:  https://example.com/"]);
+        assert_eq!(
+            render(Some(
+                &json!({"exchanges":0, "bodies":0, "dir":"/tmp/cassette"})
+            ))
+            .stdout,
+            "recorded 0 exchanges, 0 bodies: /tmp/cassette"
+        );
+        // `recording:false` is not a cassette response.
+        assert_ne!(
+            render(Some(&json!({"recording":false, "dir":"/tmp/cassette"}))).stdout,
+            "recording: /tmp/cassette"
+        );
+        assert_eq!(
+            render(Some(
+                &json!({"uploaded":true, "selector":"#file", "files":[]})
+            )),
+            Rendered::out("")
+        );
+        assert_eq!(
+            render(Some(&json!({"uploaded":true, "selector":"#file"}))),
+            Rendered::out("")
+        );
+    }
 }

@@ -207,3 +207,143 @@ fn external_dispatch_builtin_names_unaffected() {
         "built-in help must be printed"
     );
 }
+
+/// Write `contents` to `dir/name` with the given Unix mode.
+#[cfg(unix)]
+fn write_script(dir: &std::path::Path, name: &str, contents: &str, mode: u32) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, contents).expect("write script");
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("set permissions");
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn external_dispatch_signal_exit_maps_to_128_plus_signal() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    write_script(
+        temp_dir.path(),
+        "camoufox-signal",
+        "#!/bin/sh\nkill -TERM $$\nsleep 5\n",
+        0o755,
+    );
+    let output = Command::new(camoufox_bin())
+        .env("PATH", temp_dir.path())
+        .arg("signal")
+        .output()
+        .expect("run camoufox");
+    assert_eq!(
+        output.status.code(),
+        Some(128 + 15),
+        "a child killed by SIGTERM must exit with 128 + 15"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn external_dispatch_skips_non_executable_entries_and_missing_path() {
+    let first = tempfile::tempdir().expect("first dir");
+    let second = tempfile::tempdir().expect("second dir");
+    let third = tempfile::tempdir().expect("third dir");
+    // Earliest PATH entry: present but not executable, so it is skipped.
+    write_script(
+        first.path(),
+        "camoufox-tool",
+        "#!/bin/sh\necho non-executable\nexit 3\n",
+        0o644,
+    );
+    // A directory with the binary name is skipped as well.
+    fs::create_dir(second.path().join("camoufox-tool")).expect("create dir");
+    write_script(
+        third.path(),
+        "camoufox-tool",
+        "#!/bin/sh\necho executable\nexit 4\n",
+        0o755,
+    );
+    let path = std::env::join_paths([first.path(), second.path(), third.path()]).unwrap();
+    let output = Command::new(camoufox_bin())
+        .env("PATH", &path)
+        .arg("tool")
+        .output()
+        .expect("run camoufox");
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "executable\n");
+
+    // With only the non-executable entry, or with no PATH at all, the
+    // name is unrecognized.
+    for path in [Some(first.path().as_os_str()), None] {
+        let mut command = Command::new(camoufox_bin());
+        match path {
+            Some(path) => command.env("PATH", path),
+            None => command.env_remove("PATH"),
+        };
+        let output = command.arg("tool").output().expect("run camoufox");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .starts_with("error: unrecognized subcommand 'tool'"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn external_dispatch_exec_failure_exits_1_with_message() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    write_script(
+        temp_dir.path(),
+        "camoufox-broken",
+        "#!/nonexistent/interpreter\n",
+        0o755,
+    );
+    let output = Command::new(camoufox_bin())
+        .env("PATH", temp_dir.path())
+        .arg("broken")
+        .output()
+        .expect("run camoufox");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("error: failed to execute external subcommand: "),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn external_dispatch_inherits_stdin_and_passes_args_verbatim() {
+    use std::io::Write;
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    write_script(
+        temp_dir.path(),
+        "camoufox-echo",
+        "#!/bin/sh\nfor arg in \"$@\"; do printf '[%s]' \"$arg\"; done\nprintf '\\n'\ncat\n",
+        0o755,
+    );
+    let mut child = Command::new(camoufox_bin())
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", temp_dir.path().display()),
+        )
+        .args(["echo", "a b", "", "--json", "--socket", "x"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("run camoufox");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"from stdin\n")
+        .unwrap();
+    let output = child.wait_with_output().expect("wait");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[a b][][--json][--socket][x]\nfrom stdin\n"
+    );
+}

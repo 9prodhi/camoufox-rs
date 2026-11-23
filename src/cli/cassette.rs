@@ -419,4 +419,186 @@ mod tests {
         assert_eq!(load(&dir).unwrap().0.exchanges.len(), 2);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
     }
+
+    /// Write `exchanges` plus a valid body for each into a fresh cassette dir.
+    fn cassette_with(exchanges: Vec<Exchange>, bodies: &[&[u8]]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bodies")).unwrap();
+        for body in bodies {
+            std::fs::write(dir.path().join("bodies").join(sha256(body)), body).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("index.json"),
+            serde_json::to_vec(&Index::new(exchanges)).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn cassette_load_rejects_invalid_exchange_metadata() {
+        let valid = exchange(b"hello", 0);
+        let mut cases: Vec<(Vec<Exchange>, &str)> = Vec::new();
+        cases.push((vec![valid.clone(), valid.clone()], "duplicate sequence"));
+        let mut bad = valid.clone();
+        bad.request_body_sha256 = Some("ABC".into());
+        cases.push((vec![bad], "invalid sha256"));
+        let mut bad = valid.clone();
+        bad.body_sha256 = bad.body_sha256.to_uppercase();
+        cases.push((vec![bad], "invalid sha256"));
+        for status in [0, 99, 600] {
+            let mut bad = valid.clone();
+            bad.status = status;
+            cases.push((vec![bad], "invalid exchange metadata"));
+        }
+        let mut bad = valid.clone();
+        bad.method.clear();
+        cases.push((vec![bad], "invalid exchange metadata"));
+        let mut bad = valid.clone();
+        bad.url.clear();
+        cases.push((vec![bad], "invalid exchange metadata"));
+        for header in [
+            ("", "value"),
+            ("X-Split\r\nInjected", "value"),
+            ("X-Test", "value\nInjected: yes"),
+            ("X-Test", "value\r"),
+        ] {
+            let mut bad = valid.clone();
+            bad.headers = vec![(header.0.into(), header.1.into())];
+            cases.push((vec![bad], "invalid response headers"));
+        }
+        for (exchanges, expected) in cases {
+            let dir = cassette_with(exchanges.clone(), &[b"hello"]);
+            let error = load(dir.path()).unwrap_err();
+            assert!(
+                error.starts_with("invalid argument: invalid cassette: ")
+                    && error.contains(expected),
+                "{exchanges:?}: {error}"
+            );
+        }
+        // Boundary statuses and a valid request hash are accepted.
+        let mut low = valid.clone();
+        low.status = 100;
+        let mut high = exchange(b"hello", 1);
+        high.status = 599;
+        high.request_body_sha256 = Some(sha256(b"input"));
+        let dir = cassette_with(vec![low, high], &[b"hello"]);
+        let (index, bodies) = load(dir.path()).unwrap();
+        assert_eq!(index.exchanges.len(), 2);
+        assert_eq!(bodies.len(), 1, "shared bodies are loaded once");
+    }
+
+    #[test]
+    fn cassette_load_rejects_missing_malformed_and_unknown_index_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = load(dir.path()).unwrap_err();
+        assert!(
+            error.starts_with("invalid argument: invalid cassette: "),
+            "{error}"
+        );
+        for contents in [
+            "".to_owned(),
+            "{".to_owned(),
+            "[]".to_owned(),
+            r#"{"format":"camoufox-cassette","version":1}"#.to_owned(),
+            r#"{"format":"camoufox-cassette","version":1,"exchanges":[],"extra":true}"#.to_owned(),
+            serde_json::json!({"format":"camoufox-cassette","version":1,"exchanges":[{
+                "seq":0,"method":"GET","url":"https://example.com/","request_body_sha256":null,
+                "status":200,"headers":[],"body_sha256":sha256(b""),"body_len":0,"extra":1
+            }]})
+            .to_string(),
+        ] {
+            std::fs::write(dir.path().join("index.json"), &contents).unwrap();
+            let error = load(dir.path()).unwrap_err();
+            assert!(
+                error.starts_with("invalid argument: invalid cassette: "),
+                "{contents}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cassette_empty_recording_finishes_and_loads() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("nested").join("cassette");
+        let result = Recorder::new(&dir, &[]).unwrap().finish().unwrap();
+        assert_eq!(result["exchanges"], 0);
+        assert_eq!(result["bodies"], 0);
+        assert_eq!(result["dir"], dir.display().to_string());
+        let (index, bodies) = load(&dir).unwrap();
+        assert!(index.exchanges.is_empty());
+        assert!(bodies.is_empty());
+        let mut matcher = Matcher::new(index.exchanges, false);
+        assert!(matcher.take("GET", "https://example.com/", None).is_none());
+    }
+
+    #[test]
+    fn cassette_record_rejects_file_path_and_second_recorder_on_same_dir() {
+        let parent = tempfile::tempdir().unwrap();
+        let file = parent.path().join("fixture.pdf");
+        std::fs::write(&file, b"contents").unwrap();
+        assert_eq!(
+            Recorder::new(&file, &[]).unwrap_err(),
+            "invalid argument: cassette path must be a directory"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"contents");
+
+        let dir = parent.path().join("cassette");
+        let mut first = Recorder::new(&dir, &[]).unwrap();
+        assert!(Recorder::new(&dir, &[])
+            .unwrap_err()
+            .contains("refusing non-empty cassette directory"));
+        // The losing recorder must not disturb the active one.
+        first.store(exchange(b"hello", 0), b"hello").unwrap();
+        assert_eq!(first.finish().unwrap()["exchanges"], 1);
+        assert_eq!(load(&dir).unwrap().0.exchanges.len(), 1);
+        // A finished cassette is never overwritten by a new recording.
+        assert!(Recorder::new(&dir, &[])
+            .unwrap_err()
+            .contains("refusing non-empty cassette directory"));
+    }
+
+    #[test]
+    fn cassette_redirect_detection_requires_status_and_location() {
+        let mut e = exchange(b"", 0);
+        for (status, location, expected) in [
+            (301, true, true),
+            (302, true, true),
+            (303, true, true),
+            (307, true, true),
+            (308, true, true),
+            (302, false, false),
+            (300, true, false),
+            (304, true, false),
+            (200, true, false),
+        ] {
+            e.status = status;
+            e.headers = if location {
+                vec![("lOcAtIoN".into(), "/next".into())]
+            } else {
+                vec![("Content-Type".into(), "text/plain".into())]
+            };
+            assert_eq!(e.redirects(), expected, "{status} location={location}");
+        }
+    }
+
+    #[test]
+    fn cassette_replay_headers_drop_transfer_encoding_and_keep_order() {
+        let headers = vec![
+            ("Transfer-Encoding".into(), "chunked".into()),
+            ("X-First".into(), "1".into()),
+            ("x-repeated".into(), "a".into()),
+            ("X-Repeated".into(), "b".into()),
+            ("content-length".into(), "1".into()),
+        ];
+        assert_eq!(
+            replay_headers(&headers, 0),
+            vec![
+                ("X-First".into(), "1".into()),
+                ("x-repeated".into(), "a".into()),
+                ("X-Repeated".into(), "b".into()),
+                ("Content-Length".into(), "0".into()),
+            ]
+        );
+    }
 }

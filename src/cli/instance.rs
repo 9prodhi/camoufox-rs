@@ -1493,7 +1493,7 @@ impl Instance {
         paths: &[String],
         frames: &[String],
         timeout: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<InteractionOutcome, String> {
         let _selectors = crate::api::selectors::SelectorScope::enter();
         let deadline = std::time::Instant::now() + timeout;
         let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
@@ -1506,6 +1506,8 @@ impl Instance {
              const tag = el.tagName.toLowerCase(); const type = el.type || el.getAttribute('type') || ''; \
              if (tag !== 'input' || type !== 'file') \
                return 'invalid argument: element is not a file input (' + tag + '[type=' + type + '])'; \
+             if (el.webkitdirectory || el.hasAttribute('webkitdirectory')) \
+               return 'invalid argument: directory-picker inputs (webkitdirectory) are not supported'; \
              if ({count} > 1 && !el.multiple) \
                return 'invalid argument: input does not accept multiple files'; \
              return el; }})()",
@@ -1543,7 +1545,20 @@ impl Instance {
         if let Some(context_id) = context_id {
             let _ = main_frame.dispose_object_with_timeout(&context_id, object_id, remaining());
         }
-        result.map_err(|e| scoped_error(frames, e))
+        let outcome = match result {
+            Ok(()) => InteractionOutcome {
+                dialog: main_frame.pending_dialog(),
+            },
+            Err(e) if e.kind == ProtocolErrorKind::DialogOpened => {
+                let mut outcome = interaction_error(e, "upload")?;
+                if outcome.dialog.is_none() {
+                    outcome.dialog = main_frame.pending_dialog();
+                }
+                outcome
+            }
+            Err(e) => return Err(scoped_error(frames, e)),
+        };
+        Ok(outcome)
     }
 
     /// Press a named key (keydown followed by keyup).
@@ -2781,12 +2796,12 @@ impl InstanceManager {
         paths: &[String],
         frames: &[String],
         timeout: Duration,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<(Vec<String>, InteractionOutcome), String> {
         let files = validate_upload_paths(paths)?;
-        self.with_instance(instance_id, |inst, _| {
+        let outcome = self.with_instance(instance_id, |inst, _| {
             inst.upload(page_id, selector, paths, frames, timeout)
         })?;
-        Ok(files)
+        Ok((files, outcome))
     }
 
     /// Insert text into the focused element.

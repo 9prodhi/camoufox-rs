@@ -7,7 +7,7 @@ This crate implements the full stack needed to automate a Camoufox browser proce
 ## Current Scope
 
 - Library crate with a synchronous API for Juggler domains (`Browser`, `MainFrame`, `Network`, `Runtime`, `Heap`)
-- Optional CLI (`--features cli`) with a Unix socket daemon for multi-instance management
+- Optional CLI (`--features cli`) with a Unix socket daemon for multi-instance management, persistent profiles (`launch --profile-dir`), external subcommand plugins (`camoufox-<name>` on `PATH`), and structured error `kind` classifications
 - Page HTTP cassette recording and deterministic offline replay with `record start/stop` and `replay start/stop`
 - Unix implementation (process + fd pipe model): Linux and macOS. Windows is not supported.
 ## Documentation
@@ -70,16 +70,21 @@ Built-in commands: `serve`, `launch`, `dialog`, `list`, `stop`, `new-page`, `nav
 `type`, `press`, `hover`, `select`, `scroll`, `tabs`, `close-tab`, `downloads`, `record`,
 `replay`.
 
+External subcommands: executing `camoufox <name>` for any command not built-in searches for
+`camoufox-<name>` on `PATH`, passing through all arguments and setting `CAMOUFOX_SOCKET` (and
+`CAMOUFOX_JSON=1` when `--json` is supplied).
+
 Start daemon (run in a dedicated shell):
 
 ```bash
 cargo run --features cli --bin camoufox -- serve
 ```
 
-Launch an instance:
+Launch an instance (`--profile-dir` specifies an optional persistent profile directory):
 
 ```bash
 cargo run --features cli --bin camoufox -- launch
+cargo run --features cli --bin camoufox -- launch --profile-dir /path/to/profile
 ```
 
 Create a page:
@@ -302,7 +307,7 @@ cargo run --features cli --bin camoufox -- stop <instance_id>
 cargo run --features cli --bin camoufox -- shutdown
 ```
 
-JSON output mode is available for all commands:
+JSON output mode is available for all commands (`--json`). On failure, JSON error responses include a `kind` field identifying the error category (e.g. `selector_not_found`, `timeout`, `dialog_open`, `invalid_argument`, `page_not_found`, `instance_not_found`, `io`, `daemon`, etc.):
 
 ```bash
 cargo run --features cli --bin camoufox -- --json list

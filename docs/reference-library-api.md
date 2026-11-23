@@ -43,6 +43,7 @@ browser.close()?;
 Key methods:
 - `Browser::connect(connection, root_session, options)`: Connect to an established Juggler connection.
 - `browser.new_context(options)`: Create a new isolated profile context.
+- `browser.default_context(options)`: Configure and return the `BrowserContext` for the browser's persistent on-disk profile. Requires connecting with `BrowserOptions::attach_to_default_context: true` to receive page and popup events. Unlike private contexts, calling `close()` on the default context is a no-op; call `Browser::close()` to terminate the process and flush profile storage.
 - `browser.version()`: Returns the browser version string if queried.
 - `browser.user_agent()`: Returns the browser User-Agent string.
 - `browser.close()`: Consumes the handle and gracefully terminates the browser.
@@ -85,11 +86,13 @@ let popups = context.take_popups();
 ```
 
 Key methods:
+- `context.context_id()`: Returns the context's unique ID string. For the default context, this is empty (`""`).
 - `context.new_main_frame()`: Creates a new tab/page and returns a `MainFrame` handle pinned to the top frame.
 - `context.get_cookies()`: Retrieves all cookies stored in the context.
 - `context.set_cookies(cookies)`: Sets one or more cookies.
 - `context.clear_cookies()`: Clears all cookies from the context.
 - `context.take_popups()`: Returns and drains any popup pages adopted by the context registry.
+- `context.close()`: Closes and removes the browser context. For the default context, this is a no-op (`Ok(())`); use `Browser::close()` instead.
 
 ### `MainFrame`
 
@@ -138,6 +141,8 @@ Key methods:
 - `page.evaluate_main_world(expr, timeout)`: Evaluates JavaScript in the main page world. Unwraps and returns the evaluated value directly as `Result<serde_json::Value, ProtocolError>`.
 - `page.evaluate_in_frame(frame_id, expr, timeout)`: Evaluates JavaScript scoped to a child frame. Returns raw `Result<serde_json::Value, ProtocolError>` matching `evaluate`.
 - `page.resolve_child_frame(parent_id, selector, timeout)`: Resolves a child frame ID from a CSS selector.
+- `page.set_file_input_files(frame_id, object_id, files)`: Sets files on a file input element with a default 60-second timeout. Dispatches `input` and `change` events.
+- `page.set_file_input_files_with_timeout(frame_id, object_id, files, timeout)`: Sets files on a file input element within an explicit command timeout. Dispatches `input` and `change` events.
 - `page.insert_text(text)`: Inserts text into the currently focused element.
 - `page.dispatch_key_event(params)`: Dispatches a raw keyboard event.
 - `page.dispatch_mouse_event(params)`: Dispatches a raw mouse event.

@@ -5,6 +5,8 @@
 <input id="single" type="file">
 <input id="multiple" type="file" multiple>
 <input id="hidden" type="file" style="display:none">
+<input id="directory" type="file" webkitdirectory>
+<input id="alert-on-change" type="file">
 <input id="text" type="text">
 <div id="other"></div>
 <div id="host"></div>
@@ -20,6 +22,12 @@ __FRAME__
         el.dataset[type + 'Names'] = JSON.stringify(Array.from(el.files || [], file => file.name));
       });
     }
+  }
+  const alertInput = document.querySelector('#alert-on-change');
+  if (alertInput) {
+    alertInput.addEventListener('change', () => {
+      alert('file selected');
+    });
   }
 </script>
 </body>

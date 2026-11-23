@@ -80,7 +80,7 @@ pub enum Command {
         /// JavaScript dialog handling policy.
         #[arg(long, value_enum, default_value = "manual")]
         dialogs: DialogMode,
-        /// Absolute path; created or tightened to 0700, canonicalized, must be empty or an existing profile, never deleted on stop.
+        /// Absolute path; created with mode 0700 or group/other permissions removed, canonicalized, must be empty or an existing profile, never deleted on stop.
         #[arg(long)]
         profile_dir: Option<PathBuf>,
     },
@@ -623,6 +623,8 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stdout)
         );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("1 passed"), "{stdout}");
     }
 }
 
@@ -631,7 +633,7 @@ mod cassette_command_tests {
     use super::*;
 
     #[test]
-    fn record_replay_contract_commands_parse() {
+    fn record_replay_commands_parse() {
         let cli = Cli::try_parse_from([
             "camoufox",
             "record",

@@ -4,6 +4,7 @@ use clap::{CommandFactory, Parser};
 
 use camoufox::cli::client::send_request;
 use camoufox::cli::commands::{Cli, Command, RecordAction, ReplayAction};
+use camoufox::cli::error_kind::{ErrorKind, PROFILE_DIR_UNSUPPORTED};
 use camoufox::cli::ipc::DaemonRequest;
 use camoufox::cli::output::print_response;
 use camoufox::cli::socket::socket_path;
@@ -89,7 +90,24 @@ fn main() {
                 if persistent && response.ok
                     && response.data.as_ref().and_then(|data| data.get("profile_dir")).is_none()
                 {
-                    return Err("daemon does not support --profile-dir; restart it: camoufox shutdown && camoufox serve".into());
+                    let Some(instance_id) = response.data.as_ref()
+                        .and_then(|data| data.get("instance_id"))
+                        .and_then(serde_json::Value::as_str)
+                    else {
+                        return Err(format!("{PROFILE_DIR_UNSUPPORTED}; missing instance_id in launch response; could not stop browser"));
+                    };
+                    let stop = DaemonRequest::Stop { instance_id: instance_id.to_owned() };
+                    let cleanup = send_request(&sock, &stop).and_then(|response| {
+                        if response.ok {
+                            Ok(())
+                        } else {
+                            Err(response.error.unwrap_or_else(|| "daemon rejected stop".into()))
+                        }
+                    });
+                    return Err(match cleanup {
+                        Ok(()) => PROFILE_DIR_UNSUPPORTED.to_owned(),
+                        Err(error) => format!("{PROFILE_DIR_UNSUPPORTED}; failed to stop instance {instance_id}: {error}"),
+                    });
                 }
                 Ok(response)
             });
@@ -221,8 +239,14 @@ fn main() {
             timeout,
         } => {
             let output = output.map(|p| {
-                absolute_output_path(&p)
-                    .unwrap_or_else(|e| fail(cli.json, &format!("resolve screenshot path: {e}")))
+                absolute_output_path(&p).unwrap_or_else(|e| {
+                    fail_with_kind(
+                        cli.json,
+                        &format!("io error: resolve screenshot path: {e}"),
+                        ErrorKind::Io,
+                        1,
+                    )
+                })
             });
             let clip = match clip.as_deref().map(parse_clip) {
                 Some(Ok(rect)) => Some(rect),
@@ -523,7 +547,12 @@ fn main() {
                 .iter()
                 .map(|path| {
                     absolute_output_path(path).unwrap_or_else(|e| {
-                        fail(cli.json, &format!("io error: resolve upload path: {e}"))
+                        fail_with_kind(
+                            cli.json,
+                            &format!("io error: resolve upload path: {e}"),
+                            ErrorKind::Io,
+                            1,
+                        )
                     })
                 })
                 .collect();
@@ -705,6 +734,8 @@ fn dispatch_external(sock: &std::path::Path, args: &[String], json_mode: bool) -
             .env("CAMOUFOX_SOCKET", path.as_os_str());
         if json_mode {
             command.env("CAMOUFOX_JSON", "1");
+        } else {
+            command.env_remove("CAMOUFOX_JSON");
         }
         let status = command.status().unwrap_or_else(|e| {
             eprintln!("error: failed to execute external subcommand: {e}");
@@ -780,8 +811,13 @@ fn parse_clip(s: &str) -> Result<[f64; 4], String> {
 
 /// Report a client-side argument error and exit, honouring `--json`.
 fn fail(json_mode: bool, message: &str) -> ! {
+    fail_with_kind(json_mode, message, ErrorKind::InvalidArgument, 2)
+}
+
+fn fail_with_kind(json_mode: bool, message: &str, kind: ErrorKind, exit_code: i32) -> ! {
     if json_mode {
-        let resp = camoufox::cli::ipc::DaemonResponse::err(message);
+        let mut resp = camoufox::cli::ipc::DaemonResponse::err(message);
+        resp.kind = Some(kind.as_str().into());
         println!(
             "{}",
             serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into())
@@ -789,7 +825,7 @@ fn fail(json_mode: bool, message: &str) -> ! {
     } else {
         eprintln!("error: {message}");
     }
-    std::process::exit(2);
+    std::process::exit(exit_code);
 }
 
 fn run_client(sock: &std::path::Path, request: &DaemonRequest, json_mode: bool) {

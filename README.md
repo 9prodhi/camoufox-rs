@@ -89,9 +89,12 @@ cargo run --features cli --bin camoufox -- launch --profile-dir /path/to/profile
 
 For persistent browsing data, add `--profile-dir /absolute/path/to/profile` to
 `launch`. The directory must be empty or contain `prefs.js` or `times.json`.
-It is created or made private, canonicalized, and kept after stop. The daemon
-confirms the canonical path in launch success data; restart older daemons that
-cannot confirm persistent profile support.
+It is created with mode 0700 or has group/other permissions removed,
+canonicalized, and kept after stop. The daemon confirms the canonical path in
+launch success data; restart older daemons that
+cannot confirm persistent profile support. The client stops the instance returned
+by an older daemon before reporting the compatibility error; if cleanup fails,
+the error includes the instance ID so you can stop it manually.
 
 Create a page:
 
@@ -216,6 +219,11 @@ cargo run --features cli --bin camoufox -- upload <instance_id> <page_id> 'input
 # Also available: type <text>, hover <selector>, select <selector> <value>, scroll [selector]
 ```
 
+Upload rejects directory-picker (`webkitdirectory`) inputs with kind
+`invalid_argument`. If an `input` or `change` handler opens a JavaScript dialog,
+successful JSON upload data may include `"dialog": {...}`; resolve it with
+`camoufox dialog <instance_id> <page_id> accept` or `dismiss`.
+
 ### Iframe and Shadow-DOM Scoping
 
 After upgrading, restart any running daemon: `camoufox shutdown`, then
@@ -318,6 +326,9 @@ JSON output mode is available for all commands (`--json`). On failure, JSON erro
 ```bash
 cargo run --features cli --bin camoufox -- --json list
 ```
+
+Client-side argument validation exits 2 with kind `invalid_argument`; local I/O
+failures, such as resolving an upload or screenshot path, exit 1 with kind `io`.
 
 Socket resolution:
 

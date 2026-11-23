@@ -399,7 +399,7 @@ pub struct LaunchOptions {
     pub bypass_csp: bool,
     /// Policy for JavaScript dialogs.
     pub dialogs: DialogPolicy,
-    /// Absolute path; created or tightened to 0700, canonicalized, must be empty or an existing profile, never deleted on stop.
+    /// Absolute path; created with mode 0700 or group/other permissions removed, canonicalized, must be empty or an existing profile, never deleted on stop.
     pub profile_dir: Option<String>,
 }
 
@@ -461,16 +461,20 @@ impl ProfileDir {
     }
 }
 
-/// Prepare an absolute persistent profile path, creating it or clearing group/other
-/// access. It must be empty or contain `prefs.js` or `times.json`. Returns the
-/// canonical path; persistent profiles are never deleted on stop.
+/// Prepare an absolute persistent profile path, creating it with mode 0700 or
+/// removing group/other permissions. It must be empty or contain `prefs.js` or
+/// `times.json`. Returns the canonical path; never deleted on stop.
 pub fn prepare_profile_dir(path_str: &str) -> Result<PathBuf, String> {
-    prepare_profile_dir_with_permissions(path_str, |path, permissions| {
+    prepare_profile_dir_impl(path_str, |path, permissions| {
         std::fs::set_permissions(path, permissions)
     })
 }
 
-fn prepare_profile_dir_with_permissions(
+// Private test seam for exercising chmod failure without depending on the UID.
+#[cfg(test)]
+use prepare_profile_dir_impl as prepare_profile_dir_with_permissions;
+
+fn prepare_profile_dir_impl(
     path_str: &str,
     set_permissions: impl FnOnce(&Path, std::fs::Permissions) -> std::io::Result<()>,
 ) -> Result<PathBuf, String> {

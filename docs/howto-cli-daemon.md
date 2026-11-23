@@ -48,9 +48,13 @@ With `--json`:
 ```
 
 ### Socket resolution
-By default, the daemon binds to:
-- `$XDG_RUNTIME_DIR/camoufox/daemon.sock`
-- Or `/tmp/camoufox-<uid>/daemon.sock` if `XDG_RUNTIME_DIR` is unset.
+
+The daemon and client resolve the socket path in this order:
+
+1. `--socket <path>`, when supplied.
+2. `CAMOUFOX_SOCKET`, when set.
+3. `$XDG_RUNTIME_DIR/camoufox/daemon.sock`, when `XDG_RUNTIME_DIR` is set.
+4. `/tmp/camoufox-<uid>/daemon.sock` otherwise.
 
 Override the socket location with `--socket <path>` on any command:
 ```bash

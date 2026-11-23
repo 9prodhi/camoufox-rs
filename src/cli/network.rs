@@ -1,7 +1,7 @@
 //! Page-owned network workers. Reader callbacks only enqueue events: protocol
 //! calls must run on another thread so the reader can deliver their responses.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -290,7 +290,11 @@ fn handle_replay_event(
     page: &MainFrame,
     replay: &mut Replay,
     event: &EventMessage,
+    deadline: &Mutex<Option<Instant>>,
 ) -> Result<(), String> {
+    if deadline_exceeded(deadline) {
+        return Ok(());
+    }
     let p = &event.params;
     let Some(id) = p["requestId"].as_str() else {
         return Ok(());
@@ -312,19 +316,31 @@ fn handle_replay_event(
         let body = match replay.body(&exchange.body_sha256) {
             Ok(body) => body,
             Err(e) => {
-                page.abort_intercepted_request(id, "blockedbyclient");
+                let _ = page.session().send_with_finalize_deadline(
+                    "Network.abortInterceptedRequest",
+                    json!({"requestId":id, "errorCode":"blockedbyclient"}),
+                    deadline,
+                );
                 return Err(e);
             }
         };
         let headers = cassette::replay_headers(&exchange.headers, exchange.body_len);
-        let borrowed: Vec<_> = headers
+        let headers: Vec<_> = headers
             .iter()
-            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .map(|(name, value)| json!({"name":name, "value":value}))
             .collect();
-        page.fulfill_intercepted_request(id, exchange.status, "", &borrowed, &body);
+        let _ = page.session().send_with_finalize_deadline(
+            "Network.fulfillInterceptedRequest",
+            json!({"requestId":id, "status":exchange.status, "statusText":"", "headers":headers, "base64body":body}),
+            deadline,
+        );
         replay.served += 1;
     } else {
-        page.abort_intercepted_request(id, "blockedbyclient");
+        let _ = page.session().send_with_finalize_deadline(
+            "Network.abortInterceptedRequest",
+            json!({"requestId":id, "errorCode":"blockedbyclient"}),
+            deadline,
+        );
         replay.miss(method, url);
     }
     Ok(())
@@ -400,9 +416,9 @@ fn handle_record_event(
                     recorder.skip(&exchange, "finalize deadline exceeded".into());
                     return Ok(());
                 }
-                let response = page.get_response_body(id);
-                // The watchdog closes the connection to interrupt an in-flight
-                // read; queued body reads then skip without protocol calls.
+                let response = page.get_response_body_with_deadline(id, deadline);
+                // The read observes deadlines armed while it was in flight;
+                // queued body reads skip without touching the connection.
                 if deadline_exceeded(deadline) {
                     recorder.skip(&exchange, "finalize deadline exceeded".into());
                     return Ok(());
@@ -457,7 +473,7 @@ fn run(
     let mut error = None;
     while let Ok(event) = rx.recv() {
         let result = match &mut mode {
-            Mode::Replay(replay) => handle_replay_event(&page, replay, &event),
+            Mode::Replay(replay) => handle_replay_event(&page, replay, &event, &deadline),
             Mode::Record(recorder) => {
                 handle_record_event(&page, recorder, &mut events, &event, &deadline)
             }
@@ -685,9 +701,6 @@ impl NetworkState {
             set_deadline(&session.finalize_deadline, deadline);
             let recording = session.recording;
             let result = session.stop();
-            if let Err(e) = &result {
-                log::warn!("network cassette cleanup: {e}");
-            }
             if recording {
                 self.last_record_stop = Some(result);
             } else {
@@ -697,20 +710,69 @@ impl NetworkState {
     }
 }
 
+#[derive(Clone, Default)]
+struct ClosedResults {
+    record: Option<Result<Value, String>>,
+    replay: Option<Result<Value, String>>,
+}
+
+impl ClosedResults {
+    fn from_state(state: &NetworkState) -> Self {
+        Self {
+            record: state.last_record_stop.clone(),
+            replay: state.last_replay_stop.clone(),
+        }
+    }
+
+    fn errors(&self, page_id: &str) -> Vec<Value> {
+        [("record", &self.record), ("replay", &self.replay)]
+            .into_iter()
+            .filter_map(|(mode, result)| match result {
+                Some(Err(error)) => Some(json!({"page_id":page_id, "mode":mode, "error":error})),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 struct NetworkPage {
+    page_id: String,
     state: std::sync::Weak<Mutex<NetworkState>>,
     deadline: Deadline,
 }
 
 /// Reach active page operations without acquiring the per-instance mutex.
-#[derive(Default)]
 pub(crate) struct NetworkSessions {
     closed: bool,
     pages: Vec<NetworkPage>,
+    closed_results: VecDeque<(String, ClosedResults)>,
+    close_errors: Vec<Value>,
+    finalize_budget: Duration,
+}
+
+impl Default for NetworkSessions {
+    fn default() -> Self {
+        Self {
+            closed: false,
+            pages: Vec::new(),
+            closed_results: VecDeque::new(),
+            close_errors: Vec::new(),
+            finalize_budget: Duration::from_secs(FINALIZE_TIMEOUT_SECS),
+        }
+    }
 }
 
 impl NetworkSessions {
-    pub fn register(&mut self, state: &Arc<Mutex<NetworkState>>) -> Result<Deadline, String> {
+    #[cfg(test)]
+    pub fn set_finalize_budget(&mut self, budget: Duration) {
+        self.finalize_budget = budget;
+    }
+
+    pub fn register(
+        &mut self,
+        page_id: &str,
+        state: &Arc<Mutex<NetworkState>>,
+    ) -> Result<Deadline, String> {
         if self.closed {
             return Err("invalid argument: instance network sessions were closed".into());
         }
@@ -724,51 +786,92 @@ impl NetworkSessions {
         }
         let deadline = Arc::new(Mutex::new(None));
         self.pages.push(NetworkPage {
+            page_id: page_id.into(),
             state: Arc::downgrade(state),
             deadline: Arc::clone(&deadline),
         });
         Ok(deadline)
     }
 
-    pub fn close_all(registry: &Mutex<Self>, connection: &Arc<Connection>) {
-        let finalize = FinalizeDeadline::new(connection);
-        // Keep this separate network-registry mutex through the drain: two
-        // concurrent cleanup paths must both wait before either closes the
-        // connection. No per-instance mutex is held here.
+    fn remember(&mut self, page_id: &str, results: ClosedResults) {
+        self.closed_results.retain(|(id, _)| id != page_id);
+        self.closed_results.push_back((page_id.into(), results));
+        if self.closed_results.len() > 64 {
+            self.closed_results.pop_front();
+        }
+    }
+
+    pub fn closed_stop(&self, page_id: &str, recording: bool) -> Option<Result<Value, String>> {
+        let (_, results) = self.closed_results.iter().find(|(id, _)| id == page_id)?;
+        let result = if recording {
+            &results.record
+        } else {
+            &results.replay
+        };
+        result.as_ref().map(|result| {
+            result.clone().map(|mut value| {
+                value["repeated"] = json!(true);
+                value["page_closed"] = json!(true);
+                value
+            })
+        })
+    }
+
+    pub fn close_all(registry: &Mutex<Self>, connection: &Arc<Connection>) -> Vec<Value> {
+        // Serialize whole-instance drains. Page cleanup never holds this lock
+        // while joining, so it cannot invert the page/registry lock order.
         let mut registry = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registry.closed {
+            return registry.close_errors.clone();
+        }
+        let finalize = FinalizeDeadline::new(connection, registry.finalize_budget);
         registry.closed = true;
         let pages = std::mem::take(&mut registry.pages);
-        // Mark every worker before joining any of them. A concurrent record
-        // stop can own the page mutex while its worker is blocked reading.
+        // A concurrent record stop may own page state with a body read in flight.
         for page in &pages {
             set_deadline(&page.deadline, finalize.deadline);
         }
-        for page in pages.into_iter().filter_map(|p| p.state.upgrade()) {
-            close_network_state_before(&page, finalize.deadline);
+        for page in pages {
+            if let Some(state) = page.state.upgrade() {
+                let results = close_network_state_before(&state, finalize.deadline);
+                registry.close_errors.extend(results.errors(&page.page_id));
+                registry.remember(&page.page_id, results);
+            }
         }
+        registry.close_errors.clone()
     }
 
     pub fn close_page(
         registry: &Mutex<Self>,
+        page_id: &str,
         state: &Arc<Mutex<NetworkState>>,
-        connection: &Arc<Connection>,
-    ) {
-        let finalize = FinalizeDeadline::new(connection);
-        {
-            let registry = registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(page) = registry
-                .pages
-                .iter()
-                .find(|p| p.state.ptr_eq(&Arc::downgrade(state)))
-            {
-                set_deadline(&page.deadline, finalize.deadline);
-            }
-        }
-        close_network_state_before(state, finalize.deadline);
+    ) -> Vec<Value> {
+        let budget = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finalize_budget;
+        // Start only after acquiring page state: concurrent replay validation
+        // or record stop must not consume this page's finalization budget.
+        let results = close_network_state(state, budget);
+        let errors = results.errors(page_id);
+        registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remember(page_id, results);
+        errors
+    }
+}
+
+/// Log finalization failures for cleanup paths without a response channel.
+pub(crate) fn log_cassette_errors(errors: &[Value]) {
+    for error in errors {
+        log::warn!(
+            "cassette for {} not published: {}",
+            error["page_id"].as_str().unwrap_or(""),
+            error["error"].as_str().unwrap_or("")
+        );
     }
 }
 
@@ -779,17 +882,21 @@ fn set_deadline(deadline: &Mutex<Option<Instant>>, end: Instant) {
     *deadline = Some(deadline.map_or(end, |current| current.min(end)));
 }
 
-/// Close page network state while recovering poisoned cleanup locks.
-pub(crate) fn close_network_state(state: &Mutex<NetworkState>, connection: &Arc<Connection>) {
-    let finalize = FinalizeDeadline::new(connection);
-    close_network_state_before(state, finalize.deadline);
+/// Close page state without closing the browser shared by other pages.
+fn close_network_state(state: &Mutex<NetworkState>, budget: Duration) -> ClosedResults {
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.close(Instant::now() + budget);
+    ClosedResults::from_state(&state)
 }
 
-fn close_network_state_before(state: &Mutex<NetworkState>, deadline: Instant) {
-    state
+fn close_network_state_before(state: &Mutex<NetworkState>, deadline: Instant) -> ClosedResults {
+    let mut state = state
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .close(deadline);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.close(deadline);
+    ClosedResults::from_state(&state)
 }
 
 /// One watchdog covers the whole drain, including all queued body reads.
@@ -800,8 +907,8 @@ struct FinalizeDeadline {
 }
 
 impl FinalizeDeadline {
-    fn new(connection: &Arc<Connection>) -> Self {
-        let deadline = Instant::now() + Duration::from_secs(FINALIZE_TIMEOUT_SECS);
+    fn new(connection: &Arc<Connection>, budget: Duration) -> Self {
+        let deadline = Instant::now() + budget;
         let (cancel, wait) = mpsc::channel();
         let connection = Arc::clone(connection);
         let worker = std::thread::spawn(move || {

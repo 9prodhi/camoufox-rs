@@ -2079,6 +2079,25 @@ impl MainFrame {
             json!({ "requestId": request_id }),
         )?;
 
+        Self::decode_response_body(result)
+    }
+
+    /// Read a body while observing a deadline that cleanup may arm in flight.
+    #[cfg(feature = "cli")]
+    pub(crate) fn get_response_body_with_deadline(
+        &self,
+        request_id: &str,
+        deadline: &std::sync::Mutex<Option<Instant>>,
+    ) -> Result<(Vec<u8>, bool), ProtocolError> {
+        let result = self.session().send_with_finalize_deadline(
+            "Network.getResponseBody",
+            json!({"requestId": request_id}),
+            deadline,
+        )?;
+        Self::decode_response_body(result)
+    }
+
+    fn decode_response_body(result: serde_json::Value) -> Result<(Vec<u8>, bool), ProtocolError> {
         let b64 = result
             .get("base64body")
             .and_then(|v| v.as_str())

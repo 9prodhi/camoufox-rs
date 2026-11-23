@@ -59,6 +59,27 @@ pub fn print_response(response: &DaemonResponse, json_mode: bool) {
 /// command uses, and the more specific keys are tested first. Kept pure so the
 /// exact rendering can be asserted in tests.
 pub fn render(data: Option<&Value>) -> Rendered {
+    let mut rendered = render_data(data);
+    if let Some(errors) = data.and_then(|d| d["cassette_errors"].as_array()) {
+        for error in errors {
+            // Keep one warning per entry even when an I/O path contains newlines.
+            let page = error["page_id"]
+                .as_str()
+                .unwrap_or("")
+                .replace(['\n', '\r'], " ");
+            let message = error["error"]
+                .as_str()
+                .unwrap_or("")
+                .replace(['\n', '\r'], " ");
+            rendered.stderr.push(format!(
+                "warning: cassette for {page} not published: {message}"
+            ));
+        }
+    }
+    rendered
+}
+
+fn render_data(data: Option<&Value>) -> Rendered {
     let Some(data) = data else {
         return Rendered::out("ok");
     };
@@ -364,6 +385,10 @@ pub fn render(data: Option<&Value>) -> Rendered {
         }
     }
 
+    if data.get("cassette_errors").is_some() && data.as_object().is_some_and(|d| d.len() == 1) {
+        return Rendered::out("ok");
+    }
+
     // Fallback: print the data as JSON.
     Rendered::out(pretty(data))
 }
@@ -646,6 +671,22 @@ mod tests {
 mod cassette_output_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cleanup_errors_render_one_warning_line_per_entry() {
+        let data = json!({"closed_page":"p1", "cassette_errors":[
+            {"page_id":"p1", "mode":"record", "error":"io error: first\nline\rbreak"},
+            {"page_id":"p2", "mode":"replay", "error":"io error: second"}
+        ]});
+        let rendered = render(Some(&data));
+        assert_eq!(
+            rendered.stderr,
+            [
+                "warning: cassette for p1 not published: io error: first line break",
+                "warning: cassette for p2 not published: io error: second"
+            ]
+        );
+    }
 
     #[test]
     fn cassette_responses_render_counts_and_miss_details() {

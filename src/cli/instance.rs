@@ -648,15 +648,18 @@ impl Instance {
 
     /// Adopt any ready popups opened by this instance's pages.
     pub fn adopt_popups(&mut self, context: &crate::api::BrowserContext) {
-        for page in self.adopt_popups_deferred(context) {
-            super::network::close_network_state(&page.network, self.browser.connection());
+        let networks = Mutex::new(super::network::NetworkSessions::default());
+        for (page_id, page) in self.adopt_popups_deferred(context) {
+            let errors =
+                super::network::NetworkSessions::close_page(&networks, &page_id, &page.network);
+            super::network::log_cassette_errors(&errors);
         }
     }
 
     fn adopt_popups_deferred(
         &mut self,
         context: &crate::api::BrowserContext,
-    ) -> Vec<ManagedMainFrame> {
+    ) -> Vec<(String, ManagedMainFrame)> {
         let mut removed = Vec::new();
         let mut closed_ids = Vec::new();
         for (page_id, mp) in &self.pages {
@@ -666,7 +669,7 @@ impl Instance {
         }
         for id in closed_ids {
             if let Some(page) = self.pages.remove(&id) {
-                removed.push(page);
+                removed.push((id.clone(), page));
             }
             self.record_closed_page(id);
         }
@@ -1955,9 +1958,20 @@ impl Instance {
 
     /// Shut down this instance. Browser.close is followed by pipe EOF, which makes Camoufox exit.
     pub fn stop(self) -> Result<(), String> {
-        for page in self.pages.values() {
-            super::network::close_network_state(&page.network, self.browser.connection());
+        let networks = Mutex::new(super::network::NetworkSessions::default());
+        for (id, page) in &self.pages {
+            let deadline = networks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .register(id, &page.network)?;
+            page.network
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_finalize_deadline(deadline);
         }
+        let errors =
+            super::network::NetworkSessions::close_all(&networks, self.browser.connection());
+        super::network::log_cassette_errors(&errors);
         let Instance {
             browser,
             mut child,
@@ -2301,6 +2315,11 @@ impl InstanceManager {
 
     /// Stop an instance.
     pub fn stop(&self, instance_id: &str) -> Result<(), String> {
+        self.stop_with_result(instance_id).map(|_| ())
+    }
+
+    /// Stop while retaining cassette failures for the daemon success response.
+    pub(crate) fn stop_with_result(&self, instance_id: &str) -> Result<serde_json::Value, String> {
         let InstanceEntry {
             managed: entry,
             closer,
@@ -2313,7 +2332,7 @@ impl InstanceManager {
             .remove(instance_id)
             .ok_or_else(|| Self::missing(instance_id))?;
         // Network workers still need the connection to read completed bodies.
-        super::network::NetworkSessions::close_all(&networks, &closer);
+        let errors = super::network::NetworkSessions::close_all(&networks, &closer);
         // Then interrupt other commands so the instance mutex frees promptly.
         let _ = closer.close();
         let inst = entry
@@ -2322,7 +2341,12 @@ impl InstanceManager {
             .instance
             .take()
             .ok_or_else(|| Self::missing(instance_id))?;
-        inst.stop()
+        inst.stop()?;
+        Ok(if errors.is_empty() {
+            serde_json::Value::Null
+        } else {
+            json!({"cassette_errors":errors})
+        })
     }
 
     /// Create a new page in an instance.
@@ -2422,12 +2446,12 @@ impl InstanceManager {
         id: &str,
         f: impl FnOnce(&mut Instance, &crate::api::BrowserContext) -> Result<T, String>,
     ) -> Result<T, String> {
-        let entry = self
+        let (entry, networks) = self
             .instances
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(id)
-            .map(|e| Arc::clone(&e.managed))
+            .map(|e| (Arc::clone(&e.managed), Arc::clone(&e.networks)))
             .ok_or_else(|| Self::missing(id))?;
         let mut entry = entry
             .lock()
@@ -2438,10 +2462,11 @@ impl InstanceManager {
         let inst = instance.as_mut().ok_or_else(|| Self::missing(id))?;
         let removed = inst.adopt_popups_deferred(context);
         let result = f(inst, context);
-        let connection = Arc::clone(inst.browser.connection());
         drop(entry);
-        for page in removed {
-            super::network::close_network_state(&page.network, &connection);
+        for (page_id, page) in removed {
+            let errors =
+                super::network::NetworkSessions::close_page(&networks, &page_id, &page.network);
+            super::network::log_cassette_errors(&errors);
         }
         result
     }
@@ -2487,7 +2512,7 @@ impl InstanceManager {
         let deadline = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .register(&state)?;
+            .register(page_id, &state)?;
         let mut state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2523,6 +2548,10 @@ impl InstanceManager {
             validation?;
             state.stop(true, &page)
         })
+        .or_else(|error| {
+            self.closed_network_stop(instance_id, page_id, true)
+                .unwrap_or(Err(error))
+        })
     }
 
     /// Validate a cassette and enable offline replay for a page.
@@ -2553,6 +2582,29 @@ impl InstanceManager {
             validation?;
             state.stop(false, &page)
         })
+        .or_else(|error| {
+            self.closed_network_stop(instance_id, page_id, false)
+                .unwrap_or(Err(error))
+        })
+    }
+
+    fn closed_network_stop(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        recording: bool,
+    ) -> Option<Result<serde_json::Value, String>> {
+        let networks = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(instance_id)
+            .map(|entry| Arc::clone(&entry.networks))?;
+        let result = networks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed_stop(page_id, recording);
+        result
     }
 
     /// Access the download log for an instance without locking the instance.
@@ -2983,6 +3035,15 @@ impl InstanceManager {
 
     /// Close a page.
     pub fn close_tab(&self, instance_id: &str, page_id: &str) -> Result<(), String> {
+        self.close_tab_with_result(instance_id, page_id).map(|_| ())
+    }
+
+    /// Close a tab and include any cassette failure in its success data.
+    pub(crate) fn close_tab_with_result(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+    ) -> Result<serde_json::Value, String> {
         let networks = self
             .instances
             .lock()
@@ -2990,16 +3051,18 @@ impl InstanceManager {
             .get(instance_id)
             .map(|entry| Arc::clone(&entry.networks))
             .ok_or_else(|| Self::missing(instance_id))?;
-        let (state, connection) = self.with_instance(instance_id, |inst, _| {
-            Ok((
-                inst.pages.get(page_id).map(|p| Arc::clone(&p.network)),
-                Arc::clone(inst.browser.connection()),
-            ))
+        let state = self.with_instance(instance_id, |inst, _| {
+            Ok(inst.pages.get(page_id).map(|p| Arc::clone(&p.network)))
         })?;
-        if let Some(state) = state {
-            super::network::NetworkSessions::close_page(&networks, &state, &connection);
+        let errors = state.map_or_else(Vec::new, |state| {
+            super::network::NetworkSessions::close_page(&networks, page_id, &state)
+        });
+        self.with_instance(instance_id, |inst, _| inst.close_tab(page_id))?;
+        let mut data = json!({"closed_page":page_id});
+        if !errors.is_empty() {
+            data["cassette_errors"] = json!(errors);
         }
-        self.with_instance(instance_id, |inst, _| inst.close_tab(page_id))
+        Ok(data)
     }
 
     /// Export all cookies for an instance's browser context (including HttpOnly).
@@ -3052,7 +3115,8 @@ impl InstanceManager {
             .into_iter()
             .map(|(networks, closer)| {
                 std::thread::spawn(move || {
-                    super::network::NetworkSessions::close_all(&networks, &closer);
+                    let errors = super::network::NetworkSessions::close_all(&networks, &closer);
+                    super::network::log_cassette_errors(&errors);
                     let _ = closer.close();
                 })
             })
@@ -3083,7 +3147,8 @@ impl InstanceManager {
                      ..
                  }| {
                     std::thread::spawn(move || {
-                        super::network::NetworkSessions::close_all(&networks, &closer);
+                        let errors = super::network::NetworkSessions::close_all(&networks, &closer);
+                        super::network::log_cassette_errors(&errors);
                         let _ = closer.close();
                         let instance = entry
                             .lock()

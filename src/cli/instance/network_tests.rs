@@ -63,6 +63,17 @@ struct Harness {
 
 impl Harness {
     fn new(reply: impl Fn(&str, &Value) -> Result<Value, String> + Send + 'static) -> Self {
+        Self::build(reply, None)
+    }
+
+    fn ignoring_response_bodies() -> Self {
+        Self::build(|_, _| Ok(json!({})), Some("Network.getResponseBody"))
+    }
+
+    fn build(
+        reply: impl Fn(&str, &Value) -> Result<Value, String> + Send + 'static,
+        ignore: Option<&'static str>,
+    ) -> Self {
         let reply: Box<Reply> = Box::new(reply);
         let (events, incoming) = mpsc::channel();
         let (outgoing, outgoing_rx) = mpsc::channel::<Value>();
@@ -80,6 +91,9 @@ impl Harness {
                 };
                 log.lock().unwrap().push(request.clone());
                 let method = request["method"].as_str().unwrap_or("");
+                if ignore == Some(method) {
+                    continue;
+                }
                 let (result, error) = match reply(method, &request["params"]) {
                     Ok(value) => (Some(value), None),
                     Err(message) => (
@@ -171,6 +185,11 @@ impl Harness {
                 downloads: crate::cli::downloads::DownloadLog::new("ctx".into(), None),
             },
         );
+        manager.instances.lock().unwrap()["mock"]
+            .networks
+            .lock()
+            .unwrap()
+            .set_finalize_budget(Duration::from_millis(200));
         Self {
             manager,
             events,
@@ -179,6 +198,63 @@ impl Harness {
             connection: conn,
             worker: Some(worker),
         }
+    }
+
+    fn add_other_page(&self) {
+        self.events.send(RawMessage {
+            id: None,
+            method: Some("Browser.attachedToTarget".into()),
+            params: Some(json!({"sessionId":"other", "targetInfo":{"type":"page","targetId":"other-target","browserContextId":"ctx"}})),
+            result: None, error: None, session_id: None,
+        }).unwrap();
+        self.events
+            .send(RawMessage {
+                id: None,
+                method: Some("Page.frameAttached".into()),
+                params: Some(json!({"frameId":"other-main"})),
+                result: None,
+                error: None,
+                session_id: Some("other".into()),
+            })
+            .unwrap();
+        self.manager
+            .with_instance("mock", |inst, context| {
+                let tracked = context
+                    .registry()
+                    .claim("other-target", Duration::from_secs(2))
+                    .unwrap();
+                let page = MainFrame::from_tracked(
+                    tracked,
+                    self.connection.clone(),
+                    context.registry().clone(),
+                )
+                .unwrap();
+                inst.pages.insert(
+                    "p2".into(),
+                    ManagedMainFrame {
+                        main_frame: Arc::new(page),
+                        network: Default::default(),
+                        headers: Vec::new(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn assert_other_page_works(&self) {
+        self.manager
+            .with_instance("mock", |inst, _| {
+                inst.pages["p2"]
+                    .main_frame
+                    .session()
+                    .send("Test.otherPage", json!({}))
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert!(!self.closed.load(Ordering::SeqCst));
+        assert!(self.requests("Browser.close").is_empty());
     }
 
     fn page_event(&self, method: &str, params: Value) {
@@ -1075,22 +1151,22 @@ fn failed_network_start_clears_previous_stop_result() {
 
 #[test]
 fn network_finalize_deadline_bounds_cleanup_and_publishes_index() {
-    for action in ["stop", "shutdown", "close-tab"] {
-        let (release, wait) = mpsc::channel();
-        let harness = Harness::new(move |method, _| {
-            if method == "Network.getResponseBody" {
-                let _ = wait.recv_timeout(Duration::from_secs(20));
-                Ok(json!({"base64body":"aGVsbG8=", "evicted":false}))
-            } else {
-                Ok(json!({}))
-            }
-        });
+    let started = Instant::now();
+    for action in ["close-tab", "stop", "shutdown"] {
+        let harness = Harness::ignoring_response_bodies();
+        harness.add_other_page();
         let parent = tempfile::tempdir().unwrap();
         let dir = parent.path().join("cassette");
         harness
             .manager
             .record_start("mock", "p", &dir, &[])
             .unwrap();
+        if action == "close-tab" {
+            harness
+                .manager
+                .record_start("mock", "p2", &parent.path().join("other"), &[])
+                .unwrap();
+        }
         let (state, page) = harness
             .manager
             .with_instance("mock", |inst, _| {
@@ -1119,15 +1195,15 @@ fn network_finalize_deadline_bounds_cleanup_and_publishes_index() {
                     "stop" => manager.stop("mock").unwrap(),
                     "shutdown" => manager.shutdown_all(),
                     _ => {
-                        let _ = manager.close_tab("mock", "p");
+                        manager.close_tab("mock", "p").unwrap();
                     }
                 }
                 done.send(()).unwrap();
             });
-            let bounded = finished.recv_timeout(Duration::from_secs(17)).is_ok();
-            // Release the protocol peer even on regression so the test can exit.
-            let _ = release.send(());
-            let _ = release.send(());
+            let bounded = finished.recv_timeout(Duration::from_secs(1)).is_ok();
+            if !bounded {
+                let _ = harness.connection.close();
+            }
             worker.join().unwrap();
             assert!(bounded, "{action} exceeded its total finalize budget");
         });
@@ -1138,22 +1214,24 @@ fn network_finalize_deadline_bounds_cleanup_and_publishes_index() {
         for skip in result["skipped"].as_array().unwrap() {
             assert_eq!(skip["reason"], "finalize deadline exceeded");
         }
-        assert!(harness.closed.load(Ordering::SeqCst));
+        if action == "close-tab" {
+            harness.assert_other_page_works();
+            assert_eq!(
+                harness.manager.record_stop("mock", "p2").unwrap()["exchanges"],
+                0
+            );
+            assert!(parent.path().join("other/index.json").is_file());
+        } else {
+            assert!(harness.closed.load(Ordering::SeqCst));
+        }
         assert_eq!(harness.requests("Network.getResponseBody").len(), 1);
     }
+    assert!(started.elapsed() < Duration::from_secs(3));
 }
 
 #[test]
 fn network_finalize_deadline_marks_all_pages_before_draining() {
-    let (release, wait) = mpsc::channel();
-    let harness = Harness::new(move |method, _| {
-        if method == "Network.getResponseBody" {
-            let _ = wait.recv_timeout(Duration::from_secs(20));
-            Ok(json!({"base64body":"aGVsbG8=", "evicted":false}))
-        } else {
-            Ok(json!({}))
-        }
-    });
+    let harness = Harness::ignoring_response_bodies();
     harness
         .manager
         .with_instance("mock", |inst, _| {
@@ -1207,7 +1285,6 @@ fn network_finalize_deadline_marks_all_pages_before_draining() {
             std::thread::yield_now();
         }
         harness.manager.stop("mock").unwrap();
-        let _ = release.send(());
         let result = stopping.join().unwrap().unwrap();
         assert_eq!(result["skipped"][0]["reason"], "finalize deadline exceeded");
     });
@@ -1276,4 +1353,336 @@ fn failed_start_with_dialog_clears_previous_stop_result() {
             format!("invalid argument: {name} is not active for this page")
         );
     }
+}
+
+#[test]
+fn closed_page_stop_returns_finalized_record_and_replay_results() {
+    let harness = Harness::new(|_, _| Ok(json!({})));
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("cassette");
+    harness
+        .manager
+        .record_start("mock", "p", &dir, &[])
+        .unwrap();
+    harness.manager.record_stop("mock", "p").unwrap();
+    harness
+        .manager
+        .replay_start("mock", "p", &dir, false)
+        .unwrap();
+    harness.manager.close_tab("mock", "p").unwrap();
+    let recorded = harness.manager.record_stop("mock", "p").unwrap();
+    assert_eq!(recorded["exchanges"], 0);
+    assert_eq!(recorded["repeated"], true);
+    assert_eq!(recorded["page_closed"], true);
+    let replayed = harness.manager.replay_stop("mock", "p").unwrap();
+    assert_eq!(replayed["served"], 0);
+    assert_eq!(replayed["repeated"], true);
+    assert_eq!(replayed["page_closed"], true);
+    assert_eq!(
+        harness.manager.record_stop("mock", "never").unwrap_err(),
+        "page never not found"
+    );
+}
+
+#[test]
+fn popup_self_close_preserves_cassette_and_other_pages() {
+    let harness = Harness::ignoring_response_bodies();
+    harness.add_other_page();
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("cassette");
+    harness
+        .manager
+        .record_start("mock", "p", &dir, &[])
+        .unwrap();
+    harness.exchange("popup-response");
+    harness.wait_for("Network.getResponseBody", 1);
+    let entry = harness.manager.instances.lock().unwrap()["mock"]
+        .managed
+        .clone();
+    let state = entry.lock().unwrap().instance.as_ref().unwrap().pages["p"]
+        .network
+        .clone();
+    let operation = state.lock().unwrap();
+    // The page detaches itself while another network operation owns its lock.
+    harness.connection.dispose_session("page");
+    std::thread::scope(|scope| {
+        let cleanup = scope.spawn(|| {
+            harness
+                .manager
+                .with_instance("mock", |inst, _| Ok(inst.page_ids()))
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(entry) = entry.try_lock() {
+                if !entry.instance.as_ref().unwrap().pages.contains_key("p") {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "popup was not removed");
+            std::thread::yield_now();
+        }
+        // More than the injected budget must not close other pages while waiting.
+        std::thread::sleep(Duration::from_millis(400));
+        let closed_early = harness.closed.load(Ordering::SeqCst);
+        drop(operation);
+        assert_eq!(cleanup.join().unwrap().unwrap(), ["p2"]);
+        assert!(
+            !closed_early,
+            "popup cleanup closed the shared connection while waiting for its network lock"
+        );
+    });
+    harness.assert_other_page_works();
+    assert!(dir.join("index.json").is_file());
+    let result = harness.manager.record_stop("mock", "p").unwrap();
+    assert_eq!(result["page_closed"], true);
+    assert_eq!(result["repeated"], true);
+}
+
+#[test]
+fn cassette_failure_is_reported_by_close_tab_and_stop() {
+    for (action, failure) in ["close-tab", "stop"]
+        .into_iter()
+        .flat_map(|action| ["index", "body", "replay"].map(|failure| (action, failure)))
+    {
+        let harness = Harness::new(|method, _| {
+            Ok(if method == "Network.getResponseBody" {
+                json!({"base64body":"aGVsbG8=", "evicted":false})
+            } else {
+                json!({})
+            })
+        });
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("cassette");
+        harness
+            .manager
+            .record_start("mock", "p", &dir, &[])
+            .unwrap();
+        match failure {
+            "index" => {
+                // A directory at the destination makes the atomic rename fail.
+                std::fs::create_dir(dir.join("index.json")).unwrap();
+            }
+            "body" => {
+                std::fs::remove_dir(dir.join("bodies")).unwrap();
+                std::fs::write(dir.join("bodies"), b"not a directory").unwrap();
+                harness.exchange("good");
+                harness.wait_for("Network.getResponseBody", 1);
+            }
+            _ => {
+                harness.exchange("good");
+                harness.wait_for("Network.getResponseBody", 1);
+                harness.manager.record_stop("mock", "p").unwrap();
+                harness
+                    .manager
+                    .replay_start("mock", "p", &dir, false)
+                    .unwrap();
+                std::fs::write(
+                    dir.join("bodies")
+                        .join(crate::cli::cassette::sha256(b"hello")),
+                    b"wrong",
+                )
+                .unwrap();
+                harness.page_event("Network.requestWillBeSent", json!({"requestId":"changed", "method":"GET", "url":"https://example.com/good", "isIntercepted":true}));
+                harness.wait_for("Network.abortInterceptedRequest", 1);
+            }
+        }
+        let data = if action == "close-tab" {
+            harness.manager.close_tab_with_result("mock", "p").unwrap()
+        } else {
+            harness.manager.stop_with_result("mock").unwrap()
+        };
+        let errors = data["cassette_errors"]
+            .as_array()
+            .expect("cassette_errors missing");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["page_id"], "p");
+        assert_eq!(
+            errors[0]["mode"],
+            if failure == "replay" {
+                "replay"
+            } else {
+                "record"
+            }
+        );
+        let error = errors[0]["error"].as_str().unwrap();
+        assert!(error.starts_with("io error:"), "{error}");
+        let rendered = crate::cli::output::render(Some(&data));
+        assert_eq!(
+            rendered.stderr,
+            [format!("warning: cassette for p not published: {error}")]
+        );
+        if action == "close-tab" {
+            let stopped = if failure == "replay" {
+                harness.manager.replay_stop("mock", "p")
+            } else {
+                harness.manager.record_stop("mock", "p")
+            };
+            assert_eq!(stopped.unwrap_err(), error);
+        }
+    }
+}
+
+#[test]
+fn closed_page_results_keep_only_the_last_64_pages() {
+    let harness = Harness::new(|_, _| Ok(json!({})));
+    let parent = tempfile::tempdir().unwrap();
+    for i in 0..66 {
+        let id = format!("closed{i}");
+        harness
+            .manager
+            .with_instance("mock", |inst, _| {
+                inst.pages.insert(
+                    id.clone(),
+                    ManagedMainFrame {
+                        main_frame: inst.pages["p"].main_frame.clone(),
+                        network: Default::default(),
+                        headers: Vec::new(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        harness
+            .manager
+            .record_start("mock", &id, &parent.path().join(&id), &[])
+            .unwrap();
+        harness.manager.close_tab("mock", &id).unwrap();
+    }
+    for i in 0..2 {
+        assert_eq!(
+            harness
+                .manager
+                .record_stop("mock", &format!("closed{i}"))
+                .unwrap_err(),
+            format!("page closed{i} was closed")
+        );
+    }
+    for i in 2..66 {
+        let result = harness
+            .manager
+            .record_stop("mock", &format!("closed{i}"))
+            .unwrap();
+        assert_eq!(result["repeated"], true);
+        assert_eq!(result["page_closed"], true);
+    }
+}
+
+#[test]
+fn page_finalize_budget_starts_after_the_network_lock_is_acquired() {
+    let harness = Harness::ignoring_response_bodies();
+    harness.add_other_page();
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("cassette");
+    harness
+        .manager
+        .record_start("mock", "p", &dir, &[])
+        .unwrap();
+    harness.exchange("blocked");
+    harness.wait_for("Network.getResponseBody", 1);
+    let state = harness
+        .manager
+        .with_instance("mock", |inst, _| Ok(inst.pages["p"].network.clone()))
+        .unwrap();
+    let operation = state.lock().unwrap();
+    let owners = Arc::strong_count(&state);
+    std::thread::scope(|scope| {
+        let (done, finished) = mpsc::channel();
+        let manager = &harness.manager;
+        let cleanup = scope.spawn(move || {
+            let result = manager.close_tab("mock", "p");
+            done.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&state) == owners {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        let closed_early = harness.closed.load(Ordering::SeqCst);
+        let started = Instant::now();
+        drop(operation);
+        let result = finished.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            let _ = harness.connection.close();
+        }
+        cleanup.join().unwrap();
+        assert!(
+            !closed_early,
+            "waiting for the network lock closed the connection"
+        );
+        result.expect("cleanup exceeded its budget").unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "lock wait consumed the finalize budget"
+        );
+    });
+    harness.assert_other_page_works();
+    assert!(dir.join("index.json").is_file());
+}
+
+#[test]
+fn page_replay_finalize_deadline_bounds_protocol_reads() {
+    let harness = Harness::build(
+        |_, _| Ok(json!({})),
+        Some("Network.abortInterceptedRequest"),
+    );
+    harness.add_other_page();
+    let dir = empty_cassette();
+    harness
+        .manager
+        .replay_start("mock", "p", dir.path(), false)
+        .unwrap();
+    harness.page_event("Network.requestWillBeSent", json!({"requestId":"miss", "url":"https://example.com/miss", "method":"GET", "isIntercepted":true}));
+    harness.wait_for("Network.abortInterceptedRequest", 1);
+    std::thread::scope(|scope| {
+        let (done, finished) = mpsc::channel();
+        let manager = &harness.manager;
+        let cleanup = scope.spawn(move || done.send(manager.close_tab("mock", "p")).unwrap());
+        let result = finished.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            let _ = harness.connection.close();
+        }
+        cleanup.join().unwrap();
+        result.expect("replay cleanup exceeded its budget").unwrap();
+    });
+    harness.assert_other_page_works();
+    let result = harness.manager.replay_stop("mock", "p").unwrap();
+    assert_eq!(result["page_closed"], true);
+}
+
+#[test]
+fn closing_pages_without_sessions_evicts_old_stop_results() {
+    let harness = Harness::new(|_, _| Ok(json!({})));
+    let parent = tempfile::tempdir().unwrap();
+    harness
+        .manager
+        .record_start("mock", "p", &parent.path().join("cassette"), &[])
+        .unwrap();
+    let frame = harness
+        .manager
+        .with_instance("mock", |inst, _| Ok(inst.pages["p"].main_frame.clone()))
+        .unwrap();
+    harness.manager.close_tab("mock", "p").unwrap();
+    for i in 0..64 {
+        let id = format!("empty{i}");
+        harness
+            .manager
+            .with_instance("mock", |inst, _| {
+                inst.pages.insert(
+                    id.clone(),
+                    ManagedMainFrame {
+                        main_frame: frame.clone(),
+                        network: Default::default(),
+                        headers: Vec::new(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        harness.manager.close_tab("mock", &id).unwrap();
+    }
+    assert_eq!(
+        harness.manager.record_stop("mock", "p").unwrap_err(),
+        "page p was closed"
+    );
 }

@@ -353,7 +353,7 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
             let accept = match action.as_str() { "accept" => true, "dismiss" => false, _ => return DaemonResponse::err("dialog action must be accept or dismiss") };
             respond(mgr.dialog(&instance_id, &page_id, accept, text.as_deref()).map(|dialog| json!({"dialog_action": action, "dialog": dialog})))
         },
-        DaemonRequest::Stop { instance_id } => respond(mgr.stop(&instance_id)),
+        DaemonRequest::Stop { instance_id } => respond(mgr.stop_with_result(&instance_id)),
         DaemonRequest::NewPage { instance_id } => respond(mgr.new_page(&instance_id).map(|page_id| json!({"page_id": page_id}))),
         DaemonRequest::Navigate { instance_id, page_id, url, wait_until, .. } => respond(mgr.navigate(&instance_id, &page_id, &url, timeout, wait_until.as_deref()).map(|o| json!({"navigation_id": o.nav_id, "status_code": o.status_code}))),
         DaemonRequest::Evaluate { instance_id, page_id, expression, main_world, frames, .. } => {
@@ -413,7 +413,7 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
         DaemonRequest::Select { instance_id, page_id, selector, value, frames, .. } => respond(mgr.select_option(&instance_id, &page_id, &selector, &value, &frames, timeout).map(|r| json!({"selected": true, "selector": selector, "option_value": r.get("value"), "option_text": r.get("text")}))),
         DaemonRequest::Scroll { instance_id, page_id, selector, .. } => respond(mgr.scroll(&instance_id, &page_id, selector.as_deref(), timeout)),
         DaemonRequest::Tabs { instance_id, .. } => respond(mgr.tabs(&instance_id, timeout).map(|tabs| json!({"tabs": tabs}))),
-        DaemonRequest::CloseTab { instance_id, page_id } => respond(mgr.close_tab(&instance_id, &page_id).map(|()| json!({"closed_page": page_id}))),
+        DaemonRequest::CloseTab { instance_id, page_id } => respond(mgr.close_tab_with_result(&instance_id, &page_id)),
         DaemonRequest::Downloads {
             instance_id,
             wait_secs,

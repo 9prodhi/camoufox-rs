@@ -78,7 +78,7 @@ wrappers. Specific causes take precedence: a navigation timeout has kind
 `timeout`. Unrecognized errors, including arbitrary page script exceptions,
 use `other`.
 
-Commands that return a void result (such as `stop` and `shutdown`) return `{"ok": true}` with no `data` field. For commands that produce output data, the "JSON output shape" blocks documented below represent the inner payload of this `data` field.
+Commands that return a void result (such as `shutdown`, and `stop` without cassette errors) return `{"ok": true}` with no `data` field. For commands that produce output data, the "JSON output shape" blocks documented below represent the inner payload of this `data` field.
 
 ---
 
@@ -243,7 +243,9 @@ Usage: camoufox stop [OPTIONS] <INSTANCE_ID>
 - `--socket <SOCKET>`: Path to the daemon Unix socket.
 - `--json`: Output as JSON.
 
-Text mode prints `ok`. On success, `--json` returns `{"ok": true}` with no inner data payload.
+Text mode prints `ok`. On success, `--json` returns `{"ok": true}` with no inner data payload unless cassette finalization fails. In that case, success data includes `"cassette_errors":[{"page_id":"p1","mode":"record","error":"io error: ..."}]`; mode is `record` or `replay`. Plain mode prints one stderr line per entry: `warning: cassette for <page> not published: <error>`. These cassette errors do not change the successful exit code (0).
+
+Stop gives all page network workers a shared 15-second finalization budget. At the deadline it may close the browser connection to interrupt outstanding operations, skips unfinished recording exchanges with reason `finalize deadline exceeded`, and still publishes the index if cassette writes succeed.
 
 ### `new-page`
 
@@ -389,6 +391,8 @@ Usage: camoufox shutdown [OPTIONS]
 - `--json`: Output as JSON.
 
 Text mode prints `ok`. On success, `--json` returns `{"ok": true}` with no inner data payload. The socket file is removed; the `<socket>.lock` file is intentionally kept to prevent daemon startup race conditions.
+
+Shutdown uses the same shared 15-second cassette finalization budget as instance stop and may close each instance's browser connection at the deadline. Unfinished recording exchanges are skipped with reason `finalize deadline exceeded`; the index is still published if writes succeed. Finalization failures are logged by the daemon because shutdown has no cassette-result response channel.
 
 ### `ping`
 
@@ -961,6 +965,12 @@ JSON output shape:
 }
 ```
 
+An active recording or replay is finalized before the tab is closed. The tab gets a 15-second budget starting after its network-operation lock is acquired. At the deadline, that tab's unfinished recording exchanges are skipped with reason `finalize deadline exceeded`, and its index is still published if writes succeed. This cleanup never closes the shared browser connection: other tabs and their recordings remain usable. The same rules apply when a popup closes itself.
+
+If cassette finalization fails, success data also includes `"cassette_errors":[{"page_id":"p1","mode":"record","error":"io error: ..."}]` (`mode` is `record` or `replay`). The tab still closes and exit code stays 0. Plain mode prints one stderr warning per entry: `warning: cassette for <page> not published: <error>`. Self-closing popup failures are logged by the daemon.
+
+After a tab closes, `record stop` or `replay stop` can retrieve its retained result with `"repeated":true` and `"page_closed":true`. The instance retains results for at most the last 64 closed pages; retained finalization errors are returned as errors again.
+
 ### `downloads`
 
 View or wait for downloads on an instance.
@@ -1032,10 +1042,20 @@ Plain stop output is `recorded N exchanges, B bodies: DIR`. Each omitted
 exchange adds a stderr line `skipped: METHOD URL (reason)`. Repeating stop
 returns the last result with `"repeated":true` and prints
 `note: recording was already stopped` on stderr. A failed start clears the
-previous stop result. Instance stop, shutdown, and close-tab allow a total of
-15 seconds to finalize recordings before closing the connection; remaining
-body reads are skipped with reason `finalize deadline exceeded`, and the index
-is still published.
+previous stop result. After a page closes, its retained result adds both
+`"repeated":true` and `"page_closed":true`; the instance keeps results for at most
+the last 64 closed pages. A never-seen page ID still returns `page <id> not found`.
+
+Close-tab and self-closing popups get a 15-second budget after acquiring that
+page's network-operation lock. At the deadline, that page's unfinished exchanges
+are skipped with reason `finalize deadline exceeded`, and its index is still
+published if writes succeed. Other tabs and recordings are unaffected. Instance
+stop and daemon shutdown instead share one 15-second budget across all pages and
+may close the browser connection at the deadline because the instance is exiting.
+Close-tab and stop report finalization failures in success data as
+`"cassette_errors":[{"page_id":"p1","mode":"record","error":"io error: ..."}]`.
+Plain mode prints `warning: cassette for <page> not published: <error>` for each
+entry and still exits 0. Popup cleanup and daemon shutdown log failures.
 
 ### `replay`
 
@@ -1089,7 +1109,19 @@ Plain stop output is `replayed N requests, M misses`, where M is
 omits misses, stderr adds `... and N more not listed`. Repeating stop returns
 the last result with `"repeated":true` and prints
 `note: replay was already stopped` on stderr. A failed start clears the
-previous stop result.
+previous stop result. A retained result for a closed page adds `"repeated":true`
+and `"page_closed":true`; results are kept for at most the last 64 closed pages
+per instance. A never-seen page ID still returns `page <id> not found`. Retained
+finalization errors are returned as errors again.
+
+Close-tab and popup cleanup bound protocol waits to that page's 15-second
+finalization budget, starting after its network-operation lock is acquired;
+other tabs keep their shared browser connection. Instance stop and daemon
+shutdown share a 15-second budget across pages and may close that connection at
+the deadline. Close-tab and stop include finalization failures in success data
+as `"cassette_errors":[{"page_id":"p1","mode":"replay","error":"io error: ..."}]`
+and plain mode prints `warning: cassette for <page> not published: <error>` per
+entry without changing exit code 0. Popup cleanup and shutdown log failures.
 
 Start returns `{"replaying":true,"dir":"/absolute/cassette"}`. Stop returns:
 
@@ -1103,8 +1135,8 @@ has already finished that mode returns its last result with `"repeated":true`;
 a stop on a page that has never run that mode returns `invalid argument: ...`.
 Both stop commands work while a JavaScript dialog is open and allow up to 300
 seconds for draining responses. Closing a page, stopping its instance, or shutting
-down the daemon finalizes an active recording before disconnecting the browser,
-provided cassette writes succeed. Abruptly killing the daemon cannot finalize it.
+down the daemon finalizes an active recording, provided cassette writes succeed.
+Page cleanup preserves other tabs; stop and shutdown then disconnect the browser. Abruptly killing the daemon cannot finalize it.
 
 Record and replay each apply to one page, including that page's subframes.
 Popups opened from it are not recorded or replayed. Requests handled by a service

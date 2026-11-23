@@ -317,6 +317,9 @@ fn cassette_url_filter_and_active_page_cleanup() {
         .replay_start(&instance, &page, dir.path(), false)
         .unwrap();
     manager.close_tab(&instance, &page).unwrap();
+    let replayed = manager.replay_stop(&instance, &page).unwrap();
+    assert_eq!(replayed["repeated"], true);
+    assert_eq!(replayed["page_closed"], true);
     let page = manager.new_page(&instance).unwrap();
     let active = private_dir();
     manager
@@ -324,6 +327,9 @@ fn cassette_url_filter_and_active_page_cleanup() {
         .unwrap();
     manager.close_tab(&instance, &page).unwrap();
     assert!(active.path().join("index.json").is_file());
+    let recorded = manager.record_stop(&instance, &page).unwrap();
+    assert_eq!(recorded["repeated"], true);
+    assert_eq!(recorded["page_closed"], true);
     let page = manager.new_page(&instance).unwrap();
     let recording = private_dir();
     manager
@@ -1158,4 +1164,173 @@ fn cassette_replay_suppresses_persistent_response_headers() {
         before + 1
     );
     manager.stop(&instance).unwrap();
+}
+
+#[test]
+#[ignore]
+fn cassette_popup_self_close_publishes_results_and_preserves_other_recording() {
+    let fixture = Fixture::start();
+    let (manager, instance, opener) = launch();
+    let opener_dir = private_dir();
+    manager
+        .record_start(&instance, &opener, opener_dir.path(), &[])
+        .unwrap();
+    manager
+        .navigate(
+            &instance,
+            &opener,
+            &format!("{}/", fixture.origin),
+            TIMEOUT,
+            Some("load"),
+        )
+        .unwrap();
+    rendered(&manager, &instance, &opener);
+    eval(&manager, &instance, &opener, "(() => { const b = document.createElement('button'); b.id = 'popup'; b.textContent = 'open'; b.onclick = () => { window.cassettePopup = window.open('/frame'); }; document.body.append(b); })()");
+    manager
+        .click_selector(&instance, &opener, "#popup", &[], TIMEOUT)
+        .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let popup = loop {
+        let tabs = manager.tabs(&instance, TIMEOUT).unwrap();
+        if let Some(tab) = tabs.iter().find(|t| t["opener"] == opener) {
+            break tab["page_id"].as_str().unwrap().to_owned();
+        }
+        assert!(Instant::now() < deadline, "popup was not adopted");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Navigate explicitly so recording starts from a known, ready page.
+    manager
+        .navigate(
+            &instance,
+            &popup,
+            &format!("{}/frame", fixture.origin),
+            TIMEOUT,
+            Some("load"),
+        )
+        .unwrap();
+    let popup_dir = private_dir();
+    manager
+        .record_start(&instance, &popup, popup_dir.path(), &[])
+        .unwrap();
+    assert_eq!(
+        eval(
+            &manager,
+            &instance,
+            &popup,
+            "fetch('/data').then(r => r.text())"
+        ),
+        "{\"value\":\"fetch result\"}"
+    );
+    eval(
+        &manager,
+        &instance,
+        &popup,
+        "setTimeout(() => window.close(), 100); true",
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if manager
+            .tabs(&instance, TIMEOUT)
+            .unwrap()
+            .iter()
+            .all(|t| t["page_id"] != popup)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "popup did not close");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let result = manager.record_stop(&instance, &popup).unwrap();
+    assert_eq!(result["page_closed"], true);
+    assert_eq!(result["repeated"], true);
+    assert!(
+        result["exchanges"].as_u64().unwrap() + result["skipped"].as_array().unwrap().len() as u64
+            >= 1,
+        "{result}"
+    );
+    let index: Value =
+        serde_json::from_slice(&std::fs::read(popup_dir.path().join("index.json")).unwrap())
+            .unwrap();
+    assert_eq!(index["format"], "camoufox-cassette");
+    assert_eq!(eval(&manager, &instance, &opener, "6 * 7"), 42);
+    assert!(
+        manager.record_stop(&instance, &opener).unwrap()["exchanges"]
+            .as_u64()
+            .unwrap()
+            >= 11
+    );
+    manager.stop(&instance).unwrap();
+}
+
+#[test]
+#[ignore]
+fn cassette_cli_cleanup_reports_publication_errors_and_exits_successfully() {
+    let daemon = CliDaemon::new();
+    for action in ["close-tab", "stop"] {
+        for json_mode in [true, false] {
+            let launched = daemon.run(&["launch"], true);
+            let instance = launched["data"]["instance_id"].as_str().unwrap();
+            let created = daemon.run(&["new-page", instance], true);
+            let page = created["data"]["page_id"].as_str().unwrap();
+            let dir = private_dir();
+            daemon.run(
+                &[
+                    "record",
+                    "start",
+                    instance,
+                    page,
+                    "--dir",
+                    dir.path().to_str().unwrap(),
+                ],
+                true,
+            );
+            std::fs::create_dir(dir.path().join("index.json")).unwrap();
+            let args = if action == "close-tab" {
+                vec![action, instance, page]
+            } else {
+                vec![action, instance]
+            };
+            if json_mode {
+                let response = daemon.run(&args, true);
+                let errors = response["data"]["cassette_errors"]
+                    .as_array()
+                    .expect("missing cassette_errors");
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0]["page_id"], page);
+                assert_eq!(errors[0]["mode"], "record");
+                assert!(errors[0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("io error:"));
+            } else {
+                let output = std::process::Command::new(env!("CARGO_BIN_EXE_camoufox"))
+                    .args(["--socket", &daemon.socket])
+                    .args(&args)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                let lines: Vec<_> = stderr.lines().collect();
+                assert_eq!(lines.len(), 1, "{stderr}");
+                assert!(
+                    lines[0].starts_with(&format!(
+                        "warning: cassette for {page} not published: io error:"
+                    )),
+                    "{stderr}"
+                );
+            }
+            if action == "close-tab" {
+                let stopped = daemon.run(&["record", "stop", instance, page], false);
+                assert_eq!(stopped["kind"], "io");
+                // A later successful close must omit the error field entirely.
+                let created = daemon.run(&["new-page", instance], true);
+                let page = created["data"]["page_id"].as_str().unwrap();
+                assert_eq!(
+                    daemon.run(&["close-tab", instance, page], true)["data"],
+                    json!({"closed_page":page})
+                );
+                daemon.run(&["stop", instance], true);
+            }
+        }
+    }
 }

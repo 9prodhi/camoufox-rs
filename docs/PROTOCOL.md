@@ -1,4 +1,4 @@
-# Juggler Protocol — Complete Specification (v2, Audit-Corrected)
+# Juggler Protocol: Complete Specification (v2, Audit-Corrected)
 
 > Exhaustive protocol reference extracted from Playwright's Firefox patches
 > (`browser_patches/firefox/juggler/`) and Camoufox additions.
@@ -43,7 +43,7 @@ length-prefixed.
 
 ### Message Types
 
-**Request — Root Session (Client → Browser):**
+**Request: Root Session (Client → Browser):**
 ```json
 {
   "id": 1,
@@ -56,7 +56,7 @@ length-prefixed.
 > The field is absent, not `""`. Including extra fields may be rejected by server-side
 > validation (extra properties are rejected).
 
-**Request — Page Session (Client → Browser):**
+**Request: Page Session (Client → Browser):**
 ```json
 {
   "id": 2,
@@ -104,11 +104,11 @@ length-prefixed.
 
 **Implementation note**: Playwright uses a truthy check (`if (object.id)`) not a presence
 check. Since valid IDs are positive integers, this is equivalent. However, `id: 0` would
-be treated as an event — never use 0 as an ID.
+be treated as an event: never use 0 as an ID.
 
 ### Special Constants
 
-- `kBrowserCloseMessageId = -9999` — Reserved ID for `Browser.close` graceful shutdown.
+- `kBrowserCloseMessageId = -9999`: Reserved ID for `Browser.close` graceful shutdown.
   When a response with `id === -9999` arrives, the client silently discards it.
   `Browser.close` is sent directly via the transport (bypassing session's `send()`)
   with this special ID.
@@ -160,7 +160,7 @@ Exact default args from Playwright:
 //  stdin   stdout  stderr   fd3     fd4
 ```
 
-Parent accesses: `stdio[3]` (writable — commands out), `stdio[4]` (readable — responses in).
+Parent accesses: `stdio[3]` (writable: commands out), `stdio[4]` (readable: responses in).
 
 ### Startup Detection
 
@@ -345,10 +345,10 @@ is never consumed.
 
 ### Critical Validation Rules
 
-1. **Extra properties are rejected** — `"has unknown keys: extraField"` error
-2. **Missing optional fields** — `t.Optional` fields can be omitted entirely
-3. **Null vs undefined** — `t.Nullable` accepts JSON `null`. `t.Optional` accepts absence. Distinct.
-4. **Both params and results validated** — Server validates its own output too
+1. **Extra properties are rejected**: `"has unknown keys: extraField"` error
+2. **Missing optional fields**: `t.Optional` fields can be omitted entirely
+3. **Null vs undefined**: `t.Nullable` accepts JSON `null`. `t.Optional` accepts absence. Distinct.
+4. **Both params and results validated**: Server validates its own output too
 
 ### Rust Implication
 
@@ -365,7 +365,7 @@ is never consumed.
 ### Methods
 
 #### `Browser.enable`
-Enables the browser agent. **Idempotent** — calling twice is a no-op.
+Enables the browser protocol. **Idempotent**; calling twice is a no-op.
 Must be called before `createBrowserContext`/`removeBrowserContext`.
 
 ```
@@ -381,6 +381,13 @@ returns: (none)
 
 `attachToDefaultContext: true` → receive `attachedToTarget` events for pages in the
 default (non-isolated) browser context. `false` → only explicitly created context pages.
+
+In Rust, set `BrowserOptions::attach_to_default_context: true` and use
+`Browser::default_context(ContextOptions)` for the on-disk profile. Its
+`context_id()` is empty, but optional `browserContextId` fields are omitted on
+the wire rather than sent as `""` or `null`. `BrowserContext::close` only drops
+this handle; `Browser::close` flushes storage and closes its pages. The CLI's
+`launch --profile-dir` configures this persistent context automatically.
 
 Playwright always sends `userPrefs` (as empty array if no prefs).
 
@@ -679,7 +686,7 @@ returns: (none)
 
 **Note**: Playwright sends `quality: 90`. Width/height must be between 10 and 10000.
 The Camoufox/server-side Protocol.js may define this as `setVideoRecordingOptions` with
-a `dir` field — but the wire method name Playwright actually sends is `setScreencastOptions`
+a `dir` field, but the wire method name Playwright actually sends is `setScreencastOptions`
 with `quality` instead of `dir`. Verify against your Camoufox build.
 
 #### `Browser.setInitScripts`
@@ -1039,6 +1046,13 @@ params: {
 }
 returns: (none)
 ```
+
+Sets the file list and dispatches `input` and `change`. The Rust wrappers are
+`MainFrame::set_file_input_files(frame_id, object_id, files)` (60-second timeout)
+and `set_file_input_files_with_timeout(frame_id, object_id, files, timeout)`.
+They take a file-input remote object ID. CLI `upload` adds CSS/frame/open-shadow
+resolution and path validation, supports hidden inputs, replaces the selection,
+and rejects directory-picker inputs. See [upload](reference-cli.md#upload).
 
 #### `Page.adoptNode`
 ```
@@ -1772,8 +1786,10 @@ with newline.
 
 4. Create browser context:
    Browser.createBrowserContext({ removeOnDetach: true })
+   For the persistent default context, skip creation and omit browserContextId
+   from context options and page/cookie commands.
 
-5. Initialize context — ALL IN PARALLEL:
+5. Initialize context: ALL IN PARALLEL:
    ├── Browser.setDefaultViewport(...)
    ├── Browser.setDownloadOptions(...)       // if acceptDownloads != default
    ├── Browser.setTouchOverride(...)         // if hasTouch
@@ -1797,7 +1813,8 @@ with newline.
    Await all.
 
 6. Create page:
-   Browser.newPage({ browserContextId })
+   Browser.newPage({ browserContextId })     // private context
+   Browser.newPage({})                       // persistent default context
    Wait for Browser.attachedToTarget event → get sessionId
 ```
 
@@ -1861,8 +1878,8 @@ browser-idle-startup  → resolve browserStartupFinishedPromise
 7. **Unknown response IDs**: Silently ignored (no matching callback)
 
 ### Protocol Validation
-8. **Extra properties in params**: Rejected — `"has unknown keys: extraField"`
-9. **Missing required fields**: Rejected — validation error
+8. **Extra properties in params**: Rejected: `"has unknown keys: extraField"`
+9. **Missing required fields**: Rejected: validation error
 10. **Both params and results validated**: Server validates its own output
 11. **Root session must NOT send sessionId**: Extra field may be rejected
 
@@ -1910,7 +1927,7 @@ Chunk size: 2047 chars (Windows), 32767 chars (Unix). C++ `MaskConfig` reads at 
 
 ### Additional Browser Context Settings
 
-- `Browser.setPlatformOverride` — per-context `navigator.platform`
+- `Browser.setPlatformOverride`: per-context `navigator.platform`
 - Runtime fingerprint spoofing via `MaskConfig`
 - `humanize: true` launch option for anti-detection behavior
 

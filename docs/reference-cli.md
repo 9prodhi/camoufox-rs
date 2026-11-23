@@ -20,7 +20,9 @@ The following flags are available across all subcommands:
 
 ### JSON Response Envelope
 
-When `--json` is supplied, every command outputs a top-level `DaemonResponse` JSON envelope:
+With `--json`, built-in client commands output a top-level `DaemonResponse` JSON
+envelope. Clap parsing errors still use text diagnostics and exit 2; `serve` runs
+the daemon, and external subcommands control their own output and exit status.
 
 ```json
 {
@@ -42,6 +44,8 @@ On daemon or execution errors, the envelope returns:
 and the process exits with code `1`. Client-side argument validation errors exit with code `2` and kind
 `invalid_argument`, regardless of the message text. Local I/O failures, including
 failures resolving upload or screenshot paths, exit with code `1` and kind `io`.
+Daemon-side validation errors exit `1`, including kind `invalid_argument`.
+Successful commands exit `0`; external subcommands forward the executable's status.
 
 Every daemon error includes a stable, machine-readable `kind` after `error`,
 with no `data` field. Branch on `kind` instead of parsing the human-readable
@@ -1190,6 +1194,10 @@ If found, `camoufox` executes the binary with the remaining arguments, inheritin
 
 - `CAMOUFOX_SOCKET`: The absolute daemon socket path (respecting global `--socket` and its environment default). Relative socket paths resolve against the client's working directory; filesystem path bytes are preserved.
 - `CAMOUFOX_JSON=1`: Set when the global `--json` flag is given. Place global options before the external subcommand name; arguments after the name pass through to the executable.
+
+Without global `--json`, `CAMOUFOX_JSON` is removed from the executable's
+environment, even if it was set in the parent shell. Output is forwarded without
+adding a `DaemonResponse` envelope.
 
 The exit code mirrors the child process exit code (or `128 + signal` if terminated by a signal on Unix).
 

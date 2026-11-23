@@ -7,7 +7,7 @@ This crate implements the full stack needed to automate a Camoufox browser proce
 ## Current Scope
 
 - Library crate with a synchronous API for Juggler domains (`Browser`, `MainFrame`, `Network`, `Runtime`, `Heap`)
-- Optional CLI (`--features cli`) with a Unix socket daemon for multi-instance management, persistent profiles (`launch --profile-dir`), external subcommand plugins (`camoufox-<name>` on `PATH`), and structured error `kind` classifications
+- Optional CLI (`--features cli`) with a Unix socket daemon for multi-instance management, file uploads, persistent profiles (`launch --profile-dir`), external subcommand plugins (`camoufox-<name>` on `PATH`), and structured error `kind` classifications
 - Page HTTP cassette recording and deterministic offline replay with `record start/stop` and `replay start/stop`
 - Unix implementation (process + fd pipe model): Linux and macOS. Windows is not supported.
 ## Documentation
@@ -71,8 +71,9 @@ Built-in commands: `serve`, `launch`, `dialog`, `list`, `stop`, `new-page`, `nav
 `replay`.
 
 External subcommands: executing `camoufox <name>` for any command not built-in searches for
-`camoufox-<name>` on `PATH`, passing through all arguments and setting `CAMOUFOX_SOCKET` (and
-`CAMOUFOX_JSON=1` when `--json` is supplied).
+`camoufox-<name>` in absolute `PATH` entries. Arguments, standard streams, and exit status
+pass through. Put global flags before `<name>`; `CAMOUFOX_SOCKET` receives the absolute
+socket path, and `CAMOUFOX_JSON` is set to `1` with `--json` or cleared otherwise.
 
 Start daemon (run in a dedicated shell):
 
@@ -91,7 +92,8 @@ For persistent browsing data, add `--profile-dir /absolute/path/to/profile` to
 `launch`. The directory must be empty or contain `prefs.js` or `times.json`.
 It is created with mode 0700 or has group/other permissions removed,
 canonicalized, and kept after stop. The daemon confirms the canonical path in
-launch success data; restart older daemons that
+launch success data and shows it in `list`. Concurrent launches using the same
+canonical profile are refused. Restart older daemons that
 cannot confirm persistent profile support. The client stops the instance returned
 by an older daemon before reporting the compatibility error; if cleanup fails,
 the error includes the instance ID so you can stop it manually.
@@ -201,7 +203,7 @@ cargo run --features cli --bin camoufox -- wait <instance_id> <page_id> \
 Interact with the page (`click`, `hover`, `press`, `type`, and the typing phase of `fill` dispatch trusted browser-level input events; `select`, `scroll`, and `fill`'s clear step use JavaScript):
 
 ```bash
-# Click by CSS selector — resolves the element, scrolls it into view, clicks its centre:
+# Click by CSS selector: resolves the element, scrolls it into view, clicks its centre:
 cargo run --features cli --bin camoufox -- click <instance_id> <page_id> '#submit'
 
 # Or dispatch a trusted left-click at raw viewport coordinates (x, y). Because the event
@@ -219,6 +221,10 @@ cargo run --features cli --bin camoufox -- upload <instance_id> <page_id> 'input
 # Also available: type <text>, hover <selector>, select <selector> <value>, scroll [selector]
 ```
 
+Upload replaces the current selection with one or more regular files. Relative
+paths resolve against the client's working directory and are validated before
+page access. Multiple files require the input's `multiple` attribute. Plain output
+lists basenames; JSON returns `uploaded`, `selector`, and `files`.
 Upload rejects directory-picker (`webkitdirectory`) inputs with kind
 `invalid_argument`. If an `input` or `change` handler opens a JavaScript dialog,
 successful JSON upload data may include `"dialog": {...}`; resolve it with
@@ -257,7 +263,7 @@ they fail with `--frame <sel>: nothing is focused inside the frame; click or fil
 an element inside it first`.
 
 There is no remembered focus target and no focus-listener or blur-hook
-instrumentation. After interacting with the top-level page, an agent must
+instrumentation. After interacting with the top-level page,
 **click or fill inside the iframe again** before using `type --frame` or
 `press --frame`. Give the **full** `--frame` chain down to the frame that holds
 the field (for a field in a nested iframe, pass both the outer and the inner
@@ -295,7 +301,7 @@ cargo run --features cli --bin camoufox -- tabs <instance_id>
 cargo run --features cli --bin camoufox -- close-tab <instance_id> <page_id>
 ```
 
-Tabs and popups opened by the site (e.g. via `<a target="_blank">` or `window.open()`) are automatically tracked and appear in `tabs` on subsequent commands, complete with an `"opener"` field pointing to the parent page. When a page closes itself (via `window.close()`) or is closed, it is cleanly removed from `tabs`, and any subsequent command targeting it reports that the page was closed.
+Tabs and popups opened by the site (e.g. via `<a target="_blank">` or `window.open()`) are automatically tracked and appear in `tabs` on subsequent commands, complete with an `"opener"` field pointing to the parent page. Closed pages are removed from `tabs`, and most commands targeting them report that the page was closed. `record stop` and `replay stop` can retrieve retained results with `repeated: true` and `page_closed: true` for up to the last 64 closed pages per instance; retained failures remain errors.
 
 Manage downloads:
 
@@ -321,7 +327,33 @@ cargo run --features cli --bin camoufox -- stop <instance_id>
 cargo run --features cli --bin camoufox -- shutdown
 ```
 
-JSON output mode is available for all commands (`--json`). On failure, JSON error responses include a `kind` field identifying the error category (e.g. `selector_not_found`, `timeout`, `dialog_open`, `invalid_argument`, `page_not_found`, `instance_not_found`, `io`, `daemon`, etc.):
+### Network cassettes
+
+Record before navigating, then stop to publish the cassette:
+
+```bash
+camoufox record start <instance_id> <page_id> --dir /absolute/cassette
+camoufox navigate <instance_id> <page_id> https://example.com --wait-until load
+camoufox record stop <instance_id> <page_id>
+camoufox replay start <instance_id> <page_id> --dir /absolute/cassette
+camoufox navigate <instance_id> <page_id> https://example.com --wait-until load
+camoufox replay stop <instance_id> <page_id>
+```
+
+Recording requires an absent or empty absolute directory with owner-only access.
+Repeat `--url <regex>` on `record start` to filter URLs. Replay matches method and
+exact URL, optionally request-body hashes with `--match-body`; misses are aborted
+and reported at stop. Repeated matches consume responses in order, then reuse the
+last response. Replay rejects redirect cassettes. Only one recording or replay
+can run per page, including its subframes; popups need separate sessions and
+service-worker responses are outside replay interception.
+
+Cassettes store `index.json` and decoded bodies under `bodies/<sha256>`.
+Credential headers are scrubbed, but URLs and bodies may contain secrets. Use
+trusted cassettes because replayed HTML and scripts use the origin's real storage.
+See [record and replay](docs/reference-cli.md#record) for format and cleanup details.
+
+Built-in client commands support JSON output (`--json`). On failure, JSON error responses include a `kind` field identifying the error category (e.g. `selector_not_found`, `timeout`, `dialog_open`, `invalid_argument`, `page_not_found`, `instance_not_found`, `io`, `daemon`, etc.):
 
 ```bash
 cargo run --features cli --bin camoufox -- --json list
@@ -329,6 +361,11 @@ cargo run --features cli --bin camoufox -- --json list
 
 Client-side argument validation exits 2 with kind `invalid_argument`; local I/O
 failures, such as resolving an upload or screenshot path, exit 1 with kind `io`.
+Other execution and daemon errors exit 1; success exits 0. Argument parsing
+errors use clap's text diagnostics and exit 2, even with `--json`. Success responses
+omit `kind`; the client backfills missing kinds from older daemon messages and
+preserves unknown kinds, which consumers should treat as `other`. External
+subcommands control their own output and exit status.
 
 Socket resolution:
 
@@ -353,8 +390,9 @@ Daemon security and lifecycle:
 - Screenshots without `-o` are written to the runtime directory as
   `screenshot-<instance>-<page>.<ext>` with mode `0600`. A relative `-o` path is resolved
   against the client's working directory.
-- Requests for different instances run in parallel. Requests to the same instance are
-  serialized. `launch` holds no lock while the browser starts.
+- Requests for different instances run in parallel. Most commands on the same instance
+  are serialized; download waits and cassette validation, disk I/O, and draining run
+  outside the instance lock. `launch` holds no lock while the browser starts.
 
 ## JavaScript dialogs
 
@@ -412,7 +450,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Pages via `MainFrame`
 
-`BrowserContext::new_main_frame()` returns a fully wired `MainFrame` — a page
+For persistent storage, connect with `BrowserOptions::attach_to_default_context`
+set to `true`, then call `browser.default_context(ContextOptions::default())`
+instead of `new_context`. The default context uses the on-disk `LaunchConfig::profile_dir`
+and has an empty context ID. Its `close()` only drops the handle; call
+`Browser::close()` to close pages and flush storage. Keep the profile directory
+between launches. The CLI's `launch --profile-dir` handles this setup automatically.
+
+`BrowserContext::new_main_frame()` returns a fully wired `MainFrame`: a page
 handle that is **structurally pinned to the top frame**. The call blocks until
 the page target, top frame, and main-world execution context are all resolved
 from authoritative protocol responses, so there is no manual session or
@@ -420,13 +465,13 @@ execution-context wiring to do.
 
 This is the fix for the cross-origin-iframe attach bug: on sites that embed an
 early out-of-process iframe (e.g. an ad pixel), the old handle could bind to the
-iframe instead of the page — `evaluate` then ran in the wrong document.
+iframe instead of the page: `evaluate` then ran in the wrong document.
 `new_main_frame()` applies three filters so it can only ever resolve to the real
 top frame:
 
-- **Layer 1** — accept only `Browser.attachedToTarget` events where `targetInfo.type == "page"`
-- **Layer 2** — accept only the top frame's `Page.frameAttached` (empty `parentFrameId`)
-- **Layer 3** — accept only the main-world `Runtime.executionContextCreated` whose `auxData.frameId` matches the top frame
+- **Layer 1**: accept only `Browser.attachedToTarget` events where `targetInfo.type == "page"`
+- **Layer 2**: accept only the top frame's `Page.frameAttached` (empty `parentFrameId`)
+- **Layer 3**: accept only the main-world `Runtime.executionContextCreated` whose `auxData.frameId` matches the top frame
 
 ```rust,no_run
 # fn doc_test(browser: &camoufox::api::Browser) -> Result<(), Box<dyn std::error::Error>> {
@@ -436,7 +481,7 @@ use std::time::Duration;
 // ...continuing from the bootstrap example, after `Browser::connect`:
 let context = browser.new_context(ContextOptions::default())?;
 
-// One call — no manual attachedToTarget / frameAttached / executionContext wiring:
+// One call: no manual attachedToTarget / frameAttached / executionContext wiring:
 let main_frame = context.new_main_frame()?;
 
 // navigate(url, NavigateOptions, timeout) -> NavigateOutcome (nav_id and status_code)
@@ -465,9 +510,14 @@ cargo run --example web_browse -- --url https://example.com
 
 End-to-end wiring is also exercised in `tests/integration.rs` and `src/cli/instance.rs`.
 
+For file inputs, `MainFrame::set_file_input_files(frame_id, object_id, files)`
+uses a 60-second timeout; `set_file_input_files_with_timeout` accepts an explicit
+`Duration`. Both take a file-input object handle and dispatch `input` and `change`.
+The CLI's `upload` adds CSS selection, frame/shadow scoping, and path validation.
+
 ### Reliability
 
-- Every protocol request is bounded — `Session::send` enforces a default deadline
+- Every protocol request is bounded: `Session::send` enforces a default deadline
   (60s), and commands like `navigate` / `evaluate` / `wait` accept an explicit
   `timeout` (CLI: `--timeout <seconds>`), so a stuck call can no longer hang the
   daemon.
@@ -543,12 +593,17 @@ Protocol traffic is traced at `camoufox::protocol=trace` with bounded payload pr
   not supported for pointer coordinates (translation and scale are)
 - `type --frame` / `press --frame` only type into a field that is currently focused inside the
   frame; after touching the top-level page, click or fill inside the frame again
-- CLI daemon uses in-memory instance state only
-- Requests to the *same* instance are serialized: a long-polling command (e.g.
+- Instance/page IDs do not survive daemon restart; persistent profiles and cassettes remain on disk
+- Most requests to the *same* instance are serialized: a long-polling command (e.g.
   `wait --timeout 60`) on one page blocks other commands for that instance until it returns.
-  Other instances are unaffected.
-- `stop` interrupts in-flight commands and typically takes about one second. `shutdown`
-  stops browsers in parallel and replies only after cleanup and socket removal.
+  Other instances are unaffected. Download waits and cassette validation, disk I/O,
+  and draining release the instance lock.
+- `close-tab`, `stop`, and `shutdown` finalize active cassettes. Tab cleanup has a
+  15-second budget after acquiring its network-operation lock; stop and shutdown
+  share 15 seconds across an instance's pages. `close-tab` and `stop` report
+  finalization failures in success data as `cassette_errors` and warn on stderr
+  without changing exit code 0. Shutdown logs failures and replies after cleanup
+  and socket removal. Explicit cassette stop commands allow 300 seconds to drain.
 - `back` / `forward` are wired to `Page.goBack` / `Page.goForward` but are inert against the
   Camoufox builds tested here: pages created via `Browser.newPage` expose no session history
   (`history.length === 0`), so both always report "no history entry". Re-`navigate` instead.

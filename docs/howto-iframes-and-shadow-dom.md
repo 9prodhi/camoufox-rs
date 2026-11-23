@@ -17,12 +17,13 @@ This guide explains how to target elements inside nested iframes using `--frame`
 
 The `--frame <selector>` flag scopes an operation to a child iframe element matching that selector.
 
-`--frame` is supported across 11 CLI subcommands:
+`--frame` is supported across 12 CLI subcommands:
 - `text`
 - `html`
 - `links`
 - `click`
 - `fill`
+- `upload`
 - `type`
 - `press`
 - `hover`
@@ -51,6 +52,18 @@ To scope to a selector inside the iframe:
 ```bash
 ./target/release/camoufox fill 00000001 p1 "input#email" "user@example.com" --frame "#signup-frame"
 ```
+
+### Upload to a file input inside an iframe
+
+```bash
+./target/release/camoufox upload 00000001 p1 'file-picker >>> input[type=file]' ./fixture.pdf \
+    --frame '#upload-frame' --timeout 30
+```
+
+Hidden inputs work without scrolling or focus. Relative paths resolve against
+the client's working directory. Upload replaces the selection and dispatches
+`input` and `change`; multiple files require `multiple`. Directory-picker
+(`webkitdirectory`) inputs are rejected with kind `invalid_argument`.
 
 ---
 
@@ -149,6 +162,10 @@ When elements, frames, or shadow roots load asynchronously, use `wait`:
 - Retries late-attached shadow roots.
 - Validates the entire CSS selector syntax upfront before attempting frame resolution.
 - Fails immediately on invalid CSS or if a matched target is not an iframe.
+
+With `--json`, failures carry a `kind` such as `frame_not_found`, `not_iframe`,
+`frame_detached`, `shadow_root`, or `timeout`. Use that field rather than parsing
+the message. Daemon errors exit 1; client-side argument validation exits 2.
 
 ---
 

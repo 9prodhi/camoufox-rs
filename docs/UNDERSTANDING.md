@@ -188,6 +188,12 @@ The protocol uses a JSON-RPC-like format (not strict JSON-RPC 2.0). Four message
 }
 ```
 
+The CLI daemon uses a separate newline-delimited socket protocol. Its failure
+envelope is `{"ok":false,"error":"...","kind":"timeout"}`; success omits
+`kind`. These categories are supplied by the Rust CLI, not by Juggler's wire
+error object. See [CLI error conventions](reference-cli.md#json-response-envelope)
+for categories and exit codes.
+
 ### Key Discriminator
 
 - **Has `id`** → Response (success or error) to a prior request
@@ -259,6 +265,14 @@ CLIENT → {"id":3,"method":"Browser.newPage","params":{"browserContextId":"ctx1
 CLIENT ← {"method":"Browser.attachedToTarget","params":{"sessionId":"page1","targetInfo":{...}}}\0
 CLIENT ← {"id":3,"result":{"targetId":"..."}}\0
 ```
+
+For persistent storage, connect with
+`BrowserOptions::attach_to_default_context: true`, then call
+`Browser::default_context` instead of creating a private context. Its empty Rust
+context ID is omitted as `browserContextId` on the wire, so page/cookie commands
+address the on-disk profile. `BrowserContext::close` only drops that handle;
+`Browser::close` flushes storage and closes pages. The CLI configures this through
+`launch --profile-dir`.
 
 ### Page Navigation
 
@@ -358,6 +372,22 @@ Process spawning is implemented in `src/process/unix.rs`:
 The null-byte message framing is implemented in `src/codec/nul_json.rs` via `NulJsonCodec`:
 - Decodes incoming frames by scanning for `\0` with a 256 MiB buffer limit.
 - Encodes outgoing JSON byte payloads and appends the `\0` delimiter.
+
+### File inputs and cassettes
+
+`MainFrame::set_file_input_files(frame_id, object_id, files)` sends
+`Page.setFileInputFiles` with a 60-second timeout; the `_with_timeout` variant
+accepts an explicit budget. Both dispatch `input` and `change`. CLI `upload`
+adds selector/frame/shadow resolution and validates regular-file paths before
+page access.
+
+CLI `record` observes HTTP(S) events and retrieves decoded bodies through
+`Network.getResponseBody`. `replay` uses `Network.setRequestInterception` and
+`fulfillInterceptedRequest` to serve validated cassette responses, aborting misses.
+They apply to one page and its subframes; popups need separate sessions and
+service-worker responses are outside replay interception. Redirect cassettes
+are refused because redirected requests bypass interception. Format and cleanup
+rules are documented in the [CLI reference](reference-cli.md#record).
 
 ---
 

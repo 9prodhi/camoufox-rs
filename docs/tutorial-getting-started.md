@@ -142,6 +142,13 @@ You now have a verified connection to Camoufox in under 3 steps.
 
 Now let's load a web page. In Camoufox, pages belong to a `BrowserContext` (an isolated profile with its own cookies and storage). Calling `context.new_main_frame()` returns a `MainFrame` pinned to the top frame.
 
+This example uses `new_context`, whose storage is private. For data that survives
+relaunch, retain `LaunchConfig::profile_dir`, set `persistent: true`, connect with
+`BrowserOptions::attach_to_default_context: true`, and call
+`browser.default_context(ContextOptions::default())` instead. Its context ID is
+empty; `context.close()` only drops the handle. `Browser::close()` closes pages
+and flushes profile storage. See the [library guide](howto-library-usage.md#keep-storage-in-the-on-disk-profile).
+
 Update `src/main.rs`:
 
 ```rust,no_run
@@ -294,3 +301,9 @@ You created a complete, self-contained Camoufox automation client:
   - [CLI Reference](reference-cli.md)
   - [Rust Library API Reference](reference-library-api.md)
   - [Architecture and Design Rationale](explanation-architecture.md)
+
+For file inputs, the [library guide](howto-library-usage.md#file-inputs) covers
+`set_file_input_files` and its explicit-timeout variant. The CLI provides
+[`upload`](reference-cli.md#upload) for CSS selection and local file paths,
+[`record` and `replay`](reference-cli.md#record) for HTTP cassettes, and
+[`launch --profile-dir`](reference-cli.md#launch) for persistent browsing data.

@@ -43,14 +43,16 @@ browser.close()?;
 Key methods:
 - `Browser::connect(connection, root_session, options)`: Connect to an established Juggler connection.
 - `browser.new_context(options)`: Create a new isolated profile context.
-- `browser.default_context(options)`: Configure and return the `BrowserContext` for the browser's persistent on-disk profile. Requires connecting with `BrowserOptions::attach_to_default_context: true` to receive page and popup events. Unlike private contexts, calling `close()` on the default context is a no-op; call `Browser::close()` to terminate the process and flush profile storage.
+- `browser.default_context(options)`: Configure and return the `BrowserContext` for the browser's persistent on-disk profile. Requires connecting with `BrowserOptions::attach_to_default_context: true` to receive page and popup events. Its `close()` only drops the handle; call `Browser::close()` to close pages and flush profile storage.
 - `browser.version()`: Returns the browser version string if queried.
 - `browser.user_agent()`: Returns the browser User-Agent string.
 - `browser.close()`: Consumes the handle and gracefully terminates the browser.
 
 ### `BrowserContext`
 
-Represents an isolated browsing context (profile) with its own cookies and storage.
+Represents an isolated browsing context or the browser's persistent default
+context, with its own cookies and storage. `new_context` creates a private
+context; `default_context` uses the on-disk launch profile.
 
 ```rust,no_run
 # fn doc_test(context: &camoufox::api::context::BrowserContext) -> Result<(), Box<dyn std::error::Error>> {
@@ -92,7 +94,7 @@ Key methods:
 - `context.set_cookies(cookies)`: Sets one or more cookies.
 - `context.clear_cookies()`: Clears all cookies from the context.
 - `context.take_popups()`: Returns and drains any popup pages adopted by the context registry.
-- `context.close()`: Closes and removes the browser context. For the default context, this is a no-op (`Ok(())`); use `Browser::close()` instead.
+- `context.close()`: Consumes the handle, closes and removes a private context. For the default context, it only drops the handle and returns `Ok(())`; use `Browser::close()` to close pages and flush storage.
 
 ### `MainFrame`
 
@@ -154,6 +156,13 @@ Key methods:
 - `page.frames()`: Returns tracked frame IDs and their parent frame IDs.
 - `page.is_closed()`: Returns true if the page session was closed or detached.
 - `page.close()`: Closes the page target.
+
+File-input methods take `frame_id: &str`, `object_id: &str`, and `files: &[&str]`;
+the timeout variant also takes `std::time::Duration`. The object ID must refer to
+the file input in the target frame, obtained through `Runtime.evaluate` with
+`returnByValue: false`. Release it with `page.dispose_object(context_id, object_id)`
+after use. These methods send the protocol request directly; the CLI's `upload`
+adds selector/frame/shadow resolution and validates file paths and input attributes.
 
 ---
 
@@ -243,3 +252,41 @@ Structured metadata attached to `ProtocolError` when kind is `NavigationBecameDo
 Observability and structured protocol logging.
 
 - `ProtocolLogger`: Unit struct (`pub struct ProtocolLogger;`) and logging helpers for tracing incoming and outgoing protocol traffic at `TRACE` level.
+
+---
+
+## 6. `camoufox::cli` (feature = `"cli"`)
+
+- `InstanceManager::upload(instance_id, page_id, selector, paths, frames, timeout)`:
+  Requires absolute regular-file paths, validated before page access. Returns
+  basenames and an `InteractionOutcome` that may contain a dialog.
+- `InstanceManager::{record_start, record_stop, replay_start, replay_stop}`:
+  Manage per-page HTTP cassettes, including subframes. Start methods take a
+  cassette directory; recording also takes URL regex filters, replay a
+  `match_body` boolean. Stop methods return JSON counts and retained repeat results.
+- `LaunchOptions::profile_dir`: Optional persistent profile path. Use
+  `LaunchOptions::default()` followed by field assignment to configure it.
+- `prepare_profile_dir(path)`: Validates an absolute empty directory or profile
+  containing `prefs.js` or `times.json`, creates missing directories with mode
+  0700, removes group/other permissions, and returns the canonical path.
+- `Instance::persistent_profile_dir()`: Returns the canonical persistent path,
+  or `None` for temporary profiles.
+- `commands::{RecordAction, ReplayAction}`: CLI start/stop actions.
+- `commands::find_external_subcommand(name)`: Finds an executable
+  `camoufox-<name>` in absolute `PATH` entries; built-in dispatch takes precedence.
+- `ipc::DaemonResponse`: `ok`, optional `data`, optional `error`, and optional
+  error `kind`. Use `ok`, `ok_empty`, and `err` constructors. Success omits `kind`;
+  `client::send_request` backfills missing error kinds from older daemon messages
+  and preserves daemon-provided values, including unknown values.
+- `error_kind::ErrorKind`: Stable snake_case categories for selection, timeouts,
+  dialogs, frames, navigation, instance/page lookup, arguments, I/O, daemon, and
+  other errors. Treat unknown wire values as `other`. CLI execution failures exit
+  1; client argument validation exits 2 with `invalid_argument`, while local
+  path-resolution failures exit 1 with `io`. Clap parsing errors exit 2 with text
+  diagnostics. External subcommands forward their own exit status.
+
+`ErrorKind`, `DaemonRequest`, `DaemonResponse`, and `LaunchOptions` are
+`#[non_exhaustive]`; enum matches require a wildcard. `ManagedMainFrame.main_frame`
+is `Arc<MainFrame>`; private fields prevent struct-literal construction and require
+`..` when destructuring. See the [CLI reference](reference-cli.md) for cassette
+format, scope, lifecycle, and external-subcommand environment conventions.

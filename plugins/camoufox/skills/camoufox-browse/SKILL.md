@@ -1,13 +1,13 @@
 ---
 name: camoufox-browse
-description: Browse the web with a real, fingerprint-resistant Firefox (Camoufox) through the `camoufox` CLI. Use instead of WebSearch/WebFetch for any web task — searching, reading JS-rendered pages, following links, filling forms, clicking, handling iframes/shadow DOM, dialogs, downloads, cookies, and screenshots.
+description: Browse the web with a real, fingerprint-resistant Firefox (Camoufox) through the `camoufox` CLI. Use instead of WebSearch/WebFetch for any web task; searching, reading JS-rendered pages, following links, filling forms, clicking, handling iframes/shadow DOM, dialogs, downloads, cookies, and screenshots.
 ---
 
 # Browse the Web with Camoufox
 
 Camoufox is a hardened, fingerprint-resistant Firefox fork driven by the
 `camoufox` CLI. **Use it instead of `WebSearch` / `WebFetch` for all web
-browsing** — it runs a real browser, so it renders JavaScript, keeps cookies,
+browsing**: it runs a real browser, so it renders JavaScript, keeps cookies,
 and can fill forms and click things.
 
 The CLI talks to a long-running **daemon** (`camoufox serve`) over a Unix
@@ -24,9 +24,9 @@ Two binaries are involved:
 - **The Camoufox browser** it drives (`pip install camoufox && python -m
   camoufox fetch`). The daemon looks up `$CAMOUFOX_BIN`, then the active or
   newest install under `~/.cache/camoufox/browsers/`, then
-  `~/.cache/camoufox/camoufox`. Older CLI builds only check the first and
-  last of those, so resolving the path explicitly and passing
-  `launch --executable` keeps working with any daemon version:
+  `~/.cache/camoufox/camoufox`. The cache root respects an absolute
+  `$XDG_CACHE_HOME`. Set `CAMOUFOX_BIN` and pass `launch --executable` for
+  a custom install or an older daemon:
 
 ```bash
 # CLI: prefer $CAMOUFOX_CLI, then `camoufox` on PATH, then a local release build.
@@ -35,12 +35,11 @@ command -v "$BROWSE" >/dev/null 2>&1 || BROWSE="./target/release/camoufox"
 [ -x "$BROWSE" ] || command -v "$BROWSE" >/dev/null 2>&1 \
   || cargo build --release --bin camoufox --features cli   # from the repo root
 
-# Browser: prefer $CAMOUFOX_BIN, then the legacy path, then the newest fetched release.
-[ -n "$CAMOUFOX_BIN" ] || [ ! -x "$HOME/.cache/camoufox/camoufox" ] || CAMOUFOX_BIN="$HOME/.cache/camoufox/camoufox"
-[ -n "$CAMOUFOX_BIN" ] || CAMOUFOX_BIN=$(ls -d "$HOME"/.cache/camoufox/browsers/official/*/camoufox 2>/dev/null | sort -V | tail -1)
+# Optional custom browser: CAMOUFOX_BIN=/absolute/path/to/camoufox
+# Otherwise the current daemon finds the active/newest fetched install.
 ```
 
-Use `--release`, not a debug build — this tool is meant to be reused across
+Use `--release`, not a debug build: this tool is meant to be reused across
 sessions, not rebuilt each time.
 
 Each Bash tool call starts a fresh shell, so `BROWSE`, `CAMOUFOX_BIN`, `I` and
@@ -67,7 +66,7 @@ P=$($BROWSE new-page "$I" --json | jq -r '.data.page_id')
 # 4. Navigate, waiting for the load event, and check the HTTP status
 $BROWSE navigate "$I" "$P" '<url>' --wait-until load --timeout 20 --json
 
-# 5. Read the page — clean text, plus structured metadata
+# 5. Read the page: clean text, plus structured metadata
 $BROWSE text "$I" "$P"
 $BROWSE data "$I" "$P" --og
 
@@ -76,23 +75,32 @@ $BROWSE screenshot "$I" "$P" --selector 'article' -o /tmp/shot.png
 ```
 
 `launch --json` failing with `failed to spawn browser ... No such file or
-directory` means the browser binary was not found — set `CAMOUFOX_BIN` as in
+directory` means the browser binary was not found: set `CAMOUFOX_BIN` as in
 Setup and pass `--executable`.
 
 ## Conventions
 
 - **Scope.** Commands take `<inst> <page>` first, except: `serve`, `ping`,
   `list`, `shutdown` (daemon-scoped, no ids) and `launch`; `new-page`, `stop`,
-  `tabs`, `cookies`, `downloads` (instance only).
+  `tabs`, `cookies`, `downloads` (instance only). `record` and `replay` take
+  `start|stop` before `<inst> <page>`.
 - **Output.** Plain mode prints the payload alone on stdout (counts, titles,
-  pids go to stderr), so `$BROWSE text … | head -40` works. Add `--json` to any
-  command for `{"ok":true,"data":…}` / `{"ok":false,"error":…}`.
-- **Exit codes.** `0` success, `1` any command failure (message on stderr as
-  `error: …`), `2` bad arguments.
+  pids go to stderr), so `$BROWSE text … | head -40` works. Add `--json` to a
+  built-in client command for `{"ok":true,"data":…}` /
+  `{"ok":false,"error":…,"kind":"timeout"}`. Success omits `kind` and may omit
+  `data`. Branch on `kind` (e.g. `selector_not_found`, `dialog_open`, `io`),
+  treating unknown values as `other`; the client backfills missing kinds from
+  older daemon messages and preserves daemon-provided values.
+- **Exit codes.** `0` success, `1` execution or daemon failure, `2` client-side
+  argument validation (`kind: invalid_argument`) or clap parsing errors. Local
+  path-resolution failures exit `1` with kind `io`; daemon-side invalid arguments
+  also exit `1`. Plain errors print `error: …` on stderr. Clap diagnostics remain
+  text even with `--json`; external subcommands control their own output/status.
 - **Timeouts.** Most page commands take `--timeout <secs>` (default **30**);
   `wait` defaults to **10**.
-- **Global flags.** `--json` and `--socket <path>` work on every command. The
-  default socket is `$XDG_RUNTIME_DIR/camoufox/daemon.sock`, else
+- **Global flags.** `--json` and `--socket <path>` work on built-in commands.
+  `--socket` overrides `CAMOUFOX_SOCKET`; otherwise the default socket is
+  `$XDG_RUNTIME_DIR/camoufox/daemon.sock`, else
   `/tmp/camoufox-<uid>/daemon.sock`.
 
 ## Command reference
@@ -104,18 +112,26 @@ Setup and pass `--executable`.
 | `ping` | Check whether the daemon is up (`pong (N instances)`); exits 1 if not |
 | `serve &` | Start the daemon (foreground process; background it and redirect its output) |
 | `launch [--executable PATH] [--headed] [--dialogs manual\|accept\|dismiss] [--downloads-dir ABS] [--bypass-csp]` | Launch a browser (headless unless `--headed`); prints `instance_id` |
+| `launch --profile-dir ABS` | Keep cookies, localStorage, IndexedDB, and other profile data across launches; `list` includes the canonical profile path |
 | `list` | List running instances with their page ids |
 | `new-page <inst>` | Create a page, prints `page_id` |
-| `tabs <inst>` | List open pages as `page_id  url  title` — includes popups the site opened |
+| `tabs <inst>` | List open pages as `page_id  url  title`: includes popups the site opened |
 | `close-tab <inst> <page>` | Close one page |
 | `stop <inst>` | Stop one browser instance |
 | `shutdown` | Stop the daemon and every instance |
+
+`--profile-dir` requires an absolute empty directory or an existing profile with
+`prefs.js` or `times.json`. Missing directories are created with mode 0700;
+group/other access is removed from existing profiles. The daemon reserves the
+canonical path until browser exit, so concurrent launches through aliases fail.
+Stop/shutdown flush storage and keep the directory. Without it, each launch uses
+a fresh temporary profile and private context.
 
 ### Reading
 
 | Command | Description |
 |---------|-------------|
-| `text <inst> <page> [--selector <css>] [--frame <css>]…` | Rendered page text (`innerText`), or just that element. Empty output means the element renders nothing — try a more specific selector, or `html` |
+| `text <inst> <page> [--selector <css>] [--frame <css>]…` | Rendered page text (`innerText`), or just that element. Empty output means the element renders nothing: try a more specific selector, or `html` |
 | `html <inst> <page> [--selector <css>] [--frame <css>]…` | `outerHTML` of the selector, or the whole document |
 | `links <inst> <page> [--selector <css>] [--frame <css>]…` | Every `<a href>` as `text → href` (absolute URLs) |
 | `data <inst> <page> [--og] [--jsonld] [--meta]` | Structured metadata as JSON. No flags = all three groups |
@@ -158,11 +174,18 @@ Content-Security-Policy)`, relaunch the instance with `launch --bypass-csp`
 | `click <inst> <page> <css> [--frame <css>]…` | Scroll the element into view and click its centre |
 | `click <inst> <page> <x> <y>` | Click raw viewport coordinates (trusted event; `--frame` ignored) |
 | `fill <inst> <page> <css> <value> [--frame <css>]…` | Focus the field, clear it, type the value |
+| `upload <inst> <page> <css> <path>… [--frame <css>]… [--timeout N]` | Replace a file input's selection with regular files, including hidden inputs; relative paths use the client's working directory |
 | `type <inst> <page> <text> [--frame <css>]…` | Type into whatever currently has focus |
 | `press <inst> <page> <key> [--frame <css>]…` | Press a key (see key names below) |
 | `hover <inst> <page> <css> [--frame <css>]…` | Move the mouse over an element, no click |
 | `select <inst> <page> <css> <value> [--frame <css>]…` | Choose a `<select>` option by value, label, or visible text |
 | `scroll <inst> <page> [css]` | Scroll an element into view, or to the page bottom |
+
+Upload validates paths before page access, dispatches `input` and `change`, and
+supports open shadow roots with ` >>> `. Multiple files require `multiple`;
+directory-picker (`webkitdirectory`) inputs are rejected with kind
+`invalid_argument`. Plain output lists basenames; JSON returns `uploaded`,
+`selector`, and `files`, plus `dialog` if a handler opens one.
 
 Key names for `press`: `Enter` (or `Return`), `Tab`, `Escape`, `Backspace`,
 `Delete`, `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `Home`, `End`,
@@ -170,8 +193,9 @@ Key names for `press`: `Enter` (or `Return`), `Tab`, `Escape`, `Backspace`,
 
 All clicks and key presses are **trusted** browser-level input events
 (`isTrusted === true`), so they drive widgets that reject synthetic JS events.
-Interaction results are JSON. They may carry a `"dialog"` key (the action
-opened a JS dialog) or a `"downloads"` key (it started a download).
+Most interactions print JSON payloads in plain mode; upload prints basenames.
+With `--json`, success data may carry a `"dialog"` key (the action opened a JS
+dialog) or a `"downloads"` key (it started a download).
 
 ### Iframes and shadow DOM
 
@@ -179,8 +203,8 @@ Plain `text` / `links` / selectors only see the top document. To reach inside:
 
 - **`--frame <css>`** scopes a command to the iframe matching the selector.
   Repeat it for nested frames: `--frame '#outer' --frame '#inner'`. Supported by
-  `text`, `html`, `links`, `click`, `fill`, `type`, `press`, `hover`, `select`,
-  `wait`, `evaluate` — **not** by `scroll`, `screenshot`, `data`, `url`.
+  `text`, `html`, `links`, `click`, `fill`, `upload`, `type`, `press`, `hover`, `select`,
+  `wait`, `evaluate`. It is unsupported by `scroll`, `screenshot`, `data`, `url`.
   `type`/`press` with `--frame` type into whatever is already focused inside
   that frame, so `click` or `fill` the field first.
 - **`>>>`** pierces open shadow roots in any selector: `'my-app >>> button.submit'`,
@@ -195,12 +219,13 @@ $BROWSE click "$I" "$P" 'cookie-banner >>> button.accept'
 ### Dialogs (alert / confirm / prompt / beforeunload)
 
 The default dialog policy is `manual`. When a click or key press opens a
-dialog, the command succeeds and returns a `"dialog"` object — but **every
-later command on that page fails** with:
+dialog, the command succeeds and returns a `"dialog"` object. Upload may also
+return one. Most later page commands fail with kind `dialog_open` and an
+actionable message:
 
-```
-error: page p1 has an open alert dialog: "hi" — run `camoufox dialog 00000001 p1 accept|dismiss [--text T]`
-```
+`page p1 has an open alert dialog` indicates that the dialog needs a response.
+`tabs`, `close-tab`, `screenshot --clip`, `record stop`, and `replay stop` bypass
+dialog checks; `tabs --json` includes pending dialog details.
 
 Resolve it with `dialog <inst> <page> accept|dismiss [--text T]` (`--text` is
 the reply to a `prompt`). To skip this entirely, launch with
@@ -241,6 +266,48 @@ Without `-o`, the file goes to the daemon's private runtime directory
 `screenshot-<inst>-<page>.png`; the command prints the path. A relative `-o`
 resolves against your current directory.
 
+### Network cassettes
+
+| Command | Description |
+|---------|-------------|
+| `record start <inst> <page> --dir ABS [--url REGEX]…` / `record stop <inst> <page>` | Passively capture HTTP(S) traffic; repeat `--url` to include URLs matching any regex, then stop to publish `index.json` and decoded `bodies/<sha256>` |
+| `replay start <inst> <page> --dir ABS [--match-body]` / `replay stop <inst> <page>` | Serve recorded responses offline by method and exact URL, optionally matching request-body hashes; abort misses and report `served`, `missed`, and `missed_total` at stop |
+
+Record before navigating. Recording requires an absent or empty absolute
+directory; existing directories must be owner-only. New directories use mode
+0700 and files 0600. Stop reports `exchanges`, `bodies`, and `skipped`; unreadable
+or evicted bodies are skipped, while write errors prevent index publication.
+Body buffers are limited to 10 MB per response and 100 MB total.
+
+One recording or replay runs per page, including subframes; popups need their
+own sessions. Replay cannot replace service-worker responses and rejects redirect
+cassettes. Repeated requests consume responses in order, then reuse the last.
+Keep cassette files unchanged until replay stops. Replay disables page caching
+while active; stop drains accepted requests before restoring normal networking
+and caching. Explicit stop commands allow 300 seconds to drain and work with open
+dialogs. Repeating stop returns the last result with `repeated: true`.
+
+`close-tab`, instance `stop`, popup closure, and shutdown finalize active cassettes.
+Tab cleanup has a 15-second budget after acquiring its network-operation lock;
+instance stop/shutdown share 15 seconds across pages. `close-tab` and `stop` report
+finalization failures as `cassette_errors` entries in success data and warn on
+stderr, still exiting 0. Popup cleanup and shutdown log failures.
+
+Cassettes scrub credential response headers and omit request headers and raw
+request bodies. URLs and decoded response bodies remain verbatim and can contain
+secrets. Use trusted cassettes: replayed HTML and scripts use the origin's real
+storage.
+
+### External subcommands
+
+`camoufox <name> <args>…` runs `camoufox-<name>` from absolute `PATH` entries
+when the name is not built-in. Arguments, environment, standard streams, and exit
+status pass through. Put global flags before the name, for example
+`camoufox --json --socket /tmp/custom.sock custom-tool --flag value`.
+The executable receives the absolute socket path in `CAMOUFOX_SOCKET` and
+`CAMOUFOX_JSON=1` with global `--json`; otherwise `CAMOUFOX_JSON` is cleared.
+Built-ins take precedence; a missing executable uses clap's error and exit code 2.
+
 ## Worked example: scrape a page and act on it
 
 ```bash
@@ -268,15 +335,15 @@ $BROWSE stop "$I"
 ## Tips
 
 - **Prefer `text` / `html` / `links` / `data` over hand-written `evaluate` JS.**
-  They handle selector escaping, iframes, shadow DOM and error reporting for
-  you. Reach for `evaluate` only when nothing else fits.
+  `text`, `html`, and `links` handle selector escaping, iframes, and shadow DOM;
+  `data` extracts whole-page metadata. Reach for `evaluate` when these do not fit.
 - **Wait for content, don't sleep.** `navigate --wait-until load` then
   `wait --selector` is far more reliable than a fixed delay on JS-heavy sites.
-- **`data --og` is the fastest way to summarise a page** — many sites put a
+- **`data --og` is the fastest way to summarise a page**: many sites put a
   full summary in `og:description` and the lead image in `og:image`.
-- **Selectors are passed as string literals, not spliced into JS** — quotes and
+- **Selectors are passed as string literals, not spliced into JS**: quotes and
   backslashes in a selector or a `fill` value are safe.
-- **A page that seems frozen** usually has an open dialog — the error message
+- **A page that seems frozen** usually has an open dialog: the error message
   says so; run `dialog … accept|dismiss`.
 - **Clicked something and nothing changed?** The site may have opened a new
   tab. Run `tabs` and switch to the new `page_id`.
@@ -285,21 +352,25 @@ $BROWSE stop "$I"
 - **For web search**, navigate to `https://duckduckgo.com/?q=<url_encoded>`
   (Google often serves consent or captcha pages to automated browsers).
 - **After upgrading the CLI, restart the daemon** (`shutdown`, then `serve`).
-  There is no client/daemon version check, and an old daemon silently ignores
-  newer flags such as `--frame`.
+  Older daemons can silently ignore `--frame`. For `--profile-dir`, the client
+  detects missing support, stops the returned instance, and reports kind `daemon`
+  with restart instructions. Failed cleanup includes the instance ID to stop
+  manually.
 
 ## Known limitations
 
 - **`back` / `forward` do not work.** The commands exist, but this Camoufox
   build exposes no session history to pages created over the Juggler protocol,
-  so they print `no back history entry` — and still exit `0`. Re-`navigate` to
+  so they print `no back history entry` and still exit `0`. Re-`navigate` to
   the previous URL instead.
 - **`--wait-until` supports only `load` and `domcontentloaded`.** There is no
   `networkidle` primitive in the Juggler protocol.
 - **A page that has never been navigated is `about:blank`.** `cookie` needs
   `--url` or `--domain` in that case.
-- **Requests to one instance run one at a time**, so a long `wait` blocks other
-  commands on that instance. Use a second instance for parallel work.
+- **Most requests to one instance run one at a time**, so a long `wait` blocks
+  other commands on that instance. Download waits and cassette validation, disk
+  I/O, and draining run outside the instance lock. Use a second instance when
+  commands need to run independently.
 - **Detectable features.** `evaluate --main-world` and `launch --bypass-csp`
   can both be noticed by the page; avoid them on sites with bot detection.
 
@@ -309,8 +380,8 @@ $BROWSE stop "$I"
    `./target/release/camoufox`) and point it at the browser with
    `$CAMOUFOX_BIN` / `launch --executable`.
 2. **Prefer this CLI over WebSearch/WebFetch** for all web tasks.
-3. **Reuse existing instances** — check `list` before launching.
+3. **Reuse existing instances**: check `list` before launching.
 4. **Add `--json`** whenever you need to parse the output with `jq`.
-5. **Handle dialogs** — if a command reports an open dialog, resolve it before
+5. **Handle dialogs**: if a command reports an open dialog, resolve it before
    anything else.
-6. **When spawning subagents for web work**, pass them these CLI instructions.
+6. **For shared web work**, include these CLI instructions in the task.

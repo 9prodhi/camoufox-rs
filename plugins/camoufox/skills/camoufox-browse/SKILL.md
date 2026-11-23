@@ -123,7 +123,9 @@ Setup and pass `--executable`.
 `--profile-dir` requires an absolute empty directory or an existing profile with
 `prefs.js` or `times.json`. Missing directories are created with mode 0700;
 group/other access is removed from existing profiles. The daemon reserves the
-canonical path until browser exit, so concurrent launches through aliases fail.
+canonical path until browser exit, so concurrent launches through aliases fail
+within one daemon process. Do not point two daemons at the same profile directory:
+Firefox does not support concurrent use and it can corrupt the profile.
 Stop/shutdown flush storage and keep the directory. Without it, each launch uses
 a fresh temporary profile and private context.
 

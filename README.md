@@ -93,7 +93,9 @@ For persistent browsing data, add `--profile-dir /absolute/path/to/profile` to
 It is created with mode 0700 or has group/other permissions removed,
 canonicalized, and kept after stop. The daemon confirms the canonical path in
 launch success data and shows it in `list`. Concurrent launches using the same
-canonical profile are refused. Restart older daemons that
+canonical profile are refused within one daemon process. Do not point two daemons
+at the same profile directory: Firefox does not support concurrent use and it can
+corrupt the profile. Restart older daemons that
 cannot confirm persistent profile support. The client stops the instance returned
 by an older daemon before reporting the compatibility error; if cleanup fails,
 the error includes the instance ID so you can stop it manually.

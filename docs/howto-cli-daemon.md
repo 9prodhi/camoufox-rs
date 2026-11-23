@@ -112,7 +112,9 @@ other profile data survive relaunch. The directory must be empty or contain
 `prefs.js` or `times.json`; missing directories are created with mode 0700 and
 existing profiles have group/other access removed. The canonical path appears in
 launch JSON and `list`, and cannot be used concurrently by another instance in
-the daemon. Stop or shutdown flushes storage and keeps the directory.
+the same daemon process. Do not point two daemons at the same profile directory:
+Firefox does not support concurrent use and it can corrupt the profile.
+Stop or shutdown flushes storage and keeps the directory.
 
 If an older daemon cannot confirm profile support, the client stops the returned
 instance and exits 1 with kind `daemon` and restart instructions. If cleanup fails,

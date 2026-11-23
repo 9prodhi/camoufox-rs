@@ -4311,3 +4311,144 @@ fn scoped_focus_explicit_blur_then_outside_same_tick_main_world() {
 
     manager.stop(&instance).unwrap();
 }
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_persists_after_stop() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let profile_temp = tempfile::tempdir().expect("create profile tempdir");
+    let profile_path = profile_temp.path().canonicalize().expect("canonicalize");
+
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            profile_dir: Some(profile_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .expect("launch_with persistent profile failed");
+
+    // Check list output shows profile_dir
+    let list = manager.list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(
+        list[0]["profile_dir"].as_str(),
+        Some(profile_path.to_str().unwrap())
+    );
+
+    // Stop instance
+    manager.stop(&instance_id).expect("stop failed");
+
+    // Directory still exists and contains files written by browser (e.g. prefs.js)
+    assert!(profile_path.exists());
+    assert!(
+        profile_path.join("prefs.js").exists(),
+        "prefs.js must persist after instance stop"
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_refuses_second_instance_on_same_dir() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let profile_temp = tempfile::tempdir().expect("create profile tempdir");
+    let profile_path = profile_temp.path().canonicalize().expect("canonicalize");
+
+    let manager = InstanceManager::new();
+    let (instance_id, _version, _pid) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            profile_dir: Some(profile_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .expect("first launch failed");
+
+    // Second launch with same canonical path should be refused
+    let err = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            profile_dir: Some(profile_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        format!("invalid argument: profile directory already in use by instance {instance_id}")
+    );
+
+    manager.stop(&instance_id).expect("stop failed");
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_refuses_relative_path() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let manager = InstanceManager::new();
+    let err = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            profile_dir: Some("relative/profile/path".to_string()),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        "invalid argument: --profile-dir must be an absolute path"
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cli")]
+fn launch_profile_dir_list_shows_only_for_persistent() {
+    use camoufox::cli::instance::{InstanceManager, LaunchOptions};
+
+    let profile_temp = tempfile::tempdir().expect("create profile tempdir");
+    let profile_path = profile_temp.path().canonicalize().expect("canonicalize");
+
+    let manager = InstanceManager::new();
+    let (inst1, _, _) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            profile_dir: Some(profile_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .expect("inst1 launch failed");
+
+    let (inst2, _, _) = manager
+        .launch_with(&LaunchOptions {
+            headless: Some(true),
+            executable: Some(camoufox_bin()),
+            profile_dir: None,
+            ..Default::default()
+        })
+        .expect("inst2 launch failed");
+
+    let list = manager.list();
+    assert_eq!(list.len(), 2);
+
+    let item1 = list.iter().find(|i| i["instance_id"] == inst1).unwrap();
+    let item2 = list.iter().find(|i| i["instance_id"] == inst2).unwrap();
+
+    assert_eq!(
+        item1["profile_dir"].as_str(),
+        Some(profile_path.to_str().unwrap())
+    );
+    assert!(item2.get("profile_dir").is_none());
+
+    manager.stop(&inst1).expect("stop inst1");
+    manager.stop(&inst2).expect("stop inst2");
+}

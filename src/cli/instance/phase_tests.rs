@@ -240,7 +240,8 @@ impl Harness {
             pid: child.id(),
             child,
             version: None,
-            _profile_dir: tempfile::tempdir().unwrap(),
+            profile_dir: super::ProfileDir::Temp(tempfile::tempdir().unwrap()),
+            profile_dir_path: None,
             pages: HashMap::from([(
                 "p".into(),
                 ManagedMainFrame {

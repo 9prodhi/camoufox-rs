@@ -29,6 +29,35 @@ use crate::protocol::client::Connection;
 use crate::protocol::errors::{ProtocolError, ProtocolErrorKind};
 use crate::transport::pipe::PipeTransport;
 
+fn validate_upload_paths(paths: &[String]) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Err("invalid argument: at least one upload path is required".into());
+    }
+    paths
+        .iter()
+        .map(|path| {
+            let file = Path::new(path);
+            if !file.is_absolute() {
+                return Err(format!(
+                    "invalid argument: upload path must be absolute: {path}"
+                ));
+            }
+            let metadata = std::fs::metadata(file)
+                .map_err(|e| format!("invalid argument: upload file {path}: {e}"))?;
+            if !metadata.is_file() {
+                return Err(format!(
+                    "invalid argument: upload path is not a regular file: {path}"
+                ));
+            }
+            Ok(file
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned())
+        })
+        .collect()
+}
+
 fn screenshot_path(
     instance_id: &str,
     page_id: &str,
@@ -1348,6 +1377,67 @@ impl Instance {
         Ok(tag)
     }
 
+    /// Set files on a file input, including hidden inputs and scoped selectors.
+    fn upload(
+        &self,
+        page_id: &str,
+        selector: &str,
+        paths: &[String],
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let _selectors = crate::api::selectors::SelectorScope::enter();
+        let deadline = std::time::Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let target_frame_id = self.resolve_frames(page_id, frames, remaining())?;
+        let q = js_query(selector);
+        // Return either a validation error or the actual node so validation and
+        // handle creation refer to the same element, without measuring layout.
+        let expr = format!(
+            "(() => {{ const el = {q}; if (!el) return null; \
+             const tag = el.tagName.toLowerCase(); const type = el.type || el.getAttribute('type') || ''; \
+             if (tag !== 'input' || type !== 'file') \
+               return 'invalid argument: element is not a file input (' + tag + '[type=' + type + '])'; \
+             if ({count} > 1 && !el.multiple) \
+               return 'invalid argument: input does not accept multiple files'; \
+             return el; }})()",
+            count = paths.len(),
+        );
+        let main_frame = &self.page(page_id)?.main_frame;
+        let raw = main_frame
+            .evaluate_in_frame_raw(&target_frame_id, &expr, false, remaining())
+            .map_err(|e| scoped_error(frames, e))?;
+        if let Some(exc) = raw.get("exceptionDetails") {
+            return Err(scoped_error(
+                frames,
+                crate::api::selectors::selector_exception(exc),
+            ));
+        }
+        if let Some(error) = raw.pointer("/result/value").and_then(|v| v.as_str()) {
+            return Err(error.to_owned());
+        }
+        let object_id = raw
+            .pointer("/result/objectId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("selector not found: {selector}"))?;
+        let context_id = main_frame
+            .frame_ctx(&target_frame_id)
+            .and_then(|t| t.current());
+        let files: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let result = main_frame.set_file_input_files_with_timeout(
+            &target_frame_id,
+            object_id,
+            &files,
+            remaining(),
+        );
+        // Release the handle on failure too; preserve the upload result if the
+        // page navigates or closes while processing its change listener.
+        if let Some(context_id) = context_id {
+            let _ = main_frame.dispose_object_with_timeout(&context_id, object_id, remaining());
+        }
+        result.map_err(|e| scoped_error(frames, e))
+    }
+
     /// Press a named key (keydown followed by keyup).
     pub fn press(
         &self,
@@ -2384,6 +2474,26 @@ impl InstanceManager {
         })
     }
 
+    /// Set a file input's files and return their basenames in argument order.
+    ///
+    /// Paths must be absolute regular files. All paths are validated before
+    /// accessing the page. Multiple files require the input's `multiple` attribute.
+    pub fn upload(
+        &self,
+        instance_id: &str,
+        page_id: &str,
+        selector: &str,
+        paths: &[String],
+        frames: &[String],
+        timeout: Duration,
+    ) -> Result<Vec<String>, String> {
+        let files = validate_upload_paths(paths)?;
+        self.with_instance(instance_id, |inst, _| {
+            inst.upload(page_id, selector, paths, frames, timeout)
+        })?;
+        Ok(files)
+    }
+
     /// Insert text into the focused element.
     pub fn insert_text(
         &self,
@@ -2595,6 +2705,48 @@ mod phase_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_paths_accept_regular_files_and_symlinks_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("fixture one.txt");
+        let second = dir.path().join("fixture-two.pdf");
+        std::fs::write(&first, b"one").unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+        let paths = vec![first.display().to_string(), second.display().to_string()];
+        assert_eq!(
+            validate_upload_paths(&paths).unwrap(),
+            ["fixture one.txt", "fixture-two.pdf"]
+        );
+    }
+
+    #[test]
+    fn upload_paths_reject_empty_relative_missing_directory_and_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let cases = [
+            vec![],
+            vec!["relative.txt".into()],
+            vec![dir.path().join("missing.txt").display().to_string()],
+            vec![dir.path().display().to_string()],
+            vec![socket.display().to_string()],
+        ];
+        for paths in cases {
+            // Validation must happen before even looking up the instance/page.
+            let error = InstanceManager::new()
+                .upload(
+                    "absent",
+                    "absent",
+                    "input",
+                    &paths,
+                    &[],
+                    Duration::from_secs(1),
+                )
+                .unwrap_err();
+            assert!(error.starts_with("invalid argument: "), "{error}");
+        }
+    }
 
     #[test]
     fn resolve_chain_shares_budget_across_delayed_hops() {

@@ -453,6 +453,36 @@ fn main() {
             );
         }
 
+        Command::Upload {
+            instance_id,
+            page_id,
+            selector,
+            paths,
+            frames,
+            timeout,
+        } => {
+            let paths = paths
+                .iter()
+                .map(|path| {
+                    absolute_output_path(path).unwrap_or_else(|e| {
+                        fail(cli.json, &format!("io error: resolve upload path: {e}"))
+                    })
+                })
+                .collect();
+            run_client(
+                &sock,
+                &DaemonRequest::Upload {
+                    instance_id,
+                    page_id,
+                    selector,
+                    paths,
+                    frames,
+                    timeout_secs: timeout,
+                },
+                cli.json,
+            );
+        }
+
         Command::Type {
             instance_id,
             page_id,
@@ -609,7 +639,7 @@ fn split_once_trimmed(s: &str, sep: char) -> Option<(String, String)> {
     Some((name.to_string(), value.trim().to_string()))
 }
 
-/// Resolve screenshot destinations against the client's cwd, not the daemon's.
+/// Resolve file paths against the client's cwd, not the daemon's.
 fn absolute_output_path(path: &str) -> std::io::Result<String> {
     let path = std::path::Path::new(path);
     let absolute = if path.is_absolute() {
@@ -698,6 +728,43 @@ mod tests {
             absolute_output_path(absolute.to_str().unwrap()).unwrap(),
             absolute.to_string_lossy()
         );
+    }
+
+    #[test]
+    fn upload_requires_paths_and_accepts_nested_frames_and_timeout() {
+        assert!(Cli::try_parse_from(["camoufox", "upload", "i", "p1", "input"]).is_err());
+        let cli = Cli::try_parse_from([
+            "camoufox",
+            "upload",
+            "i",
+            "p1",
+            "host >>> input",
+            "fixture.txt",
+            "second.pdf",
+            "--frame",
+            "#outer",
+            "--frame",
+            "#inner",
+            "--timeout",
+            "17",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Upload {
+                paths,
+                frames,
+                timeout,
+                ..
+            } => {
+                assert_eq!(paths, ["fixture.txt", "second.pdf"]);
+                assert_eq!(frames, ["#outer", "#inner"]);
+                assert_eq!(timeout, 17);
+            }
+            _ => panic!("expected upload command"),
+        }
+        let cli =
+            Cli::try_parse_from(["camoufox", "upload", "i", "p1", "input", "fixture.txt"]).unwrap();
+        assert!(matches!(cli.command, Command::Upload { timeout: 30, .. }));
     }
 
     #[test]

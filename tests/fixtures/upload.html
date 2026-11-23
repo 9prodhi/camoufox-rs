@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>File input fixture</title></head>
+<body>
+<input id="single" type="file">
+<input id="multiple" type="file" multiple>
+<input id="hidden" type="file" style="display:none">
+<input id="text" type="text">
+<div id="other"></div>
+<div id="host"></div>
+<div id="no-root"></div>
+__FRAME__
+<script>
+  const root = document.querySelector('#host').attachShadow({mode: 'open'});
+  root.innerHTML = '<input id="shadow-file" type="file">';
+  for (const el of [...document.querySelectorAll('input'), ...root.querySelectorAll('input')]) {
+    for (const type of ['input', 'change']) {
+      el.addEventListener(type, () => {
+        el.dataset[type] = String(Number(el.dataset[type] || 0) + 1);
+        el.dataset[type + 'Names'] = JSON.stringify(Array.from(el.files || [], file => file.name));
+      });
+    }
+  }
+</script>
+</body>
+</html>

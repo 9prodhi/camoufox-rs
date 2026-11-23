@@ -16,6 +16,41 @@ use std::time::Duration;
 
 use tiny_http::{Header, Response, Server};
 
+/// Serves file inputs in the main document, nested same-origin frames, and an
+/// open shadow root. Each input records its input/change events and filenames.
+#[cfg(feature = "cli")]
+pub struct UploadServer {
+    pub url: String,
+    _server: Arc<Server>,
+}
+
+#[cfg(feature = "cli")]
+impl UploadServer {
+    pub fn start() -> Self {
+        let server = Arc::new(Server::http("127.0.0.1:0").expect("bind upload server"));
+        let url = format!("http://{}/", server.server_addr().to_ip().unwrap());
+        let worker = Arc::clone(&server);
+        thread::spawn(move || {
+            for request in worker.incoming_requests() {
+                let frame = match request.url() {
+                    "/" => r#"<iframe id="outer" src="/outer.html"></iframe>"#,
+                    "/outer.html" => r#"<iframe id="inner" src="/inner.html"></iframe>"#,
+                    _ => "",
+                };
+                let html = include_str!("upload.html").replace("__FRAME__", frame);
+                let response = Response::from_string(html).with_header(
+                    Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap(),
+                );
+                let _ = request.respond(response);
+            }
+        });
+        Self {
+            url,
+            _server: server,
+        }
+    }
+}
+
 const MAIN_HTML_TEMPLATE: &str = include_str!("main.html");
 const IFRAME_HTML: &str = include_str!("iframe.html");
 const MAIN_DELAY: Duration = Duration::from_millis(50);

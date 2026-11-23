@@ -102,6 +102,7 @@ Commands that return a void result (such as `stop` and `shutdown`) return `{"ok"
 | [`cookie`](#cookie) | Set a cookie for the instance's browser context: `name=value` |
 | [`header`](#header) | Set an extra HTTP request header for a page: `Name: value` |
 | [`fill`](#fill) | Focus the element matching a selector, clear it, and type a value into it |
+| [`upload`](#upload) | Set files on a file input, including hidden inputs |
 | [`type`](#type) | Type text into whatever element currently has focus |
 | [`press`](#press) | Press a named key (Enter, Tab, Escape, ArrowDown, a, 1, …) |
 | [`hover`](#hover) | Move the mouse over the element matching a selector (no click) |
@@ -715,6 +716,44 @@ JSON output shape:
   "value": "admin"
 }
 ```
+
+### `upload`
+
+Set the files of an `<input type="file">`, including hidden inputs. The browser
+dispatches `input` and `change` events after updating the file list.
+
+```text
+Usage: camoufox upload [OPTIONS] <INSTANCE_ID> <PAGE_ID> <SELECTOR> <PATH>...
+```
+
+- `<INSTANCE_ID>`: Instance ID.
+- `<PAGE_ID>`: Page ID.
+- `<SELECTOR>`: CSS selector of the file input. Supports ` >>> ` to pierce open shadow roots.
+- `<PATH>...`: One or more regular files. Relative paths resolve against the client's working directory. Multiple files require the input's `multiple` attribute. Each upload replaces the previous selection.
+- `--frame <FRAMES>`: Scope to an iframe matching this selector (repeatable for nested iframes).
+- `--timeout <TIMEOUT>`: Overall command timeout in seconds [default: `30`].
+- `--socket <SOCKET>`: Path to the daemon Unix socket.
+- `--json`: Output as JSON.
+
+Plain output prints one uploaded basename per line. JSON output shape (inside `data`):
+
+```json
+{
+  "uploaded": true,
+  "selector": "input#file",
+  "files": ["fixture.pdf"]
+}
+```
+
+```bash
+camoufox upload <instance_id> <page_id> '#file' ./fixture.pdf
+camoufox upload <instance_id> <page_id> '#host >>> input' ./one.txt ./two.txt \
+    --frame '#outer' --frame '#inner'
+```
+
+Missing selectors report `selector not found: <selector>`. Non-file elements,
+missing or non-regular paths, and multiple files on a single-file input report
+`invalid argument: ...`. File paths are checked before accessing the page.
 
 ### `type`
 

@@ -387,6 +387,25 @@ pub enum Command {
         frames: Vec<String>,
     },
 
+    /// Set files on a file input, including hidden inputs.
+    Upload {
+        /// Instance ID.
+        instance_id: String,
+        /// Page ID.
+        page_id: String,
+        /// CSS selector of the file input. Supports ` >>> ` shadow piercing.
+        selector: String,
+        /// Files to upload, resolved against the client's working directory.
+        #[arg(required = true, num_args = 1.., value_name = "PATH")]
+        paths: Vec<String>,
+        /// Scope to an iframe matching this selector (repeatable for nested iframes).
+        #[arg(long = "frame", action = clap::ArgAction::Append)]
+        frames: Vec<String>,
+        /// Overall command timeout in seconds.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+    },
+
     /// Type text into whatever element currently has focus.
     Type {
         /// Instance ID.

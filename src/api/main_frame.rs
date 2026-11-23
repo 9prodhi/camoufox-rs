@@ -1409,13 +1409,31 @@ impl MainFrame {
         object_id: &str,
         files: &[&str],
     ) -> Result<(), ProtocolError> {
-        self.session().send(
+        self.set_file_input_files_with_timeout(frame_id, object_id, files, Duration::from_secs(60))
+    }
+
+    /// Set files for a file input within an explicit command budget.
+    ///
+    /// Juggler dispatches `input` and `change` after setting the files.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProtocolError`] if the command fails or times out.
+    pub fn set_file_input_files_with_timeout(
+        &self,
+        frame_id: &str,
+        object_id: &str,
+        files: &[&str],
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
+        self.session().send_with_timeout(
             "Page.setFileInputFiles",
             json!({
                 "frameId": frame_id,
                 "objectId": object_id,
                 "files": files,
             }),
+            timeout,
         )?;
         Ok(())
     }
@@ -1985,12 +2003,22 @@ impl MainFrame {
         execution_context_id: &str,
         object_id: &str,
     ) -> Result<(), ProtocolError> {
-        self.session().send(
+        self.dispose_object_with_timeout(execution_context_id, object_id, Duration::from_secs(60))
+    }
+
+    pub(crate) fn dispose_object_with_timeout(
+        &self,
+        execution_context_id: &str,
+        object_id: &str,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
+        self.session().send_with_timeout(
             "Runtime.disposeObject",
             json!({
                 "executionContextId": execution_context_id,
                 "objectId": object_id,
             }),
+            timeout,
         )?;
         Ok(())
     }
@@ -2842,6 +2870,30 @@ mod tests {
             out_rx,
             closed,
         }
+    }
+
+    #[test]
+    fn set_file_input_files_uses_frame_object_and_command_budget() {
+        let h = build_mock_frame("upload", "main");
+        let started = Instant::now();
+        let error = h
+            .frame
+            .set_file_input_files_with_timeout(
+                "child",
+                "input-object",
+                &["/tmp/fixture.txt"],
+                Duration::from_millis(30),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, ProtocolErrorKind::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let sent = h.out_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(sent["method"], "Page.setFileInputFiles");
+        assert_eq!(
+            sent["params"],
+            json!({"frameId":"child", "objectId":"input-object", "files":["/tmp/fixture.txt"]})
+        );
+        h.closed.store(true, Ordering::SeqCst);
     }
 
     #[test]

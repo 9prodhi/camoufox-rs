@@ -695,18 +695,21 @@ impl NetworkState {
         result
     }
 
-    fn close(&mut self, deadline: Instant) {
+    fn close(&mut self, deadline: Instant) -> Option<(&'static str, Result<Value, String>)> {
         self.closed = true;
-        if let Some(session) = self.session.take() {
+        self.session.take().map(|session| {
             set_deadline(&session.finalize_deadline, deadline);
             let recording = session.recording;
             let result = session.stop();
-            if recording {
-                self.last_record_stop = Some(result);
+            let mode = if recording {
+                self.last_record_stop = Some(result.clone());
+                "record"
             } else {
-                self.last_replay_stop = Some(result);
-            }
-        }
+                self.last_replay_stop = Some(result.clone());
+                "replay"
+            };
+            (mode, result)
+        })
     }
 }
 
@@ -722,16 +725,6 @@ impl ClosedResults {
             record: state.last_record_stop.clone(),
             replay: state.last_replay_stop.clone(),
         }
-    }
-
-    fn errors(&self, page_id: &str) -> Vec<Value> {
-        [("record", &self.record), ("replay", &self.replay)]
-            .into_iter()
-            .filter_map(|(mode, result)| match result {
-                Some(Err(error)) => Some(json!({"page_id":page_id, "mode":mode, "error":error})),
-                _ => None,
-            })
-            .collect()
     }
 }
 
@@ -835,8 +828,9 @@ impl NetworkSessions {
         }
         for page in pages {
             if let Some(state) = page.state.upgrade() {
-                let results = close_network_state_before(&state, finalize.deadline);
-                registry.close_errors.extend(results.errors(&page.page_id));
+                let (results, errors) =
+                    close_network_state(&state, &page.page_id, || finalize.deadline);
+                registry.close_errors.extend(errors);
                 registry.remember(&page.page_id, results);
             }
         }
@@ -854,8 +848,7 @@ impl NetworkSessions {
             .finalize_budget;
         // Start only after acquiring page state: concurrent replay validation
         // or record stop must not consume this page's finalization budget.
-        let results = close_network_state(state, budget);
-        let errors = results.errors(page_id);
+        let (results, errors) = close_network_state(state, page_id, || Instant::now() + budget);
         registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -883,20 +876,24 @@ fn set_deadline(deadline: &Mutex<Option<Instant>>, end: Instant) {
 }
 
 /// Close page state without closing the browser shared by other pages.
-fn close_network_state(state: &Mutex<NetworkState>, budget: Duration) -> ClosedResults {
+fn close_network_state(
+    state: &Mutex<NetworkState>,
+    page_id: &str,
+    deadline: impl FnOnce() -> Instant,
+) -> (ClosedResults, Vec<Value>) {
     let mut state = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.close(Instant::now() + budget);
-    ClosedResults::from_state(&state)
-}
-
-fn close_network_state_before(state: &Mutex<NetworkState>, deadline: Instant) -> ClosedResults {
-    let mut state = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.close(deadline);
-    ClosedResults::from_state(&state)
+    let errors = state
+        .close(deadline())
+        .into_iter()
+        .filter_map(|(mode, result)| {
+            result
+                .err()
+                .map(|error| json!({"page_id":page_id, "mode":mode, "error":error}))
+        })
+        .collect();
+    (ClosedResults::from_state(&state), errors)
 }
 
 /// One watchdog covers the whole drain, including all queued body reads.

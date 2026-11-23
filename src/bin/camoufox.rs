@@ -663,14 +663,14 @@ fn dispatch_external(sock: &std::path::Path, args: &[String]) -> ! {
         }
     }
 
-    // Not found: behave exactly like clap's default "unrecognized subcommand" error.
-    let mut cmd = Cli::command();
-    let name_str = args.first().map(String::as_str).unwrap_or("");
-    let err = cmd.error(
-        clap::error::ErrorKind::InvalidSubcommand,
-        format!("unrecognized subcommand '{name_str}'"),
-    );
-    err.exit();
+    // Reparse the original argv so clap supplies its native error and suggestions.
+    Cli::command()
+        // The derive-configured value parser would re-enable external subcommands.
+        .external_subcommand_value_parser(None)
+        .allow_external_subcommands(false)
+        .try_get_matches()
+        .expect_err("unresolved external subcommands must be rejected by clap")
+        .exit();
 }
 
 /// Split `s` on the first `sep`, trimming whitespace around both halves.

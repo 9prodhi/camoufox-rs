@@ -128,6 +128,24 @@ fn external_dispatch_unknown_name_matches_pinned_clap_error() {
 }
 
 #[test]
+fn external_dispatch_near_miss_preserves_clap_suggestions() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let output = Command::new(camoufox_bin())
+        .env("PATH", temp_dir.path())
+        .arg("navgate")
+        .output()
+        .expect("run camoufox");
+
+    assert_eq!(output.status.code(), Some(2), "exit code must be 2");
+    assert!(output.stdout.is_empty(), "stdout must be empty");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert!(
+        stderr.contains("\n\n  tip: some similar subcommands exist: 'evaluate', 'navigate'\n\n"),
+        "stderr must contain clap's suggestion line and surrounding blank lines, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn external_dispatch_path_separator_rejected_as_unrecognized() {
     let output = Command::new(camoufox_bin())
         .arg("some/path")

@@ -68,6 +68,11 @@ pub enum Command {
         /// JavaScript dialog handling policy.
         #[arg(long, value_enum, default_value = "manual")]
         dialogs: DialogMode,
+        /// Persistent profile directory (must be absolute path).
+        /// Created with mode 0700 if it does not exist.
+        /// Omit to use an isolated temporary directory (deleted when the instance stops).
+        #[arg(long)]
+        profile_dir: Option<PathBuf>,
     },
 
     /// Accept or dismiss an open JavaScript dialog.
@@ -514,4 +519,86 @@ pub enum Command {
         #[arg(long)]
         wait: Option<u64>,
     },
+
+    /// External subcommand: `camoufox <name> [args...]` runs `camoufox-<name>` from PATH.
+    ///
+    /// Built-in subcommand names always win. When `<name>` is not a built-in,
+    /// the binary `camoufox-<name>` is looked up on `PATH` and executed with the
+    /// remaining arguments, inheriting stdio, the current environment, and
+    /// `CAMOUFOX_SOCKET` set to the resolved daemon socket path.
+    /// Exit code mirrors the child (signal → 128+n on Unix).
+    ///
+    /// Names containing path separators are treated as not found.
+    #[command(external_subcommand)]
+    External(Vec<String>),
+}
+
+/// Look up an external subcommand executable on `PATH`.
+///
+/// Returns `Some(path)` if `camoufox-<name>` is found on `PATH` and is an
+/// executable file. Returns `None` if `name` is empty, contains path
+/// separators, or is not found on `PATH`.
+pub fn find_external_subcommand(name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(std::path::is_separator) {
+        return None;
+    }
+
+    let bin_name = format!("camoufox-{name}");
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(&bin_name);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = candidate.metadata() {
+                if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) {
+                    return Some(candidate);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_external_subcommand_rejects_empty_and_separators() {
+        assert!(find_external_subcommand("").is_none());
+        assert!(find_external_subcommand("foo/bar").is_none());
+        assert!(find_external_subcommand("../cmd").is_none());
+    }
+
+    #[test]
+    fn find_external_subcommand_locates_binary_on_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin_path = temp.path().join("camoufox-testxyz");
+        std::fs::write(&bin_path, "#!/bin/sh\nexit 0\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let orig_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = temp.path().as_os_str().to_os_string();
+        new_path.push(":");
+        new_path.push(&orig_path);
+
+        // Safety note: tests run in process; PATH changes are safe here for this check.
+        std::env::set_var("PATH", &new_path);
+        let found = find_external_subcommand("testxyz");
+        std::env::set_var("PATH", orig_path);
+
+        assert_eq!(found, Some(bin_path));
+    }
 }

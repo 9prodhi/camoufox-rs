@@ -32,6 +32,11 @@ pub enum DaemonRequest {
         bypass_csp: bool,
         #[serde(default)]
         dialogs: crate::api::DialogPolicy,
+        /// Persistent profile directory. When set, the directory is used as-is
+        /// and is never deleted when the instance stops.
+        /// When absent, an isolated temporary directory is used (deleted on stop).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_dir: Option<String>,
     },
 
     /// Accept or dismiss a page's open JavaScript dialog.
@@ -694,6 +699,7 @@ mod tests {
             downloads_dir: None,
             bypass_csp: false,
             dialogs: Default::default(),
+            profile_dir: None,
         };
         assert_eq!(launch.read_timeout().as_secs(), 210);
     }

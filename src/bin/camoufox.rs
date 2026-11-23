@@ -1,6 +1,6 @@
 //! Camoufox CLI binary entrypoint.
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use camoufox::cli::client::send_request;
 use camoufox::cli::commands::{Cli, Command};
@@ -27,6 +27,7 @@ fn main() {
             downloads_dir,
             bypass_csp,
             dialogs,
+            profile_dir,
         } => {
             let request = DaemonRequest::Launch {
                 headless: Some(!headed),
@@ -34,6 +35,7 @@ fn main() {
                 downloads_dir,
                 bypass_csp,
                 dialogs: dialogs.into(),
+                profile_dir: profile_dir.map(|p| p.to_string_lossy().into_owned()),
             };
             run_client(&sock, &request, cli.json);
         }
@@ -624,7 +626,51 @@ fn main() {
                 cli.json,
             );
         }
+
+        Command::External(args) => {
+            dispatch_external(&sock, &args);
+        }
     }
+}
+
+/// Dispatches an external subcommand or exits with clap's unrecognized subcommand error.
+fn dispatch_external(sock: &std::path::Path, args: &[String]) -> ! {
+    if let Some(name) = args.first() {
+        if !name.contains(std::path::is_separator) {
+            if let Some(binary) = camoufox::cli::commands::find_external_subcommand(name) {
+                let status = std::process::Command::new(&binary)
+                    .args(&args[1..])
+                    .env("CAMOUFOX_SOCKET", sock.to_string_lossy().as_ref())
+                    .status()
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: failed to execute external subcommand: {e}");
+                        std::process::exit(1);
+                    });
+
+                #[cfg(unix)]
+                let exit_code = {
+                    use std::os::unix::process::ExitStatusExt;
+                    status
+                        .code()
+                        .or_else(|| status.signal().map(|s| 128 + s))
+                        .unwrap_or(1)
+                };
+                #[cfg(not(unix))]
+                let exit_code = status.code().unwrap_or(1);
+
+                std::process::exit(exit_code);
+            }
+        }
+    }
+
+    // Not found: behave exactly like clap's default "unrecognized subcommand" error.
+    let mut cmd = Cli::command();
+    let name_str = args.first().map(String::as_str).unwrap_or("");
+    let err = cmd.error(
+        clap::error::ErrorKind::InvalidSubcommand,
+        format!("unrecognized subcommand '{name_str}'"),
+    );
+    err.exit();
 }
 
 /// Split `s` on the first `sep`, trimming whitespace around both halves.

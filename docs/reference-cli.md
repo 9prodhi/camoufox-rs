@@ -140,6 +140,7 @@ Usage: camoufox launch [OPTIONS]
 - `--downloads-dir <DOWNLOADS_DIR>`: Directory to save downloads to (must be absolute; defaults to cancel).
 - `--bypass-csp`: Disable page Content-Security-Policy (needed for `--main-world` on strict-CSP sites; detectable by pages).
 - `--dialogs <DIALOGS>`: JavaScript dialog handling policy (`manual`, `accept`, `dismiss`) [default: `manual`].
+- `--profile-dir <PROFILE_DIR>`: Persistent profile directory (must be absolute path). Created with mode 0700 if missing; an existing directory with looser permissions is tightened to 0700 on Unix. Persistent profiles are never deleted on stop or shutdown.
 - `--socket <SOCKET>`: Path to the daemon Unix socket.
 - `--json`: Output as JSON.
 
@@ -191,7 +192,7 @@ Usage: camoufox list [OPTIONS]
 - `--socket <SOCKET>`: Path to the daemon Unix socket.
 - `--json`: Output as JSON.
 
-Text mode prints one line per instance formatted as `<instance_id>  pid=<pid>  version=<version>  pages=[<pages>]` (or `no running instances` if empty).
+Text mode prints one line per instance formatted as `<instance_id>  pid=<pid>  version=<version>  pages=[<pages>]` (appended with `profile_dir=<profile_dir>` when persistent, or `no running instances` if empty).
 
 JSON output shape:
 ```json
@@ -201,11 +202,13 @@ JSON output shape:
       "instance_id": "00000001",
       "pid": 3511172,
       "version": "Firefox/158.0.1-beta.41",
-      "pages": []
+      "pages": [],
+      "profile_dir": "/path/to/profile"
     }
   ]
 }
 ```
+Note: `profile_dir` is present only when the instance was launched with a persistent profile directory (`--profile-dir`).
 
 ### `stop`
 
@@ -963,3 +966,18 @@ JSON output shape:
 }
 ```
 Each entry in the `downloads` array is a `DownloadEntry` object.
+
+### External Subcommands
+
+`camoufox` supports git/cargo-style external subcommands. When an unrecognized command name `<name>` is invoked, `camoufox` searches for an executable binary named `camoufox-<name>` on `PATH`:
+
+```bash
+camoufox custom-tool --flag arg
+```
+
+If found, `camoufox` executes the binary with the remaining arguments, inheriting standard input/output/error, passing the current environment, and setting:
+- `CAMOUFOX_SOCKET`: The resolved filesystem path to the daemon Unix socket (respecting global `--socket`).
+
+The exit code mirrors the child process exit code (or `128 + signal` if terminated by a signal on Unix).
+
+Built-in command names always win over external binaries. Subcommand names containing path separators (such as `/`) are rejected as unrecognized subcommands. If no matching executable is found on `PATH`, `camoufox` exits with status 2 and clap's standard unrecognized subcommand error.

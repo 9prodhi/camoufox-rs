@@ -386,6 +386,10 @@ pub struct LaunchOptions {
     pub bypass_csp: bool,
     /// Policy for JavaScript dialogs.
     pub dialogs: DialogPolicy,
+    /// Persistent profile directory. When `Some`, the directory is used as-is
+    /// (created with mode 0700 if absent) and is never deleted on stop.
+    /// When `None`, a temporary directory is used and deleted on stop.
+    pub profile_dir: Option<String>,
 }
 
 impl LaunchOptions {
@@ -425,6 +429,102 @@ fn interaction_error(error: ProtocolError, operation: &str) -> Result<Interactio
     }
 }
 
+/// Owns the lifecycle of a browser profile directory.
+pub(crate) enum ProfileDir {
+    /// Persistent directory: not removed on drop.
+    Persistent(PathBuf),
+    /// Temporary directory: removed on drop.
+    Temp(tempfile::TempDir),
+}
+
+impl ProfileDir {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Persistent(p) => p.as_path(),
+            Self::Temp(t) => t.path(),
+        }
+    }
+
+    fn is_persistent(&self) -> bool {
+        matches!(self, Self::Persistent(_))
+    }
+}
+
+/// Prepares a persistent profile directory:
+/// - Must be an absolute path.
+/// - Created with mode 0700 if missing.
+/// - Existing directory with looser permissions is tightened to 0700 (Unix).
+/// - Returns the canonical path.
+pub fn prepare_profile_dir(path_str: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path_str);
+    if !path.is_absolute() {
+        return Err("invalid argument: --profile-dir must be an absolute path".to_string());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !path.exists() {
+            std::fs::create_dir_all(&path).map_err(|e| {
+                format!("failed to create profile directory {}: {e}", path.display())
+            })?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| {
+                    format!(
+                        "failed to set permissions on profile directory {}: {e}",
+                        path.display()
+                    )
+                },
+            )?;
+        } else {
+            let meta = std::fs::metadata(&path).map_err(|e| {
+                format!(
+                    "failed to inspect profile directory {}: {e}",
+                    path.display()
+                )
+            })?;
+            if !meta.is_dir() {
+                return Err(format!(
+                    "invalid argument: profile directory {} is not a directory",
+                    path.display()
+                ));
+            }
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |e| {
+                        format!(
+                            "failed to set permissions on profile directory {}: {e}",
+                            path.display()
+                        )
+                    },
+                )?;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if !path.exists() {
+            std::fs::create_dir_all(&path).map_err(|e| {
+                format!("failed to create profile directory {}: {e}", path.display())
+            })?;
+        } else if !path.is_dir() {
+            return Err(format!(
+                "invalid argument: profile directory {} is not a directory",
+                path.display()
+            ));
+        }
+    }
+
+    path.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize profile directory {}: {e}",
+            path.display()
+        )
+    })
+}
+
 /// A running Camoufox browser instance managed by the daemon.
 pub struct Instance {
     instance_id: String,
@@ -432,7 +532,11 @@ pub struct Instance {
     pub child: Child,
     pub version: Option<String>,
     pub pid: u32,
-    _profile_dir: tempfile::TempDir,
+    /// Profile directory handle. `Persistent` keeps the directory after stop;
+    /// `Temp` deletes it when the handle is dropped.
+    profile_dir: ProfileDir,
+    /// Canonical path of the profile directory, used for collision detection.
+    pub profile_dir_path: Option<PathBuf>,
     pages: HashMap<String, ManagedMainFrame>,
     closed_pages: HashSet<String>,
     closed_pages_order: VecDeque<String>,
@@ -1809,15 +1913,24 @@ impl Instance {
             browser,
             mut child,
             close_timeout,
-            _profile_dir,
+            profile_dir,
             ..
         } = self;
         let _ = browser.close();
         let result = crate::process::lifecycle::graceful_shutdown(&mut child, close_timeout)
             .map_err(|e| format!("failed to stop browser: {e}"));
         // Keep the profile alive through kill + wait, including error paths.
-        drop(_profile_dir);
+        drop(profile_dir);
         result
+    }
+
+    /// Returns the canonical profile directory path if persistent, else `None`.
+    pub fn persistent_profile_dir(&self) -> Option<&std::path::Path> {
+        if self.profile_dir.is_persistent() {
+            self.profile_dir_path.as_deref()
+        } else {
+            None
+        }
     }
 }
 
@@ -1916,8 +2029,35 @@ impl InstanceManager {
         }
 
         let instance_id = format!("{:08x}", self.counter.fetch_add(1, Ordering::Relaxed) + 1);
-        let profile_dir =
-            tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+        let (profile_dir, profile_dir_path) = match &options.profile_dir {
+            Some(dir_str) => {
+                let canonical = prepare_profile_dir(dir_str)?;
+                let instances = self
+                    .instances
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (id, entry) in instances.iter() {
+                    let managed = entry
+                        .managed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(inst) = &managed.instance {
+                        if inst.profile_dir_path.as_ref() == Some(&canonical) {
+                            return Err(format!(
+                                "invalid argument: profile directory already in use by instance {id}"
+                            ));
+                        }
+                    }
+                }
+                (ProfileDir::Persistent(canonical.clone()), Some(canonical))
+            }
+            None => {
+                let temp =
+                    tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+                let canonical = temp.path().canonicalize().ok();
+                (ProfileDir::Temp(temp), canonical)
+            }
+        };
         let headless = options.headless;
 
         let executable = options
@@ -1972,7 +2112,8 @@ impl InstanceManager {
             child: child.into_child(),
             version: version.clone(),
             pid,
-            _profile_dir: profile_dir,
+            profile_dir,
+            profile_dir_path,
             pages: HashMap::new(),
             closed_pages: HashSet::new(),
             closed_pages_order: VecDeque::new(),
@@ -2021,12 +2162,16 @@ impl InstanceManager {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(inst) = &entry.instance {
-                result.push(json!({
+                let mut item = json!({
                     "instance_id": id,
                     "pid": inst.pid,
                     "version": inst.version,
                     "pages": inst.page_ids(),
-                }));
+                });
+                if let Some(profile_dir) = inst.persistent_profile_dir() {
+                    item["profile_dir"] = json!(profile_dir.to_string_lossy());
+                }
+                result.push(item);
             }
         }
         result.sort_by(|a, b| {
@@ -3175,7 +3320,8 @@ mod tests {
             child,
             version: None,
             pid: 0,
-            _profile_dir: tempfile::tempdir().unwrap(),
+            profile_dir: ProfileDir::Temp(tempfile::tempdir().unwrap()),
+            profile_dir_path: None,
             pages: HashMap::from([(
                 "p1".into(),
                 ManagedMainFrame {
@@ -3208,5 +3354,75 @@ mod tests {
         drop(context);
         drop(tx);
         drop(conn);
+    }
+
+    #[test]
+    fn prepare_profile_dir_rejects_relative_path() {
+        let err = prepare_profile_dir("relative/path").unwrap_err();
+        assert_eq!(
+            err,
+            "invalid argument: --profile-dir must be an absolute path"
+        );
+    }
+
+    #[test]
+    fn prepare_profile_dir_creates_missing_dir_with_mode_0700() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("missing_profile_subdir");
+        assert!(!target.exists());
+
+        let canonical = prepare_profile_dir(target.to_str().unwrap()).unwrap();
+        assert!(canonical.exists());
+        assert!(canonical.is_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&canonical).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "created directory permissions must be 0700");
+        }
+    }
+
+    #[test]
+    fn prepare_profile_dir_tightens_looser_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("loose_profile");
+        std::fs::create_dir_all(&target).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let meta = std::fs::metadata(&target).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o777);
+
+            let canonical = prepare_profile_dir(target.to_str().unwrap()).unwrap();
+            let meta = std::fs::metadata(&canonical).unwrap();
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o700,
+                "looser permissions must be tightened to 0700"
+            );
+        }
+
+        #[cfg(not(unix))]
+        {
+            let canonical = prepare_profile_dir(target.to_str().unwrap()).unwrap();
+            assert!(canonical.is_dir());
+        }
+    }
+
+    #[test]
+    fn prepare_profile_dir_rejects_existing_non_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("some_file");
+        std::fs::write(&file_path, "not a directory").unwrap();
+
+        let err = prepare_profile_dir(file_path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("is not a directory"),
+            "expected non-directory error, got: {err}"
+        );
     }
 }

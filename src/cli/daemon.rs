@@ -324,6 +324,7 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
             downloads_dir,
             bypass_csp,
             dialogs,
+            profile_dir,
         } => respond(
             mgr.launch_with(&LaunchOptions {
                 headless,
@@ -331,6 +332,7 @@ fn dispatch(request: DaemonRequest, mgr: &InstanceManager) -> DaemonResponse {
                 downloads_dir,
                 bypass_csp,
                 dialogs,
+                profile_dir,
             })
             .map(|(instance_id, version, pid)| {
                 json!({"instance_id": instance_id, "version": version, "pid": pid})

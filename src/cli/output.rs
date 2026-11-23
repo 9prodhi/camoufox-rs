@@ -219,7 +219,11 @@ pub fn render(data: Option<&Value>) -> Rendered {
                             .join(",")
                     })
                     .unwrap_or_default();
-                format!("{id}  pid={pid}  version={version}  pages=[{pages}]")
+                let mut line = format!("{id}  pid={pid}  version={version}  pages=[{pages}]");
+                if let Some(profile_dir) = inst.get("profile_dir").and_then(|v| v.as_str()) {
+                    line.push_str(&format!("  profile_dir={profile_dir}"));
+                }
+                line
             })
             .collect();
         return Rendered::out(lines.join("\n"));
@@ -544,5 +548,34 @@ mod tests {
     fn downloads_renders_no_downloads_when_empty() {
         let rendered = render(Some(&json!({ "downloads": [] })));
         assert_eq!(rendered.stdout, "no downloads");
+    }
+
+    #[test]
+    fn list_renders_profile_dir_only_when_present() {
+        let data = json!({
+            "instances": [
+                {
+                    "instance_id": "00000001",
+                    "pid": 100,
+                    "version": "Firefox/150",
+                    "pages": ["p1"],
+                    "profile_dir": "/abs/profile"
+                },
+                {
+                    "instance_id": "00000002",
+                    "pid": 200,
+                    "version": "Firefox/150",
+                    "pages": []
+                }
+            ]
+        });
+        let rendered = render(Some(&data));
+        let lines: Vec<&str> = rendered.stdout.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "00000001  pid=100  version=Firefox/150  pages=[p1]  profile_dir=/abs/profile"
+        );
+        assert_eq!(lines[1], "00000002  pid=200  version=Firefox/150  pages=[]");
     }
 }

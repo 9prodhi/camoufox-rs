@@ -2998,6 +2998,9 @@ impl InstanceManager {
 mod phase_tests;
 
 #[cfg(test)]
+mod network_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3665,6 +3668,80 @@ mod tests {
         assert!(
             !dir.exists(),
             "a missing instance must not create a cassette directory"
+        );
+    }
+
+    #[test]
+    fn prepare_profile_dir_create_failure_is_io_and_precedes_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+        // Permission bits do not restrict root; the assertion needs a normal user.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("read-only");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let target = parent.join("profile");
+        let direct = prepare_profile_dir(target.to_str().unwrap()).unwrap_err();
+        let manager = InstanceManager::new();
+        let launched = manager
+            .launch_with(&LaunchOptions {
+                executable: Some("/nonexistent/camoufox-test-binary".into()),
+                profile_dir: Some(target.display().to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for error in [direct, launched] {
+            assert!(
+                error.starts_with(&format!(
+                    "failed to create profile directory {}: ",
+                    target.display()
+                )),
+                "{error}"
+            );
+            assert_eq!(
+                crate::cli::ipc::DaemonResponse::err(error).kind.as_deref(),
+                Some("io")
+            );
+        }
+        assert!(!target.exists());
+        assert!(manager.list().is_empty());
+        // The failed launch released its reservation: a retry gets the
+        // same I/O error rather than "already in use".
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let retry = prepare_profile_dir(target.to_str().unwrap()).unwrap_err();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(retry.starts_with("failed to create profile directory "));
+    }
+
+    #[test]
+    fn prepare_profile_dir_permission_failure_is_io() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // A group/world-accessible directory owned by another user cannot be
+        // tightened. Only run where that is guaranteed: never as root (which
+        // could chmod it) and only on a directory this user does not own.
+        let uid = unsafe { libc::geteuid() };
+        let foreign = Path::new("/usr");
+        let Ok(meta) = std::fs::metadata(foreign) else {
+            return;
+        };
+        if uid == 0 || meta.uid() == uid || meta.permissions().mode() & 0o077 == 0 {
+            return;
+        }
+        let error = prepare_profile_dir("/usr").unwrap_err();
+        assert!(
+            error.starts_with("failed to set permissions on profile directory /usr: "),
+            "{error}"
+        );
+        assert_eq!(
+            crate::cli::ipc::DaemonResponse::err(error).kind.as_deref(),
+            Some("io")
+        );
+        assert_eq!(
+            std::fs::metadata(foreign).unwrap().permissions().mode(),
+            meta.permissions().mode()
         );
     }
 

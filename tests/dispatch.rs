@@ -289,6 +289,58 @@ fn external_dispatch_skips_non_executable_entries_and_missing_path() {
     }
 }
 
+/// Replaces the former in-process unit test that mutated PATH globally.
+#[cfg(unix)]
+#[test]
+fn external_dispatch_first_executable_on_path_wins_and_symlinks_resolve() {
+    let first = tempfile::tempdir().expect("first dir");
+    let second = tempfile::tempdir().expect("second dir");
+    let target = write_script(
+        first.path(),
+        "real-tool",
+        "#!/bin/sh\necho \"first $0\"\n",
+        0o755,
+    );
+    std::os::unix::fs::symlink(&target, first.path().join("camoufox-tool")).unwrap();
+    write_script(
+        second.path(),
+        "camoufox-tool",
+        "#!/bin/sh\necho second\n",
+        0o755,
+    );
+    let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+    let output = Command::new(camoufox_bin())
+        .env("PATH", &path)
+        .arg("tool")
+        .output()
+        .expect("run camoufox");
+    assert_eq!(output.status.code(), Some(0));
+    // The child is run by the PATH entry's own path, not the link target.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("first {}\n", first.path().join("camoufox-tool").display())
+    );
+
+    // Reversed order picks the other binary.
+    let path = std::env::join_paths([second.path(), first.path()]).unwrap();
+    let output = Command::new(camoufox_bin())
+        .env("PATH", &path)
+        .arg("tool")
+        .output()
+        .expect("run camoufox");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "second\n");
+
+    // A dangling symlink is skipped like a missing entry.
+    fs::remove_file(&target).unwrap();
+    let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+    let output = Command::new(camoufox_bin())
+        .env("PATH", &path)
+        .arg("tool")
+        .output()
+        .expect("run camoufox");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "second\n");
+}
+
 #[cfg(unix)]
 #[test]
 fn external_dispatch_exec_failure_exits_1_with_message() {

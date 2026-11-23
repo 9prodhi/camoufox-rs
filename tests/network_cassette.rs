@@ -791,3 +791,107 @@ fn cassette_skips_failed_and_non_http_requests_and_replay_restarts() {
     }
     manager.stop(&instance).unwrap();
 }
+
+/// Whether `pid` has exited (gone or a zombie awaiting its new parent).
+fn process_gone(pid: u64) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X')),
+    }
+}
+
+#[test]
+#[ignore]
+fn cassette_daemon_killed_mid_record_leaves_unpublished_cassette() {
+    let fixture = Fixture::start();
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("cassette");
+    let dir_arg = dir.to_str().unwrap();
+    let mut daemon = CliDaemon::new();
+    let launched = daemon.run(&["launch"], true);
+    let instance = launched["data"]["instance_id"].as_str().unwrap().to_owned();
+    let browser_pid = launched["data"]["pid"].as_u64().unwrap();
+    let page = daemon.run(&["new-page", &instance], true)["data"]["page_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    daemon.run(
+        &["record", "start", &instance, &page, "--dir", dir_arg],
+        true,
+    );
+    daemon.run(
+        &[
+            "navigate",
+            &instance,
+            &page,
+            &format!("{}/", fixture.origin),
+            "--wait-until",
+            "load",
+        ],
+        true,
+    );
+    daemon.run(
+        &[
+            "wait",
+            &instance,
+            &page,
+            "--selector",
+            "body[data-ready=yes]",
+        ],
+        true,
+    );
+    // Bodies are written as responses finish, so some exist before the kill.
+    assert!(std::fs::read_dir(dir.join("bodies")).unwrap().count() > 0);
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+
+    // Without the daemon, the cassette is never published.
+    assert!(!dir.join("index.json").exists());
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(leftovers, ["bodies"]);
+    // The browser exits once its protocol pipe closes.
+    let deadline = Instant::now() + TIMEOUT;
+    while !process_gone(browser_pid) {
+        assert!(
+            Instant::now() < deadline,
+            "browser {browser_pid} outlived its daemon"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // A fresh daemon refuses to replay or overwrite the partial cassette.
+    let daemon = CliDaemon::new();
+    let instance = daemon.run(&["launch"], true)["data"]["instance_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let page = daemon.run(&["new-page", &instance], true)["data"]["page_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let replay = daemon.run(
+        &["replay", "start", &instance, &page, "--dir", dir_arg],
+        false,
+    );
+    assert_eq!(replay["kind"], "invalid_argument", "{replay}");
+    assert!(replay["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("invalid argument: invalid cassette: "));
+    let record = daemon.run(
+        &["record", "start", &instance, &page, "--dir", dir_arg],
+        false,
+    );
+    assert_eq!(
+        record["error"],
+        "invalid argument: refusing non-empty cassette directory"
+    );
+    // The page is unaffected and replay is not active.
+    daemon.run(&["replay", "stop", &instance, &page], false);
+    daemon.run(&["stop", &instance], true);
+}

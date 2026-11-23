@@ -746,6 +746,46 @@ mod tests {
         assert!(matches!(request, DaemonRequest::Launch { .. }));
     }
 
+    #[test]
+    fn launch_profile_dir_wire_shape_and_round_trip() {
+        let launch = |profile_dir: Option<&str>| DaemonRequest::Launch {
+            headless: Some(true),
+            executable: None,
+            downloads_dir: None,
+            bypass_csp: false,
+            dialogs: Default::default(),
+            profile_dir: profile_dir.map(str::to_owned),
+        };
+        let with = serde_json::to_value(launch(Some("/data/profile"))).unwrap();
+        assert_eq!(with["method"], "Launch");
+        assert_eq!(with["params"]["profile_dir"], "/data/profile");
+        // Absent profile dirs are omitted so older daemons see the same payload.
+        let without = serde_json::to_value(launch(None)).unwrap();
+        assert!(without["params"].get("profile_dir").is_none(), "{without}");
+        for value in [with, without] {
+            let expected = value["params"]["profile_dir"].as_str().map(str::to_owned);
+            match serde_json::from_value(value).unwrap() {
+                DaemonRequest::Launch { profile_dir, .. } => assert_eq!(profile_dir, expected),
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+        // Explicit null means "no profile dir"; a non-string is rejected.
+        let request: DaemonRequest =
+            serde_json::from_value(json!({"method": "Launch", "params": {"profile_dir": null}}))
+                .unwrap();
+        assert!(matches!(
+            request,
+            DaemonRequest::Launch {
+                profile_dir: None,
+                ..
+            }
+        ));
+        assert!(serde_json::from_value::<DaemonRequest>(
+            json!({"method": "Launch", "params": {"profile_dir": 7}})
+        )
+        .is_err());
+    }
+
     /// `DaemonRequest::Cookies` serialises to the expected JSON shape and
     /// deserialises back to the same variant (round-trip).
     #[test]

@@ -585,6 +585,69 @@ mod tests {
     }
 
     #[test]
+    fn launch_forwards_profile_dir_through_dispatch() {
+        let daemon = TestDaemon::start();
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("fixture.pdf");
+        std::fs::write(&file, b"contents").unwrap();
+        let profile = temp.path().join("nested").join("profile");
+        let launch = |profile_dir: &str| {
+            daemon.request(DaemonRequest::Launch {
+                headless: Some(true),
+                // A nonexistent executable keeps the test browser-free while
+                // proving profile handling ran first.
+                executable: Some("/nonexistent/camoufox-test-binary".into()),
+                downloads_dir: None,
+                bypass_csp: false,
+                dialogs: Default::default(),
+                profile_dir: Some(profile_dir.into()),
+            })
+        };
+        let kind = |response: &DaemonResponse| {
+            serde_json::to_value(response).unwrap()["kind"]
+                .as_str()
+                .map(str::to_owned)
+        };
+        let relative = launch("relative/profile");
+        assert!(!relative.ok);
+        assert_eq!(
+            relative.error.as_deref(),
+            Some("invalid argument: --profile-dir must be an absolute path")
+        );
+        assert_eq!(kind(&relative).as_deref(), Some("invalid_argument"));
+        let not_dir = launch(file.to_str().unwrap());
+        assert!(not_dir
+            .error
+            .as_deref()
+            .unwrap()
+            .ends_with("is not a directory"));
+        assert_eq!(kind(&not_dir).as_deref(), Some("invalid_argument"));
+        // A valid profile dir is prepared (0700) before the spawn fails.
+        let spawn = launch(profile.to_str().unwrap());
+        assert!(
+            spawn
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("failed to spawn browser"),
+            "{spawn:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&profile).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let list = daemon.request(DaemonRequest::List);
+        assert_eq!(list.data.unwrap()["instances"], json!([]));
+        // The failed spawn released the reservation: retrying is not "in use".
+        let retry = launch(profile.to_str().unwrap());
+        assert!(retry
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("failed to spawn browser"));
+    }
+
+    #[test]
     fn idle_connection_does_not_block_ping() {
         // Holding an unrelated client connection open must not serialize Ping.
         let daemon = TestDaemon::start();

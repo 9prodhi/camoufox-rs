@@ -582,6 +582,74 @@ mod tests {
         }
     }
 
+    fn kind(error: &str) -> Option<String> {
+        crate::cli::ipc::DaemonResponse::err(error).kind
+    }
+
+    #[test]
+    fn cassette_store_write_error_is_io_and_leaves_no_index() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("cassette");
+        let mut recorder = Recorder::new(&dir, &[]).unwrap();
+        // Replace the reserved bodies/ directory with a regular file so the
+        // body write fails with ENOTDIR (independent of the caller's uid).
+        std::fs::remove_dir(dir.join("bodies")).unwrap();
+        std::fs::write(dir.join("bodies"), b"not a directory").unwrap();
+        let error = recorder.store(exchange(b"hello", 0), b"hello").unwrap_err();
+        assert!(
+            error.starts_with("io error: writing cassette body: "),
+            "{error}"
+        );
+        assert_eq!(kind(&error).as_deref(), Some("io"));
+        assert!(!dir.join("index.json").exists());
+        assert_eq!(
+            std::fs::read(dir.join("bodies")).unwrap(),
+            b"not a directory"
+        );
+    }
+
+    #[test]
+    fn cassette_finish_reports_temp_file_failure_as_io() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("cassette");
+        let mut recorder = Recorder::new(&dir, &[]).unwrap();
+        recorder.store(exchange(b"hello", 0), b"hello").unwrap();
+        // The cassette directory disappears before the index is written.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let error = recorder.finish().unwrap_err();
+        assert!(error.starts_with("io error: "), "{error}");
+        assert_eq!(kind(&error).as_deref(), Some("io"));
+        assert!(!dir.exists(), "finish must not recreate a removed cassette");
+    }
+
+    #[test]
+    fn cassette_finish_persist_failure_is_io_and_removes_temp_index() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("cassette");
+        let mut recorder = Recorder::new(&dir, &[]).unwrap();
+        recorder.store(exchange(b"hello", 0), b"hello").unwrap();
+        // A non-empty directory at index.json makes the atomic rename fail.
+        std::fs::create_dir_all(dir.join("index.json").join("occupied")).unwrap();
+        let error = recorder.finish().unwrap_err();
+        assert!(
+            error.starts_with("io error: finalizing cassette: "),
+            "{error}"
+        );
+        assert_eq!(kind(&error).as_deref(), Some("io"));
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            ["bodies", "index.json"],
+            "the temporary index must be cleaned up"
+        );
+        assert!(dir.join("index.json").join("occupied").is_dir());
+        assert!(load(&dir).unwrap_err().starts_with("invalid argument: "));
+    }
+
     #[test]
     fn cassette_replay_headers_drop_transfer_encoding_and_keep_order() {
         let headers = vec![

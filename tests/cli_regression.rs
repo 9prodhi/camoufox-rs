@@ -742,6 +742,63 @@ fn ping_daemon_not_running_json_shape() {
     assert_eq!(v["kind"], "daemon");
 }
 
+/// Run `camoufox <args>` from a working directory that is deleted first.
+fn run_in_removed_cwd(args: &[&str]) -> std::process::Output {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path().join("gone");
+    std::fs::create_dir(&cwd).unwrap();
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"cd "$1" && rmdir "$1" && shift && exec "$@""#)
+        .arg("sh")
+        .arg(&cwd)
+        .arg(bin())
+        .args(args)
+        .output()
+        .expect("run camoufox in a removed cwd")
+}
+
+#[test]
+fn upload_relative_path_with_removed_cwd_is_io_error() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let sock = tmp.path().join("d.sock");
+    let sock = sock.to_str().unwrap();
+    let upload = ["upload", "i", "p1", "#file", "fixture.pdf"];
+
+    let out = run_in_removed_cwd(&[&["--socket", sock][..], &upload].concat());
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("error: io error: resolve upload path: "),
+        "{stderr}"
+    );
+
+    let out = run_in_removed_cwd(&[&["--json", "--socket", sock][..], &upload].concat());
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert!(v["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("io error: resolve upload path: "));
+    assert_eq!(v["kind"], "io");
+
+    // Absolute paths never consult the cwd and reach the (absent) daemon.
+    let out = run_in_removed_cwd(&[
+        "--json",
+        "--socket",
+        sock,
+        "upload",
+        "i",
+        "p1",
+        "#file",
+        "/fixture.pdf",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_error_shape(&v, "daemon is not running (start with: camoufox serve)");
+}
+
 // ---------------------------------------------------------------------------
 // Requirement 4 — Browser integration goldens (ignored; require Camoufox)
 // ---------------------------------------------------------------------------
@@ -1337,4 +1394,78 @@ fn interception_off_by_default_note() {
     // with RUST_LOG=camoufox::protocol=trace routes protocol SEND/RECV logs to stderr.
     // `browser_integration_interception_off_by_default` and `browser_integration_full_session`
     // assert that no `setRequestInterception` command is sent during launch and navigation.
+}
+
+/// `camoufox launch --profile-dir` through the real binary and daemon: the
+/// flag is forwarded, `list` reports the canonical path in both output modes,
+/// aliases collide, and the directory outlives the instance.
+#[test]
+#[ignore]
+fn browser_cli_launch_profile_dir_is_listed_and_survives_stop() {
+    use std::os::unix::fs::PermissionsExt;
+    let rt_dir = tempfile::Builder::new()
+        .prefix("camoufox-rt-")
+        .tempdir()
+        .expect("create temp rt dir");
+    std::fs::set_permissions(rt_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::create_dir(rt_dir.path().join("camoufox")).unwrap();
+    std::fs::set_permissions(
+        rt_dir.path().join("camoufox"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let daemon = DaemonGuard::start(rt_dir.path());
+
+    let profiles = tempfile::tempdir().unwrap();
+    let profile = profiles.path().join("nested").join("profile");
+    let profile_arg = profile.to_str().unwrap();
+
+    // The daemon (not the client) enforces absolute paths.
+    let relative = daemon.run_json(&["launch", "--profile-dir", "relative/profile"]);
+    assert_error_shape(
+        &relative,
+        "invalid argument: --profile-dir must be an absolute path",
+    );
+    assert_eq!(relative["kind"], "invalid_argument");
+
+    let launched = daemon.run_json(&["launch", "--profile-dir", profile_arg]);
+    assert_eq!(launched["ok"], true, "{launched}");
+    let instance = launched["data"]["instance_id"].as_str().unwrap().to_owned();
+    let canonical = profile.canonicalize().unwrap();
+    let canonical = canonical.to_str().unwrap();
+    assert_eq!(
+        std::fs::metadata(&profile).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    let listed = daemon.run_json(&["list"]);
+    assert_eq!(listed["data"]["instances"][0]["profile_dir"], canonical);
+    let plain = daemon.run(&["list"]);
+    assert!(plain.status.success());
+    let stdout = String::from_utf8_lossy(&plain.stdout);
+    assert!(
+        stdout.starts_with(&instance)
+            && stdout
+                .trim_end()
+                .ends_with(&format!("  profile_dir={canonical}")),
+        "{stdout}"
+    );
+
+    // A symlink alias resolves to the same directory and is refused.
+    let alias = profiles.path().join("alias");
+    std::os::unix::fs::symlink(&profile, &alias).unwrap();
+    let second = daemon.run_json(&["launch", "--profile-dir", alias.to_str().unwrap()]);
+    assert_error_shape(
+        &second,
+        &format!("invalid argument: profile directory already in use by instance {instance}"),
+    );
+    assert_eq!(second["kind"], "invalid_argument");
+
+    let stopped = daemon.run(&["stop", &instance]);
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert_eq!(daemon.run_json(&["list"])["data"]["instances"], json!([]));
+    assert!(
+        profile.join("prefs.js").is_file(),
+        "profile must survive stop"
+    );
 }

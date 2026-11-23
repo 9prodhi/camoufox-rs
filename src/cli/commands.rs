@@ -589,30 +589,9 @@ mod tests {
         assert!(find_external_subcommand("../cmd").is_none());
     }
 
-    #[test]
-    fn find_external_subcommand_locates_binary_on_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let bin_path = temp.path().join("camoufox-testxyz");
-        std::fs::write(&bin_path, "#!/bin/sh\nexit 0\n").unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let orig_path = std::env::var_os("PATH").unwrap_or_default();
-        let mut new_path = temp.path().as_os_str().to_os_string();
-        new_path.push(":");
-        new_path.push(&orig_path);
-
-        // Safety note: tests run in process; PATH changes are safe here for this check.
-        std::env::set_var("PATH", &new_path);
-        let found = find_external_subcommand("testxyz");
-        std::env::set_var("PATH", orig_path);
-
-        assert_eq!(found, Some(bin_path));
-    }
+    // Lookup of a binary on PATH is covered by subprocess tests in
+    // tests/dispatch.rs, which set PATH per child instead of mutating this
+    // process's environment while other tests run in parallel.
 }
 
 #[cfg(test)]

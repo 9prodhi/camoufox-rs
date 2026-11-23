@@ -60,7 +60,7 @@ pub enum DaemonRequest {
         bypass_csp: bool,
         #[serde(default)]
         dialogs: crate::api::DialogPolicy,
-        /// Absolute path; created or tightened to 0700, canonicalized, must be empty or an existing profile, never deleted on stop.
+        /// Absolute path; created with mode 0700 or group/other permissions removed, canonicalized, must be empty or an existing profile, never deleted on stop.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile_dir: Option<String>,
     },

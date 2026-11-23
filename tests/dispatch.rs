@@ -488,3 +488,23 @@ fn external_dispatch_preserves_non_utf8_socket_path() {
             .as_encoded_bytes()
     );
 }
+
+#[test]
+fn external_dispatch_clears_inherited_json_without_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    write_script(
+        dir.path(),
+        "camoufox-hello",
+        "#!/bin/sh\nprintf 'json: %s\\n' \"$CAMOUFOX_JSON\"\n",
+        0o755,
+    );
+    let output = Command::new(camoufox_bin())
+        .env("PATH", dir.path())
+        .env("CAMOUFOX_JSON", "1")
+        .arg("hello")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"json: \n");
+    assert!(output.stderr.is_empty());
+}

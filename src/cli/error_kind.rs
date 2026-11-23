@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Compatibility error when a daemon cannot confirm persistent profile support.
+pub const PROFILE_DIR_UNSUPPORTED: &str =
+    "daemon does not support --profile-dir; restart it: camoufox shutdown && camoufox serve";
+
 /// Machine-readable category of a daemon error, independent of its message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,7 +116,7 @@ impl ErrorKind {
             || message == "daemon is already running"
             || message == "daemon is not running (start with: camoufox serve)"
             || message == "daemon closed connection without responding"
-            || message == "daemon does not support --profile-dir; restart it: camoufox shutdown && camoufox serve"
+            || message.starts_with(PROFILE_DIR_UNSUPPORTED)
             || [
                 "socket parent directory does not exist: ",
                 "failed to connect to daemon: ",

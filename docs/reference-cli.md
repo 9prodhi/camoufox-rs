@@ -39,7 +39,9 @@ On daemon or execution errors, the envelope returns:
 }
 ```
 
-and the process exits with code `1`. Client-side argument validation errors exit with code `2`.
+and the process exits with code `1`. Client-side argument validation errors exit with code `2` and kind
+`invalid_argument`, regardless of the message text. Local I/O failures, including
+failures resolving upload or screenshot paths, exit with code `1` and kind `io`.
 
 Every daemon error includes a stable, machine-readable `kind` after `error`,
 with no `data` field. Branch on `kind` instead of parsing the human-readable
@@ -150,7 +152,7 @@ Usage: camoufox launch [OPTIONS]
 - `--downloads-dir <DOWNLOADS_DIR>`: Directory to save downloads to (must be absolute; defaults to cancel).
 - `--bypass-csp`: Disable page Content-Security-Policy (needed for `--main-world` on strict-CSP sites; detectable by pages).
 - `--dialogs <DIALOGS>`: JavaScript dialog handling policy (`manual`, `accept`, `dismiss`) [default: `manual`].
-- `--profile-dir <PROFILE_DIR>`: Absolute path; created or tightened to 0700, canonicalized, must be empty or an existing profile, never deleted on stop. An existing profile contains `prefs.js` or `times.json`. Tightening clears only group/other read, write, and execute permissions, preserving special permission bits. Persistent profiles use the browser's default context: cookies, localStorage, IndexedDB, and other profile data survive relaunch. Stop or shutdown gracefully flushes storage before returning. A profile is reserved during launch and remains in use until the browser exits; concurrent launches on the same canonical directory are refused. Persistent profiles are never deleted on stop or shutdown. Without this flag, launches use a fresh temporary profile and private context.
+- `--profile-dir <PROFILE_DIR>`: Absolute path; created with mode 0700 or group/other permissions removed, canonicalized, must be empty or an existing profile, never deleted on stop. An existing profile contains `prefs.js` or `times.json`. Tightening clears only group/other read, write, and execute permissions, preserving special permission bits. Persistent profiles use the browser's default context: cookies, localStorage, IndexedDB, and other profile data survive relaunch. Stop or shutdown gracefully flushes storage before returning. A profile is reserved during launch and remains in use until the browser exits; concurrent launches on the same canonical directory are refused. Persistent profiles are never deleted on stop or shutdown. Without this flag, launches use a fresh temporary profile and private context.
 - `--socket <SOCKET>`: Path to the daemon Unix socket.
 - `--json`: Output as JSON.
 
@@ -165,9 +167,12 @@ JSON output shape:
 
 For a persistent launch, the success data also contains `"profile_dir"` with the
 canonical directory path. If an older daemon omits that confirmation after
-`--profile-dir`, the client exits 1 with kind `daemon` and error
+`--profile-dir`, the client first sends `Stop` for the returned `instance_id`
+to clean up the browser, then exits 1 with kind `daemon` and error
 `daemon does not support --profile-dir; restart it: camoufox shutdown && camoufox serve`.
-Restart the daemon before retrying the persistent launch.
+If cleanup fails, the error also includes the instance ID and cleanup failure so
+you can stop that instance manually. Restart the daemon before retrying the
+persistent launch.
 
 ### `dialog`
 
@@ -770,9 +775,14 @@ camoufox upload <instance_id> <page_id> '#host >>> input' ./one.txt ./two.txt \
     --frame '#outer' --frame '#inner'
 ```
 
+If an `input` or `change` handler opens a JavaScript dialog, successful upload
+data may also include `"dialog": {...}`. Resolve it with `camoufox dialog
+<instance_id> <page_id> accept` or `dismiss` before continuing.
+
 Missing selectors report `selector not found: <selector>`. Non-file elements,
-missing or non-regular paths, and multiple files on a single-file input report
-`invalid argument: ...`. File paths are checked before accessing the page.
+directory-picker (`webkitdirectory`) inputs, missing or non-regular paths, and
+multiple files on a single-file input report `invalid argument: ...` with kind
+`invalid_argument`. File paths are checked before accessing the page.
 
 ### `type`
 

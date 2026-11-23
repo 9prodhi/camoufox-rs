@@ -762,6 +762,49 @@ fn ping_daemon_not_running_json_shape() {
     assert_eq!(v["kind"], "daemon");
 }
 
+#[test]
+fn client_argument_validation_json_golden() {
+    for (args, message) in [
+        (vec!["cookie", "i", "p1", "invalid"], "cookie must be `name=value` (got \"invalid\")"),
+        (vec!["header", "i", "p1", "invalid"], "header must be `Name: value` (got \"invalid\")"),
+        (vec!["screenshot", "i", "p1", "--clip", "1,2,0,4"], "--clip width and height must be positive"),
+        (vec!["click", "i", "p1", "invalid", "2"], "X coordinate must be an integer when a Y coordinate is given (got \"invalid\"); for a selector click, omit the Y argument"),
+    ] {
+        let output = Command::new(bin()).arg("--json").args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), format!("{{\n  \"ok\": false,\n  \"error\": {},\n  \"kind\": \"invalid_argument\"\n}}\n", serde_json::to_string(message).unwrap()));
+    }
+}
+
+#[test]
+fn screenshot_relative_path_with_removed_cwd_is_io_error() {
+    for json in [false, true] {
+        let mut args = vec!["screenshot", "i", "p1", "--output", "fixture.png"];
+        if json {
+            args.insert(0, "--json");
+        }
+        let output = run_in_removed_cwd(&args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let message = "io error: resolve screenshot path: No such file or directory (os error 2)";
+        if json {
+            assert!(output.stderr.is_empty());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!(
+                    "{{\n  \"ok\": false,\n  \"error\": \"{message}\",\n  \"kind\": \"io\"\n}}\n"
+                )
+            );
+        } else {
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                format!("error: {message}\n")
+            );
+        }
+    }
+}
+
 /// Run `camoufox <args>` from a working directory that is deleted first.
 fn run_in_removed_cwd(args: &[&str]) -> std::process::Output {
     let tmp = tempfile::tempdir().expect("create tempdir");
@@ -786,7 +829,7 @@ fn upload_relative_path_with_removed_cwd_is_io_error() {
     let upload = ["upload", "i", "p1", "#file", "fixture.pdf"];
 
     let out = run_in_removed_cwd(&[&["--socket", sock][..], &upload].concat());
-    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(out.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -795,7 +838,7 @@ fn upload_relative_path_with_removed_cwd_is_io_error() {
     );
 
     let out = run_in_removed_cwd(&[&["--json", "--socket", sock][..], &upload].concat());
-    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
     let v: Value = serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert!(v["error"]
         .as_str()
@@ -817,6 +860,31 @@ fn upload_relative_path_with_removed_cwd_is_io_error() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     let v: Value = serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert_error_shape(&v, "daemon is not running (start with: camoufox serve)");
+}
+
+#[test]
+fn daemon_guard_ignores_ambient_socket() {
+    const CHILD: &str = "CAMOUFOX_GUARD_ISOLATION_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = DaemonGuard::start(dir.path());
+        assert_eq!(daemon.run_json(&["ping"])["ok"], true);
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "daemon_guard_ignores_ambient_socket"])
+        .env(CHILD, "1")
+        .env("CAMOUFOX_SOCKET", dir.path().join("missing/daemon.sock"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("1 passed"), "{stdout}");
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +976,7 @@ impl DaemonGuard {
         let log_file = std::fs::File::create(&log_path).expect("create daemon log file");
         let child = Command::new(bin())
             .arg("serve")
+            .env_remove("CAMOUFOX_SOCKET")
             .env("XDG_RUNTIME_DIR", rt_dir)
             .env("RUST_LOG", "camoufox::protocol=trace")
             .stdout(Stdio::null())

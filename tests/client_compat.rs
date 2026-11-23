@@ -1,38 +1,55 @@
 //! Client compatibility with older daemon response shapes, without a browser.
 #![cfg(feature = "cli")]
 
+use camoufox::cli::error_kind::PROFILE_DIR_UNSUPPORTED;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 fn old_daemon(response: &str, args: &[&str], socket_from_env: bool) -> (Output, serde_json::Value) {
+    let (output, mut requests) = old_daemon_exchanges(&[response], args, socket_from_env);
+    (output, requests.remove(0))
+}
+
+fn old_daemon_exchanges(
+    responses: &[&str],
+    args: &[&str],
+    socket_from_env: bool,
+) -> (Output, Vec<serde_json::Value>) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("daemon.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let response = format!("{response}\n");
+    let responses: Vec<_> = responses
+        .iter()
+        .map(|response| format!("{response}\n"))
+        .collect();
     let worker = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "client did not connect");
-                    std::thread::sleep(Duration::from_millis(10));
+        let mut requests = Vec::new();
+        for response in responses {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "client did not connect");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept: {error}"),
                 }
-                Err(error) => panic!("accept: {error}"),
-            }
-        };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        stream.write_all(response.as_bytes()).unwrap();
-        serde_json::from_str(&line).unwrap()
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+            requests.push(serde_json::from_str(&line).unwrap());
+        }
+        requests
     });
     let mut command = Command::new(env!("CARGO_BIN_EXE_camoufox"));
     command.env_remove("CAMOUFOX_SOCKET");
@@ -47,8 +64,6 @@ fn old_daemon(response: &str, args: &[&str], socket_from_env: bool) -> (Output, 
 
 const OLD_LAUNCH: &str =
     r#"{"ok":true,"data":{"instance_id":"00000001","version":"test","pid":123}}"#;
-const PROFILE_UNSUPPORTED: &str =
-    "daemon does not support --profile-dir; restart it: camoufox shutdown && camoufox serve";
 
 #[test]
 fn persistent_launch_rejects_old_daemon_in_both_output_modes() {
@@ -57,21 +72,26 @@ fn persistent_launch_rejects_old_daemon_in_both_output_modes() {
         if json {
             args.insert(0, "--json");
         }
-        let (output, request) = old_daemon(OLD_LAUNCH, &args, false);
-        assert_eq!(request["params"]["profile_dir"], "/absolute/profile");
+        let (output, requests) =
+            old_daemon_exchanges(&[OLD_LAUNCH, r#"{"ok":true}"#], &args, false);
+        assert_eq!(requests[0]["params"]["profile_dir"], "/absolute/profile");
+        assert_eq!(
+            requests[1],
+            serde_json::json!({"method":"Stop","params":{"instance_id":"00000001"}})
+        );
         assert_eq!(output.status.code(), Some(1));
         if json {
             let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(
                 response,
-                serde_json::json!({"ok": false, "error": PROFILE_UNSUPPORTED, "kind": "daemon"})
+                serde_json::json!({"ok": false, "error": PROFILE_DIR_UNSUPPORTED, "kind": "daemon"})
             );
             assert!(output.stderr.is_empty());
         } else {
             assert!(output.stdout.is_empty());
             assert_eq!(
                 String::from_utf8(output.stderr).unwrap(),
-                format!("error: {PROFILE_UNSUPPORTED}\n")
+                format!("error: {PROFILE_DIR_UNSUPPORTED}\n")
             );
         }
     }
@@ -146,4 +166,47 @@ fn client_honours_socket_environment_default() {
     let (output, request) = old_daemon(r#"{"ok":true}"#, &["--json", "ping"], true);
     assert_eq!(output.status.code(), Some(0), "{:?}", output);
     assert_eq!(request["method"], "Ping");
+}
+
+#[test]
+fn persistent_launch_reports_instance_when_cleanup_fails() {
+    // Exercise a daemon rejection and a malformed response (client transport/protocol error).
+    for stop_response in [r#"{"ok":false,"error":"cleanup refused"}"#, "invalid JSON"] {
+        let (output, requests) = old_daemon_exchanges(
+            &[OLD_LAUNCH, stop_response],
+            &["--json", "launch", "--profile-dir", "/absolute/profile"],
+            false,
+        );
+        assert_eq!(requests[1]["method"], "Stop");
+        assert_eq!(requests[1]["params"]["instance_id"], "00000001");
+        assert_eq!(output.status.code(), Some(1));
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let message = response["error"].as_str().unwrap();
+        assert!(message.starts_with(PROFILE_DIR_UNSUPPORTED), "{message}");
+        assert!(
+            message.contains("failed to stop instance 00000001: "),
+            "{message}"
+        );
+        assert_eq!(response["kind"], "daemon");
+    }
+}
+
+#[test]
+fn persistent_launch_without_instance_id_reports_cleanup_impossible() {
+    let (output, _) = old_daemon(
+        r#"{"ok":true,"data":{}}"#,
+        &["--json", "launch", "--profile-dir", "/absolute/profile"],
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        response,
+        serde_json::json!({
+            "ok": false,
+            "error": format!("{PROFILE_DIR_UNSUPPORTED}; missing instance_id in launch response; could not stop browser"),
+            "kind": "daemon"
+        })
+    );
 }
